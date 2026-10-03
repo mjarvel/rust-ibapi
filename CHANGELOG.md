@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Client::cancel_order_untracked` (sync/async) writes an individual cancellation
+  without installing a per-order subscription. Observe broker outcomes through
+  `order_update_stream`; successful writing does not confirm cancellation. This
+  path avoids diverting concurrent execution downloads into a cancel receiver.
+- Historical `fetch_once` (sync/async) requires a `HistoricalDataEnd` response
+  and never retries a connection reset, for applications owning generation/retry policy.
+
 - `ContractDetailsBuilder::buffer_limit(n)` caps unread items (rows and notices): when `n` are waiting and another arrives, the subscription yields every queued item, then the new `Error::BufferLimitExceeded { limit }`, then ends, and later rows are discarded. TWS's end marker and errors always get through, so a result that fills the cap exactly still ends normally. Without it nothing changes (async: lossy `channel_capacity`; sync: unbounded). `n` must be `1..=contracts::MAX_BUFFER_LIMIT` (#876).
 - `Subscription::cancel_and_drain(deadline)` (sync and async) writes the native cancel and waits for TWS to finish the request, returning `Drained::Ended`, `Drained::Rejected(notice)` or `Drained::Unconfirmed`; session errors are `Err`. Observed live, TWS keeps sending contract details after a cancel, so the drain usually waits out the whole result (#876).
 - `Client::contract_details_stream(&contract)` returns a `ContractDetailsBuilder`: `request_id()` is known before anything is sent, and `subscribe()` sends once (no retry) and returns a `Subscription<ContractDetails>`. Rows can be read as they arrive; dropping the subscription early sends the native `cancelContractData` (server 215+), and rows TWS sends after that are discarded. See `examples/{sync,async}/contract_details_stream.rs` (#876).
@@ -17,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `From<market_data::historical::HistoricalParseError> for Error`, so `s.parse::<BarSize>()?` (and `Duration`, `WhatToShow`) works in a function returning `ibapi::Error` (#838).
 
 ### Changed
+
+- Historical bar `fetch` now returns `UnexpectedEndOfStream` if the response
+  closes after the bars without `HistoricalDataEnd`, instead of incomplete success.
+  Its existing reset retry remains; use `fetch_once` to disable replay.
 
 - The `utoipa` feature is renamed `utoipa-6` and requires utoipa 6 (was 5). Public types derive utoipa 6's `ToSchema`, which a crate on utoipa 5 can't use in its `#[derive(OpenApi)]`; enable `utoipa-6` and upgrade to utoipa 6 (Rust 1.88+). A later utoipa major will be a new `utoipa-<major>` feature in a minor release; if several are enabled, the newest wins. See `docs/migration-5.0.md` §14 (#884).
 - `contract_details` now collects over `contract_details_stream`. On server 215+ it writes no cancel after TWS's end marker, but does write `cancelContractData` when TWS answers with an error (e.g. 200), as dropping any subscription after an error does; the old path wrote neither. The guard that skips a cancel after the end marker sits in `Subscription` but changes no other existing stream (#876).

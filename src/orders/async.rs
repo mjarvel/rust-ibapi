@@ -238,6 +238,32 @@ impl Client {
         ))
     }
 
+    /// Write a cancellation without installing a per-order receiver.
+    ///
+    /// Observe outcomes through order_update_stream; Ok only proves local writing.
+    /// This avoids diverting concurrent execution downloads into a cancel receiver.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run(client: &ibapi::Client) -> Result<(), ibapi::Error> {
+    /// use futures::StreamExt;
+    /// let mut updates = client.order_update_stream().await?;
+    /// client.cancel_order_untracked(42, "").await?;
+    /// while let Some(item) = updates.next().await {
+    ///     println!("{item:?}"); // Inspect status/errors; writing is not acceptance.
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn cancel_order_untracked(&self, order_id: i32, manual_order_cancel_time: &str) -> Result<(), Error> {
+        if !manual_order_cancel_time.is_empty() {
+            check_version(self.server_version(), Features::MANUAL_ORDER_TIME)?;
+        }
+
+        let request = encoders::encode_cancel_order(order_id, manual_order_cancel_time)?;
+        self.send_message(request).await
+    }
+
     /// Cancels all open [Order]s.
     ///
     /// # Examples

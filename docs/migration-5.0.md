@@ -4,6 +4,23 @@ This guide covers the breaking changes in `ibapi` 5.0. For 3.x → 4.x, see [`mi
 
 ## Breaking changes
 
+## Strict history and observer-owned cancellation
+
+Historical `fetch()` now rejects a response that closes after bars but before
+`HistoricalDataEnd` with `Error::UnexpectedEndOfStream`. It retains its reset
+retry behavior. The new `fetch_once()` uses the same request/decoder and date/range
+semantics, requires the end frame and returns reset errors without replay. Both
+sync and async builders expose it; applications still supply timeout/cancellation
+policy around the async future. See the [README](../README.md#available-apis).
+
+`Client::cancel_order_untracked(order_id, manual_order_cancel_time)` uses the same
+encoder/version check as `cancel_order` and returns a local write result without
+creating an order channel. Use it with a previously installed `order_update_stream`
+to observe status/errors, preserving manual execution-download routing. Neither
+writing nor dropping an observer proves cancellation. Existing `cancel_order`
+and its per-order subscription are unchanged. The name describes receiver
+registration, not permission to cancel unknown orders: callers enforce ownership.
+
 ### 1. `OrderCondition` gains `Unknown(UnknownCondition)`
 
 The last order wire enum that coerced an unrecognized value. `decode_order_condition` read any condition type it did not model — including `2`, which IB leaves unassigned between `Price = 1` and `Time = 3` — as `OrderCondition::Price(PriceCondition::default())`: contract id `0`, empty exchange, price `0.0`, indistinguishable from a real price condition. Re-placing that order sent TWS a different condition from the one it held.

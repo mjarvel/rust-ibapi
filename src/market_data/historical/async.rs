@@ -285,45 +285,59 @@ pub(crate) async fn historical_data(
     what_to_show: WhatToShow,
     trading_hours: TradingHours,
 ) -> Result<HistoricalData, Error> {
-    common::validate_historical_data(client.server_version(), contract, end_date, Some(what_to_show))?;
-
     retry_on_connection_reset(client, || async {
-        let builder = client.request();
-        let request = encoders::encode_request_historical_data(
-            builder.request_id(),
-            contract,
-            end_date,
-            duration,
-            bar_size,
-            Some(what_to_show),
-            trading_hours.use_rth(),
-            false,
-            &Vec::<crate::contracts::TagValue>::default(),
-        )?;
-
-        let mut subscription = builder.send_raw(request).await?;
-
-        let mut data = match subscription.next().await {
-            Some(Ok(message)) => decoders::decode_historical_data(message.expect_type(IncomingMessages::HistoricalData)?)?,
-            Some(Err(e)) => return Err(e),
-            None => return Err(Error::UnexpectedEndOfStream),
-        };
-
-        // The end frame is a second read, which is why this is not a one-shot
-        // and cannot use the helpers in `common::request_helpers`.
-        match subscription.next().await {
-            Some(Ok(end_message)) => {
-                let (start, end) = decoders::decode_historical_data_end(&end_message)?;
-                data.start = start;
-                data.end = end;
-            }
-            Some(Err(e)) => return Err(e),
-            None => {}
-        }
-
-        Ok(data)
+        historical_data_once(client, contract, end_date, duration, bar_size, what_to_show, trading_hours).await
     })
     .await
+}
+
+// Builder-fed wire seam: the public API already names optional inputs.
+pub(crate) async fn historical_data_once(
+    client: &Client,
+    contract: &Contract,
+    end_date: Option<OffsetDateTime>,
+    duration: Duration,
+    bar_size: BarSize,
+    what_to_show: WhatToShow,
+    trading_hours: TradingHours,
+) -> Result<HistoricalData, Error> {
+    common::validate_historical_data(client.server_version(), contract, end_date, Some(what_to_show))?;
+
+    let builder = client.request();
+    let request = encoders::encode_request_historical_data(
+        builder.request_id(),
+        contract,
+        end_date,
+        duration,
+        bar_size,
+        Some(what_to_show),
+        trading_hours.use_rth(),
+        false,
+        &Vec::<crate::contracts::TagValue>::default(),
+    )?;
+
+    let mut subscription = builder.send_raw(request).await?;
+
+    let mut data = match subscription.next().await {
+        Some(Ok(message)) => decoders::decode_historical_data(message.expect_type(IncomingMessages::HistoricalData)?)?,
+        Some(Err(e)) => return Err(e),
+        None => return Err(Error::UnexpectedEndOfStream),
+    };
+
+    // The end frame is a second read, which is why this is not a one-shot
+    // and cannot use the helpers in `common::request_helpers`.
+    match subscription.next().await {
+        Some(Ok(end_message)) => {
+            let end_message = end_message.expect_type(IncomingMessages::HistoricalDataEnd)?;
+            let (start, end) = decoders::decode_historical_data_end(end_message)?;
+            data.start = start;
+            data.end = end;
+        }
+        Some(Err(e)) => return Err(e),
+        None => return Err(Error::UnexpectedEndOfStream),
+    }
+
+    Ok(data)
 }
 
 pub(crate) async fn historical_data_stream(

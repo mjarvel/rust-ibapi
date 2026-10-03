@@ -191,6 +191,34 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
         Ok(trim_to_range(data, self.between))
     }
 
+    /// Fetch one strictly completed response without replay on connection reset.
+    ///
+    /// Requires HistoricalDataEnd; missing completion is UnexpectedEndOfStream.
+    /// Applications owning reconnect/generation policy should use this method.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn run(client: &ibapi::client::blocking::Client, contract: &ibapi::contracts::Contract) -> Result<(), ibapi::Error> {
+    /// use ibapi::market_data::historical::{BarSize, ToDuration};
+    /// let data = client.historical_data(contract, BarSize::Day).duration(1.days()).fetch_once()?;
+    /// println!("{} bars, range {} to {}", data.bars.len(), data.start, data.end);
+    /// # Ok(()) }
+    /// ```
+    pub fn fetch_once(self) -> Result<HistoricalData, Error> {
+        let (end_date, duration) = self.resolve_date_spec()?;
+        let data = crate::market_data::historical::sync::historical_data_once(
+            self.client,
+            self.contract,
+            end_date,
+            duration,
+            self.bar_size,
+            self.what_to_show,
+            self.trading_hours,
+        )?;
+        Ok(trim_to_range(data, self.between))
+    }
+
     /// Submit a streaming request (`keep_up_to_date = true`) and return a
     /// [`Subscription`](crate::subscriptions::Subscription) of [`HistoricalBarUpdate`].
     /// IBKR sends initial bars, then per-bar updates as they form.
@@ -264,6 +292,35 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     pub async fn fetch(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_date_spec()?;
         let data = crate::market_data::historical::r#async::historical_data(
+            self.client,
+            self.contract,
+            end_date,
+            duration,
+            self.bar_size,
+            self.what_to_show,
+            self.trading_hours,
+        )
+        .await?;
+        Ok(trim_to_range(data, self.between))
+    }
+
+    /// Fetch one strictly completed response without replay on connection reset.
+    ///
+    /// Requires HistoricalDataEnd; missing completion is UnexpectedEndOfStream.
+    /// Applications owning reconnect/generation policy should use this method.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run(client: &ibapi::Client, contract: &ibapi::contracts::Contract) -> Result<(), ibapi::Error> {
+    /// use ibapi::market_data::historical::{BarSize, ToDuration};
+    /// let data = client.historical_data(contract, BarSize::Day).duration(1.days()).fetch_once().await?;
+    /// println!("{} bars, range {} to {}", data.bars.len(), data.start, data.end);
+    /// # Ok(()) }
+    /// ```
+    pub async fn fetch_once(self) -> Result<HistoricalData, Error> {
+        let (end_date, duration) = self.resolve_date_spec()?;
+        let data = crate::market_data::historical::r#async::historical_data_once(
             self.client,
             self.contract,
             end_date,

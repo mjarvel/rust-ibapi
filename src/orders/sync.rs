@@ -125,6 +125,34 @@ impl Client {
         Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))
     }
 
+    /// Write a cancellation without installing a per-order receiver.
+    ///
+    /// Observe outcomes through order_update_stream; Ok only proves local writing.
+    /// This avoids diverting concurrent execution downloads into a cancel receiver.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn run(client: &ibapi::client::blocking::Client) -> Result<(), ibapi::Error> {
+    /// let updates = client.order_update_stream()?;
+    /// client.cancel_order_untracked(42, "")?;
+    /// for item in &updates {
+    ///     println!("{item:?}"); // Inspect status/errors; writing is not acceptance.
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn cancel_order_untracked(&self, order_id: i32, manual_order_cancel_time: &str) -> Result<(), Error> {
+        if !manual_order_cancel_time.is_empty() {
+            self.check_server_version(
+                server_versions::MANUAL_ORDER_TIME,
+                "It does not support manual order cancel time attribute",
+            )?
+        }
+
+        let request = encoders::encode_cancel_order(order_id, manual_order_cancel_time)?;
+        self.send_message(request)
+    }
+
     /// Requests completed [`crate::orders::Order`]s.
     ///
     /// # Arguments

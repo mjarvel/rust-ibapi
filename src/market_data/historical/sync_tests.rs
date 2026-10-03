@@ -1117,12 +1117,15 @@ fn test_historical_data_end_of_stream_is_not_retried() {
 #[test]
 fn test_historical_data_retries_a_connection_reset() {
     let message_bus = Arc::new(
-        MessageBusStub::with_ordered_responses(vec![proto_response(
-            IncomingMessages::HistoricalData,
-            historical_data_response()
-                .bar(historical_data_bar(1_678_886_400).ohlc(185.50, 186.00, 185.25, 185.75))
-                .encode_proto(),
-        )])
+        MessageBusStub::with_ordered_responses(vec![
+            proto_response(
+                IncomingMessages::HistoricalData,
+                historical_data_response()
+                    .bar(historical_data_bar(1_678_886_400).ohlc(185.50, 186.00, 185.25, 185.75))
+                    .encode_proto(),
+            ),
+            proto_response(IncomingMessages::HistoricalDataEnd, historical_data_end_response().encode_proto()),
+        ])
         .with_connection_resets(1),
     );
     let client = Client::stubbed(message_bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
@@ -1492,4 +1495,97 @@ fn test_tick_subscription_skips_unexpected_message_then_yields() {
         .expect("decode error");
     assert_eq!(tick.price, 14.00, "wrong price");
     assert!(subscription.next().is_none(), "should be done");
+}
+#[test]
+fn strict_history_requires_second_end_and_never_replays() {
+    for reset in [false, true] {
+        let bus = Arc::new(
+            MessageBusStub::with_ordered_responses(vec![proto_response(
+                IncomingMessages::HistoricalData,
+                historical_data_response().encode_proto(),
+            )])
+            .with_connection_resets(usize::from(reset)),
+        );
+        let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+        let result = client
+            .historical_data(&Contract::stock("NVDA").build(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch_once();
+        if reset {
+            assert!(matches!(result, Err(Error::ConnectionReset)), "got {result:?}");
+        } else {
+            assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
+        }
+        assert_eq!(request_message_count(&bus), 1);
+    }
+}
+
+#[test]
+fn strict_history_keeps_date_and_range_from_proven_end() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::HistoricalData,
+            historical_data_response()
+                .bar(historical_data_daily_bar("20261002").ohlc(1.0, 2.0, 1.0, 2.0))
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::HistoricalDataEnd,
+            historical_data_end_response()
+                .start_date_str("20261002 00:00:00 UTC")
+                .end_date_str("20261003 00:00:00 UTC")
+                .encode_proto(),
+        ),
+    ]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let data = client
+        .historical_data(&Contract::stock("NVDA").build(), BarSize::Day)
+        .duration(Duration::days(1))
+        .fetch_once()
+        .unwrap();
+    assert_eq!(data.bars[0].date, BarTimestamp::Date(date!(2026 - 10 - 02)));
+    assert_eq!(data.end, datetime!(2026-10-03 00:00:00 UTC));
+    assert_eq!(request_message_count(&bus), 1);
+}
+
+#[test]
+fn strict_legacy_fetch_also_rejects_missing_end() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
+        IncomingMessages::HistoricalData,
+        historical_data_response().encode_proto(),
+    )]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let result = client
+        .historical_data(&Contract::stock("NVDA").build(), BarSize::Day)
+        .duration(Duration::days(1))
+        .fetch();
+    assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
+    assert_eq!(request_message_count(&bus), 1);
+}
+
+#[test]
+fn strict_once_preserves_error_and_rejects_wrong_end() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_error_response(
+        9000,
+        162,
+        "permission denied",
+    )]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let result = client
+        .historical_data(&Contract::stock("NVDA").build(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch_once();
+    assert_tws_error_message(result.unwrap_err(), 162, "permission denied");
+    assert_eq!(request_message_count(&bus), 1);
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto()),
+        proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto()),
+    ]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let result = client
+        .historical_data(&Contract::stock("NVDA").build(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch_once();
+    assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "got {result:?}");
+    assert_eq!(request_message_count(&bus), 1);
 }

@@ -53,6 +53,13 @@ use ibapi::client::blocking::Client;  // blocking client
 
 ## Available APIs
 
+Applications that own reconnect and request-generation policy can use historical
+`fetch_once()` for a strictly completed, non-retrying bar request. Applications
+using continuous `order_update_stream()` can use `cancel_order_untracked(id, "")`
+to write a cancellation without creating a per-order receiver. A local write is
+not broker acceptance; keep observing status, executions and errors. See the
+[migration guide](docs/migration-5.0.md#strict-history-and-observer-owned-cancellation).
+
 The [Client documentation](https://docs.rs/ibapi/latest/ibapi/struct.Client.html) provides comprehensive details on all currently available APIs, including trading, account management, and market data features, along with examples to help you get started.
 
 ## Examples

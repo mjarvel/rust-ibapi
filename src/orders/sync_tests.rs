@@ -1145,3 +1145,20 @@ fn preset_legs_rejected_below_attached_orders_gate() {
     }
     assert_eq!(request_message_count(&bus), 0);
 }
+#[test]
+fn sender_only_cancel_encodes_once_without_registration_or_cancel_on_drop() {
+    let bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    client.cancel_order_untracked(42, "").unwrap();
+    assert_eq!(request_message_count(&bus), 1);
+    assert_request(&bus, 0, &cancel_order_request().order_id(42));
+}
+
+#[test]
+fn sender_only_cancel_version_gate_sends_nothing() {
+    let bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(bus.clone(), server_versions::MANUAL_ORDER_TIME - 1);
+    let result = client.cancel_order_untracked(42, "20261004-00:00:00");
+    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
+    assert_eq!(request_message_count(&bus), 0);
+}

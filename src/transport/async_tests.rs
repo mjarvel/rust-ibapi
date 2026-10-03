@@ -52,6 +52,60 @@ fn make_bus() -> (MemoryStream, Arc<AsyncTcpMessageBus<MemoryStream>>) {
 
 const TICK: Duration = Duration::from_millis(100);
 
+/// Exercise the public sender-only cancellation and typed download/observer through
+/// the real dispatcher, including equal numeric order/request IDs and a late fee.
+#[tokio::test]
+async fn sender_only_cancel_does_not_divert_execution_download_or_end() {
+    use crate::orders::{ExecutionFilter, Executions, OrderUpdate};
+    use crate::testdata::builders::orders::{commission_report, execution_data};
+    let (stream, bus) = make_bus();
+    let client = crate::Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let mut observer = client.order_update_stream().await.unwrap();
+    client.cancel_order_untracked(9000, "").await.unwrap();
+    assert!(bus.order_channels.read().await.is_empty());
+    let mut download = client.executions(ExecutionFilter::default()).await.unwrap();
+    stream.push_inbound(binary_proto(
+        crate::IncomingMessages::ExecutionData as i32,
+        &execution_data()
+            .request_id(9000)
+            .order_id(9000)
+            .execution_id("late-fee")
+            .shares(1.0)
+            .price(100.0)
+            .to_proto(),
+    ));
+    stream.push_inbound(binary_proto(
+        crate::IncomingMessages::ExecutionDataEnd as i32,
+        &crate::proto::ExecutionDetailsEnd { req_id: Some(9000) },
+    ));
+    for _ in 0..2 {
+        bus.read_and_route_message().await.unwrap();
+    }
+    assert!(matches!(
+        download.next().await,
+        Some(Ok(SubscriptionItem::Data(Executions::ExecutionData(_))))
+    ));
+    assert!(download.next().await.is_none());
+    assert_eq!(
+        download.cancel_and_drain(tokio::time::Instant::now()).await.unwrap(),
+        crate::subscriptions::Drained::Ended
+    );
+    stream.push_inbound(binary_proto(
+        crate::IncomingMessages::CommissionsReport as i32,
+        &commission_report().execution_id("late-fee").commission(0.0).to_proto(),
+    ));
+    bus.read_and_route_message().await.unwrap();
+    assert!(matches!(
+        observer.next().await,
+        Some(Ok(SubscriptionItem::Data(OrderUpdate::ExecutionData(_))))
+    ));
+    assert!(matches!(
+        observer.next().await,
+        Some(Ok(SubscriptionItem::Data(OrderUpdate::CommissionReport(_))))
+    ));
+    assert!(bus.order_channels.read().await.is_empty());
+}
+
 /// `with_channel_capacity` reaches the per-request channels: a capacity-2
 /// channel holds at most 2 queued frames, evicting the oldest (#779).
 #[tokio::test]
