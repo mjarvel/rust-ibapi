@@ -1,7 +1,7 @@
 use time::OffsetDateTime;
 
 use crate::contracts::Contract;
-use crate::market_data::historical::{BarSize, BarTimestamp, Duration, HistoricalBarUpdate, HistoricalData, WhatToShow};
+use crate::market_data::historical::{BarSize, BarTimestamp, Duration, HistoricalBarUpdate, HistoricalData, HistoricalSnapshotUpdate, WhatToShow};
 use crate::market_data::TradingHours;
 use crate::Error;
 
@@ -14,7 +14,7 @@ mod tests;
 /// Required: one of [`duration`](Self::duration) (with optional [`ending`](Self::ending))
 /// or [`between`](Self::between) to specify the time range. Mixing the two styles
 /// errors at the terminal.
-#[must_use = "HistoricalDataBuilder does nothing until you call .fetch() or .stream()"]
+#[must_use = "HistoricalDataBuilder does nothing until you call .fetch(), .fetch_once(), .snapshot_once() or .stream()"]
 pub struct HistoricalDataBuilder<'a, C> {
     client: &'a C,
     contract: &'a Contract,
@@ -191,6 +191,46 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
         Ok(trim_to_range(data, self.between))
     }
 
+    /// Subscribe to one finite historical response, retaining request notices.
+    ///
+    /// Writes keep_up_to_date=false once, with no reset retry. Consume envelopes
+    /// through HistoricalSnapshotUpdate::End to prove completion; channel closure alone
+    /// is not a complete result. Supports ending/duration and between; native
+    /// batches remain untrimmed for between, so callers own range trimming/bounds.
+    /// Optional wire fields retain their presence; invalid/missing dates fail.
+    /// End marks native snapshot completion, so cleanup sends no cancel after End.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn run(client: &ibapi::client::blocking::Client, contract: &ibapi::contracts::Contract) -> Result<(), ibapi::Error> {
+    /// use ibapi::market_data::historical::{BarSize, HistoricalSnapshotUpdate, ToDuration};
+    /// use ibapi::subscriptions::SubscriptionItem;
+    /// let response = client.historical_data(contract, BarSize::Day).duration(1.days()).snapshot_once()?;
+    /// let mut completed = false;
+    /// while let Some(item) = response.next() {
+    ///     match item? {
+    ///         SubscriptionItem::Data(HistoricalSnapshotUpdate::End { .. }) => { completed = true; break; }
+    ///         other => println!("{other:?}"),
+    ///     }
+    /// }
+    /// response.cancel();
+    /// if !completed { return Err(ibapi::Error::UnexpectedEndOfStream); }
+    /// # Ok(()) }
+    /// ```
+    pub fn snapshot_once(self) -> Result<crate::subscriptions::sync::Subscription<HistoricalSnapshotUpdate>, Error> {
+        let (end_date, duration) = self.resolve_date_spec()?;
+        crate::market_data::historical::sync::historical_snapshot_subscription_once(
+            self.client,
+            self.contract,
+            end_date,
+            duration,
+            self.bar_size,
+            self.what_to_show,
+            self.trading_hours,
+        )
+    }
+
     /// Fetch one strictly completed response without replay on connection reset.
     ///
     /// Requires HistoricalDataEnd; missing completion is UnexpectedEndOfStream.
@@ -302,6 +342,48 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
         )
         .await?;
         Ok(trim_to_range(data, self.between))
+    }
+
+    /// Subscribe to one finite historical response, retaining request notices.
+    ///
+    /// Writes keep_up_to_date=false once, with no reset retry. Consume envelopes
+    /// through HistoricalSnapshotUpdate::End to prove completion; channel closure alone
+    /// is not a complete result. Supports ending/duration and between; native
+    /// batches remain untrimmed for between, so callers own range trimming/bounds.
+    /// Optional wire fields retain their presence; invalid/missing dates fail.
+    /// End marks native snapshot completion, so cleanup sends no cancel after End.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run(client: &ibapi::Client, contract: &ibapi::contracts::Contract) -> Result<(), ibapi::Error> {
+    /// use futures::StreamExt;
+    /// use ibapi::market_data::historical::{BarSize, HistoricalSnapshotUpdate, ToDuration};
+    /// use ibapi::subscriptions::SubscriptionItem;
+    /// let mut response = client.historical_data(contract, BarSize::Day).duration(1.days()).snapshot_once().await?;
+    /// let mut completed = false;
+    /// while let Some(item) = response.next().await {
+    ///     match item? {
+    ///         SubscriptionItem::Data(HistoricalSnapshotUpdate::End { .. }) => { completed = true; break; }
+    ///         other => println!("{other:?}"),
+    ///     }
+    /// }
+    /// response.cancel().await;
+    /// if !completed { return Err(ibapi::Error::UnexpectedEndOfStream); }
+    /// # Ok(()) }
+    /// ```
+    pub async fn snapshot_once(self) -> Result<crate::subscriptions::r#async::Subscription<HistoricalSnapshotUpdate>, Error> {
+        let (end_date, duration) = self.resolve_date_spec()?;
+        crate::market_data::historical::r#async::historical_snapshot_subscription_once(
+            self.client,
+            self.contract,
+            end_date,
+            duration,
+            self.bar_size,
+            self.what_to_show,
+            self.trading_hours,
+        )
+        .await
     }
 
     /// Fetch one strictly completed response without replay on connection reset.

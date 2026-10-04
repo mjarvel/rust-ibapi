@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Historical `snapshot_once` (sync/async) yields finite envelopes with request
+  notices, optional OHLC/volume/WAP/count values and explicit range-end metadata.
+  It preserves zero separately from absent values, rejects invalid/missing bar
+  dates and sends once without retrying connection resets. Its End envelope marks
+  native completion so cleanup after End writes no cancellation. Existing Bar,
+  fetch/fetch_once and ongoing stream behavior remains unchanged.
+
 - `Client::cancel_order_untracked` (sync/async) writes an individual cancellation
   without installing a per-order subscription. Observe broker outcomes through
   `order_update_stream`; successful writing does not confirm cancellation. This

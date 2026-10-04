@@ -29,6 +29,8 @@ use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
 pub(crate) mod common;
+mod snapshot;
+pub use snapshot::{HistoricalSnapshotBar, HistoricalSnapshotUpdate};
 
 mod builder;
 pub use builder::{HistoricalDataBuilder, HistoricalScheduleBuilder, HistoricalTicksBuilder};

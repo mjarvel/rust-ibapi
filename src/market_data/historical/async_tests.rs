@@ -1367,3 +1367,133 @@ async fn strict_once_preserves_error_and_rejects_wrong_end() {
     assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "got {result:?}");
     assert_eq!(request_message_count(&bus), 1);
 }
+use crate::market_data::historical::HistoricalSnapshotUpdate;
+use prost::Message;
+
+// Exercise the production decoder after modifying only presence bits in builder bytes.
+fn snapshot_frame(absent: bool, invalid_date: bool) -> crate::messages::ResponseMessage {
+    let bytes = historical_data_response()
+        .bar(
+            historical_data_daily_bar("20261002")
+                .ohlc(1.123456789, 2.0, 1.0, 2.0)
+                .volume(0.0)
+                .wap(0.0)
+                .count(0),
+        )
+        .encode_proto();
+    let mut raw = crate::proto::HistoricalData::decode(bytes.as_slice()).unwrap();
+    let bar = &mut raw.historical_data_bars[0];
+    if absent {
+        bar.volume = None;
+        bar.wap = None;
+        bar.bar_count = None;
+    }
+    if invalid_date {
+        bar.date = Some("invalid".into());
+    }
+    proto_response(IncomingMessages::HistoricalData, raw.encode_to_vec())
+}
+
+#[tokio::test]
+async fn snapshot_once_preserves_optional_fields_notice_date_and_ended_cleanup() {
+    for absent in [false, true] {
+        let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+            proto_error_response(9000, 2188, "original warning"),
+            snapshot_frame(absent, false),
+            proto_response(
+                IncomingMessages::HistoricalDataEnd,
+                historical_data_end_response()
+                    .start_date_str("20261002 00:00:00 UTC")
+                    .end_date_str("20261003 00:00:00 UTC")
+                    .encode_proto(),
+            ),
+        ]));
+        let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+        let contract = test_contract();
+        let mut response = client
+            .historical_data(&contract, BarSize::Day)
+            .duration(Duration::days(1))
+            .snapshot_once()
+            .await
+            .unwrap();
+        assert!(
+            matches!(response.next().await, Some(Ok(SubscriptionItem::Notice(notice))) if notice.code == 2188 && notice.message == "original warning")
+        );
+        let Some(Ok(SubscriptionItem::Data(HistoricalSnapshotUpdate::Historical { bars }))) = response.next().await else {
+            panic!("missing bars")
+        };
+        assert_eq!(bars[0].date, BarTimestamp::Date(date!(2026 - 10 - 02)));
+        assert_eq!(bars[0].open, Some(1.123456789));
+        assert_eq!(bars[0].volume, if absent { None } else { Some(0.0) });
+        assert_eq!(bars[0].wap, if absent { None } else { Some(0.0) });
+        assert_eq!(bars[0].count, if absent { None } else { Some(0) });
+        assert!(
+            matches!(response.next().await, Some(Ok(SubscriptionItem::Data(HistoricalSnapshotUpdate::End { end, .. }))) if end == datetime!(2026-10-03 00:00:00 UTC))
+        );
+        // The new finite decoder marks End; cleanup releases routing without a wire cancel.
+        response.cancel().await;
+        drop(response);
+        assert_eq!(request_message_count(&bus), 1);
+        assert_request(
+            &bus,
+            0,
+            &historical_data_request()
+                .request_id(TEST_REQ_ID_FIRST)
+                .contract(&contract)
+                .end_date(None)
+                .duration(Duration::days(1))
+                .bar_size(BarSize::Day)
+                .what_to_show(Some(WhatToShow::Trades))
+                .use_rth(true)
+                .keep_up_to_date(false),
+        );
+    }
+}
+
+#[tokio::test]
+async fn snapshot_once_invalid_date_and_reset_fail_without_replay() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![snapshot_frame(true, true)]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let contract = test_contract();
+    let mut response = client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .snapshot_once()
+        .await
+        .unwrap();
+    assert!(matches!(response.next().await, Some(Err(Error::Parse(_, _, _)))));
+    assert_eq!(request_message_count(&bus), 1);
+    let reset_bus = Arc::new(MessageBusStub::default().with_connection_resets(1));
+    let reset_client = Client::stubbed(reset_bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let mut response = reset_client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .snapshot_once()
+        .await
+        .unwrap();
+    assert!(matches!(response.next().await, Some(Err(Error::ConnectionReset))));
+    assert_eq!(request_message_count(&reset_bus), 1);
+}
+
+#[tokio::test]
+async fn snapshot_once_channel_closure_is_not_an_end() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![snapshot_frame(false, false)]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let contract = test_contract();
+    let mut response = client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .snapshot_once()
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.next().await,
+        Some(Ok(SubscriptionItem::Data(HistoricalSnapshotUpdate::Historical { .. })))
+    ));
+    assert!(response.next().await.is_none());
+    assert_eq!(request_message_count(&bus), 1);
+    assert!(matches!(
+        response.cancel_and_drain(tokio::time::Instant::now()).await.unwrap(),
+        crate::subscriptions::Drained::Unconfirmed
+    ));
+}

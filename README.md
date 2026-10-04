@@ -55,6 +55,11 @@ use ibapi::client::blocking::Client;  // blocking client
 
 Applications that own reconnect and request-generation policy can use historical
 `fetch_once()` for a strictly completed, non-retrying bar request. Applications
+that also need request notices and optional wire-field presence can use historical
+`snapshot_once()`, consume every envelope through `HistoricalSnapshotUpdate::End`,
+then release the subscription. Its finite End proves completion; channel closure
+alone does not. Missing or invalid dates fail rather than becoming epoch, and
+optional values preserve explicit zero. Applications
 using continuous `order_update_stream()` can use `cancel_order_untracked(id, "")`
 to write a cancellation without creating a per-order receiver. A local write is
 not broker acceptance; keep observing status, executions and errors. See the

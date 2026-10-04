@@ -144,7 +144,7 @@ fn check_all() -> Roster {
     use crate::accounts::{AccountSummaryResult, AccountUpdate, AccountUpdateMulti, PnL, PnLSingle, PositionUpdate, PositionUpdateMulti};
     use crate::contracts::{ContractDetails, OptionChain, OptionComputation};
     use crate::display_groups::DisplayGroupUpdate;
-    use crate::market_data::historical::{HistoricalBarUpdate, TickBidAsk, TickLast, TickMidpoint};
+    use crate::market_data::historical::{HistoricalBarUpdate, HistoricalSnapshotUpdate, TickBidAsk, TickLast, TickMidpoint};
     use crate::market_data::realtime::{Bar, BidAsk, MarketDepths, MidPoint, TickTypes, Trade};
     use crate::news::{NewsArticle, NewsBulletin};
     use crate::orders::{CancelOrder, Executions, ExerciseOptions, OrderUpdate, Orders, PlaceOrder};
@@ -165,6 +165,7 @@ fn check_all() -> Roster {
     check_stream::<OptionComputation>(&mut roster);
     check_stream::<DisplayGroupUpdate>(&mut roster);
     check_stream::<HistoricalBarUpdate>(&mut roster);
+    check_stream::<HistoricalSnapshotUpdate>(&mut roster);
     check_stream::<Bar>(&mut roster);
     check_stream::<BidAsk>(&mut roster);
     check_stream::<MarketDepths>(&mut roster);

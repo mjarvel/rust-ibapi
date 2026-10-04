@@ -1,3 +1,4 @@
+use super::HistoricalSnapshotUpdate;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,6 +290,35 @@ pub(crate) async fn historical_data(
         historical_data_once(client, contract, end_date, duration, bar_size, what_to_show, trading_hours).await
     })
     .await
+}
+
+// Builder-fed internal encoder seam, matching historical_data_once's flat arguments.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn historical_snapshot_subscription_once(
+    client: &Client,
+    contract: &Contract,
+    end_date: Option<OffsetDateTime>,
+    duration: Duration,
+    bar_size: BarSize,
+    what_to_show: WhatToShow,
+    trading_hours: TradingHours,
+) -> Result<Subscription<HistoricalSnapshotUpdate>, Error> {
+    common::validate_historical_data(client.server_version(), contract, end_date, Some(what_to_show))?;
+
+    let builder = client.request();
+    let request = encoders::encode_request_historical_data(
+        builder.request_id(),
+        contract,
+        end_date,
+        duration,
+        bar_size,
+        Some(what_to_show),
+        trading_hours.use_rth(),
+        false,
+        &Vec::<crate::contracts::TagValue>::default(),
+    )?;
+
+    builder.send::<HistoricalSnapshotUpdate>(request).await
 }
 
 // Builder-fed wire seam: the public API already names optional inputs.

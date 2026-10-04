@@ -227,3 +227,25 @@ No code changes required, but observable at runtime:
 - Examples: `examples/async` and `examples/sync`
 - README: [Handling notifications](../README.md#handling-notifications)
 - Issues: <https://github.com/wboayue/rust-ibapi/issues>
+
+## Finite historical envelopes with optional values
+
+Use `client.historical_data(&contract, bar_size).duration(duration).snapshot_once()`
+(async callers await it) when an application needs all request notices and field
+presence without reset replay. It sends keep_up_to_date=false once and returns
+`Subscription<HistoricalSnapshotUpdate>`:
+
+- Historical { bars }: each HistoricalSnapshotBar retains a validated date/instant
+  and optional OHLC, volume, WAP and count. Present zero stays Some(0); absent/unset
+  stays None. Missing or invalid dates are errors, not synthesized epoch values.
+- End { start, end }: actual broker range metadata and native completion. Stop at
+  this envelope; channel closure without it proves no complete result. Cancel/drop
+  after End releases routing without a wire cancellation.
+- SubscriptionItem::Notice retains nonterminal request notices. Terminal errors
+  remain Err, and ConnectionReset is never retried by this method.
+
+The builder accepts duration/ending and between. Unlike fetch's convenience trim,
+this envelope API retains native batches; callers using between own range trimming.
+Existing Bar/HistoricalData, fetch, fetch_once and stream shapes remain unchanged.
+This method neither paginates nor sets caller deadlines/row limits; applications
+must bound reading, pacing and cleanup themselves.
