@@ -2,6 +2,7 @@ use super::*;
 use crate::common::test_utils::helpers::proto_response;
 use crate::testdata::builders::market_data::{historical_data_bar, historical_data_response};
 use crate::testdata::builders::ResponseProtoEncoder;
+use prost::Message;
 
 // Existing fixture bytes supply the payload; mutate only the wire presence/sentinel fields.
 fn bar_proto() -> proto::HistoricalData {
@@ -71,4 +72,17 @@ fn incomplete_cancellation_requires_request_identity() {
         HistoricalSnapshotUpdate::cancel_message(crate::server_versions::PROTOBUF_REST_MESSAGES_3, None, None),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+#[test]
+fn decimal_minus_one_is_preserved_without_guessing_the_requested_price_family() {
+    let mut raw = bar_proto();
+    raw.historical_data_bars[0].volume = Some("-1".into());
+    raw.historical_data_bars[0].wap = Some("-1".into());
+    raw.historical_data_bars[0].bar_count = Some(-1);
+    let bar = decode(raw).unwrap();
+    assert_eq!(bar.volume, Some(-1.0));
+    assert_eq!(bar.wap, Some(-1.0));
+    assert_eq!(bar.count, None);
+    assert_eq!(bar.low, Some(-1.0));
 }

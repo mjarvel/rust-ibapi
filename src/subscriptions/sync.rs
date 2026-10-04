@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use log::{debug, error, warn};
 
 use super::common::{
-    debug_assert_request_id_routable, drain_outcome, filter_notice, is_undeclared, DecoderContext, Drained, RoutedItem, SubscriptionItem,
+    debug_assert_request_id_routable, drain_outcome, filter_notice, is_undeclared, notice_item, DecoderContext, Drained, RoutedItem, SubscriptionItem,
 };
 use super::{log_cancel_error, StreamDecoder};
+use crate::client::ids::RequestId;
 use crate::errors::Error;
 use crate::transport::{InternalSubscription, MessageBus, SharedTicket};
 
@@ -41,7 +42,6 @@ pub struct Subscription<T: StreamDecoder<T>> {
     context: DecoderContext,
     message_bus: Arc<dyn MessageBus>,
     request_id: Option<i32>,
-    order_id: Option<i32>,
     shared: Option<SharedTicket>,
     phantom: PhantomData<T>,
     cancelled: AtomicBool,
@@ -61,8 +61,9 @@ enum NextAction<T> {
 #[allow(private_bounds)]
 impl<T: StreamDecoder<T>> Subscription<T> {
     pub(crate) fn new(message_bus: Arc<dyn MessageBus>, subscription: InternalSubscription, context: DecoderContext) -> Self {
-        let request_id = subscription.request_id;
-        let order_id = subscription.order_id;
+        // Raw from here on: the public accessor and the decoders' cancel
+        // messages speak `i32`.
+        let request_id = subscription.request_id.map(RequestId::raw);
         let shared = subscription.shared;
 
         debug_assert_request_id_routable::<T, T>(request_id);
@@ -71,7 +72,6 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             context,
             message_bus,
             request_id,
-            order_id,
             shared,
             subscription,
             phantom: PhantomData,
@@ -82,13 +82,13 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         }
     }
 
-    /// Cancel the subscription
+    /// Cancel the subscription.
+    ///
+    /// Writes TWS's cancel unless the request has already finished (end
+    /// marker or snapshot end) or its type has none. Either way the
+    /// subscription stops receiving: it yields what was already queued, then
+    /// `Err(Error::Cancelled)`, then ends. Idempotent; also called on drop.
     pub fn cancel(&self) {
-        // Skip on snapshot subscriptions whose data already arrived.
-        if self.snapshot_ended.load(Ordering::Relaxed) {
-            return;
-        }
-
         // One atomic swap, not a load then a store: two threads cancelling the
         // same handle would otherwise both reach the bus, and on a shared
         // stream that releases the count twice.
@@ -96,30 +96,22 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             return;
         }
 
-        if let Some(request_id) = self.request_id {
-            if let Some(message) = self.request_cancel_message() {
-                if let Err(e) = self.message_bus.cancel_subscription(request_id, &message) {
-                    log_cancel_error("subscription", &e);
-                }
-                self.subscription.cancel();
-            }
-        } else if let Some(order_id) = self.order_id {
-            if let Ok(message) = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)) {
-                if let Err(e) = self.message_bus.cancel_order_subscription(order_id, &message) {
-                    log_cancel_error("order subscription", &e);
-                }
-                self.subscription.cancel();
-            }
-        } else if let Some(ticket) = self.shared {
+        if let Some(ticket) = self.shared {
             // The count is released whether or not the type has a cancel message.
             let message = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)).ok();
             if let Err(e) = self.message_bus.cancel_shared_subscription(ticket, message.as_deref()) {
                 log_cancel_error("shared subscription", &e);
             }
-            self.subscription.cancel();
-        } else {
-            debug!("Could not determine cancel method")
+        } else if let Some(message) = self.pending_cancel() {
+            // Id-routed, while TWS may still be running the request. The write
+            // goes whether or not it reaches TWS.
+            if let Err(e) = self.message_bus.send_message(&message) {
+                log_cancel_error("subscription", &e);
+            }
         }
+        // Released either way (`order_update_stream`, which has no id, included),
+        // so a handle kept after `cancel()` stops collecting frames.
+        self.subscription.cancel();
     }
 
     /// Returns the request ID associated with this subscription.
@@ -133,11 +125,11 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         self.ended_natively.load(Ordering::Relaxed)
     }
 
-    /// The cancel a request-id subscription writes, if any. `None` once the
-    /// stream has seen its end marker: the cancel would name a request TWS
-    /// already finished.
-    fn request_cancel_message(&self) -> Option<Vec<u8>> {
-        if self.ended_natively() {
+    /// The cancel a subscription that isn't shared writes, if any. `None` when the
+    /// type has none, or once the stream has seen its end marker or snapshot
+    /// end: the cancel would name a request TWS already finished.
+    fn pending_cancel(&self) -> Option<Vec<u8>> {
+        if self.ended_natively() || self.snapshot_ended.load(Ordering::Relaxed) {
             return None;
         }
         T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)).ok()
@@ -165,7 +157,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     /// query with no end marker yet. So the drain usually waits out the whole
     /// result: size `deadline` for it, and prefer narrow queries. A stream with
     /// no end marker (market data) always ends `Unconfirmed`. Subscriptions
-    /// without a request id (shared streams) are cancelled as by
+    /// without a request id (shared, order and order-update streams) are cancelled as by
     /// [`cancel`](Self::cancel) and return `Unconfirmed` immediately.
     ///
     /// # Examples
@@ -190,7 +182,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     /// }
     /// ```
     pub fn cancel_and_drain(self, deadline: Instant) -> Result<Drained, Error> {
-        // A finished snapshot is complete at TWS too, and `cancel()` skips it.
+        // A finished snapshot is complete at TWS too; `cancel()` writes nothing for it.
         if self.ended_natively() || self.snapshot_ended.load(Ordering::Relaxed) {
             return Ok(Drained::Ended);
         }
@@ -205,10 +197,10 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         }
 
         // Write the cancel but keep the route: `cancel()` would unregister it
-        // (`MessageBus::cancel_subscription`), and then TWS's end marker could
+        // (`InternalSubscription::cancel`), and then TWS's end marker could
         // not reach us. The route goes when the subscription drops.
         if !self.cancelled.swap(true, Ordering::Relaxed) {
-            if let Some(message) = self.request_cancel_message() {
+            if let Some(message) = self.pending_cancel() {
                 if let Err(e) = self.message_bus.send_message(&message) {
                     log_cancel_error("subscription", &e);
                 }
@@ -298,7 +290,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
                     NextAction::Return(Some(Err(err)))
                 }
             },
-            Some(RoutedItem::Notice(notice)) => NextAction::Return(Some(Ok(SubscriptionItem::Notice(notice)))),
+            Some(RoutedItem::Notice(notice)) => NextAction::Return(Some(Ok(notice_item(notice)))),
             Some(RoutedItem::Error(Error::Notice(notice))) if T::is_nonterminal_notice(&notice) => {
                 NextAction::Return(Some(Ok(SubscriptionItem::Notice(notice))))
             }

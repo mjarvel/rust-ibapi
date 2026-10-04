@@ -9,7 +9,7 @@
 //! and an unrecognised message id has already collapsed to `NotValid`.
 //!
 //! That distinction is the whole point. The failure under investigation in
-//! `plans/tick-by-tick-reconnect-decode-desync.md` is a *framing* desync: a
+//! #891 is a *framing* desync: a
 //! length prefix that does not describe the frame that follows, after which
 //! every subsequent read starts mid-message. A recorder-based capture cannot
 //! contain the evidence, because the corrupted field is the one it discards.
@@ -31,13 +31,10 @@
 //!
 //! # Limits
 //!
-//! Bytes consumed by a `read_exact` that then *fails* never reach the tap — the
-//! read has taken them off the socket and dropped them before returning. So a
-//! `.bin` is byte-exact only for reads that completed. A desync caused that way
-//! is still visible (the next prefix in the capture is the shifted one), but the
-//! lost bytes are simply absent, and the capture will not replay against the
-//! wire byte for byte. See F8 in
-//! `plans/tick-by-tick-reconnect-decode-desync.md`.
+//! The tap sees a prefix or body only once it is complete. A read that times out
+//! partway keeps its bytes and resumes (#892), so a split frame is captured
+//! byte-exact. A frame cut short by EOF, a hard socket error, or the mid-frame
+//! stall limit leaves only its completed parts, and the capture ends there.
 //!
 //! # Cost
 //!

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use serial_test::serial;
 
 use super::*;
+use crate::client::ids::{OrderId, RequestId};
 use crate::common::test_utils::helpers::{error_frame, managed_accounts_frame, next_valid_id_frame};
 use crate::messages::{encode_raw_length, IncomingMessages, OutgoingMessages};
 use crate::server_versions;
@@ -27,11 +28,11 @@ fn accessors_round_trip() {
     assert!(client.time_zone().is_none());
     assert!(client.is_connected());
 
-    let r1 = client.next_request_id();
-    let r2 = client.next_request_id();
+    let r1 = client.mint_request_id();
+    let r2 = client.mint_request_id();
     assert!(r2 > r1, "request ids should increment");
 
-    client.raise_next_order_id(9000);
+    client.raise_next_order_id(OrderId::from(9000));
     let o1 = client.next_order_id();
     let o2 = client.next_order_id();
     assert_eq!(o1, 9000);
@@ -65,8 +66,8 @@ fn send_helpers_round_trip_through_bus() {
     let bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(bus.clone(), SERVER_VERSION);
 
-    client.send_request(1, vec![0x01]).expect("send_request");
-    client.send_order(2, vec![0x02]).expect("send_order");
+    client.send_request(RequestId::nth(1), vec![0x01]).expect("send_request");
+    client.send_order(OrderId::from(2), vec![0x02]).expect("send_order");
     client.send_message(vec![0x03]).expect("send_message");
     client
         .send_shared_request(OutgoingMessages::RequestCurrentTime, vec![0x04])
@@ -97,6 +98,22 @@ fn handshake_frames() -> Vec<Vec<u8>> {
     ]
 }
 
+/// A server whose next valid order id is already in the request range is
+/// refused at connect: every order the session placed would collide with
+/// request ids (#789).
+#[test]
+fn connect_rejects_next_valid_id_in_request_range() {
+    let mut frames = handshake_frames();
+    frames[1] = next_valid_id_frame(crate::client::ids::REQUEST_ID_FLOOR);
+    let (addr, _h) = spawn_handshake_listener(frames);
+
+    match Client::connect(&addr.to_string(), 100) {
+        Err(Error::ConnectionRejected(message)) => assert!(message.contains("next valid order id"), "{message}"),
+        Err(other) => panic!("expected ConnectionRejected, got {other:?}"),
+        Ok(_) => panic!("connect accepted a next valid order id in the request range"),
+    }
+}
+
 fn binary_text(msg_id: i32, payload: &str) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&msg_id.to_be_bytes());
@@ -120,7 +137,7 @@ fn connect_handshakes_against_real_socket() {
 /// frame-reading free function, and what it writes has to be the wire bytes
 /// with their length prefixes intact. That prefix is the field
 /// `MessageRecorder` discards and the one a framing desync corrupts — see
-/// `plans/tick-by-tick-reconnect-decode-desync.md`.
+/// #891.
 ///
 /// Serial: `temp_env` mutates the process environment, so a parallel test that
 /// opened a connection would write into this directory too.

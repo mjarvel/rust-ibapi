@@ -1,6 +1,7 @@
 use super::common::{decoders, encoders, verify};
 use super::*;
 use crate::client::blocking::{ClientRequestBuilders, Subscription};
+use crate::client::ids::RequestId;
 use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
 use crate::messages::OutgoingMessages;
 use crate::protocol::{check_version, Features};
@@ -72,7 +73,7 @@ impl Client {
     /// }
     /// ```
     pub fn contract_details_stream<'a>(&'a self, contract: &'a Contract) -> ContractDetailsBuilder<'a, Self> {
-        ContractDetailsBuilder::new(self, contract, self.next_request_id())
+        ContractDetailsBuilder::new(self, contract, self.mint_request_id())
     }
 
     /// Cancels an in-flight contract details request.
@@ -84,12 +85,16 @@ impl Client {
     ///
     /// ```no_run
     /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
     ///
     /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
     ///
-    /// // `request_id` is the id the in-flight `contract_details` call was issued with;
-    /// // cancelling one that has already completed is harmless.
-    /// let request_id = client.next_request_id();
+    /// let contract = Contract::stock("AAPL").build();
+    /// let builder = client.contract_details_stream(&contract);
+    /// let request_id = builder.request_id();
+    /// let _subscription = builder.subscribe().expect("request failed");
+    ///
+    /// // Cancelling a request that has already completed is harmless.
     /// client.cancel_contract_details(request_id).expect("cancel failed");
     /// ```
     pub fn cancel_contract_details(&self, request_id: i32) -> Result<(), Error> {
@@ -305,12 +310,12 @@ impl Client {
 pub(in crate::contracts) fn contract_details_stream(
     client: &Client,
     contract: &Contract,
-    request_id: i32,
+    request_id: RequestId,
     buffer_limit: Option<usize>,
 ) -> Result<Subscription<ContractDetails>, Error> {
     let buffer_limit = contract_details_builder::validate_buffer_limit(buffer_limit)?;
     verify::verify_contract(client.server_version, contract)?;
-    let packet = encoders::encode_request_contract_data(request_id, contract)?;
+    let packet = encoders::encode_request_contract_data(request_id.raw(), contract)?;
     let request = client.request_with_id(request_id);
     match buffer_limit {
         Some(limit) => {

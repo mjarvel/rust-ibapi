@@ -173,8 +173,11 @@ pub(in crate::<module>) fn decode_my_response(message: &ResponseMessage) -> Resu
     decode_my_response_proto(message.require_proto()?)
 }
 
+// `decode_proto` (trait `crate::proto::decoders::DecodeProto`) maps prost's
+// error to `Error::ProtobufDecode`; `Error` deliberately has no public
+// `From<prost::DecodeError>`, so `prost::Message::decode(..)?` won't compile.
 pub(crate) fn decode_my_response_proto(bytes: &[u8]) -> Result<MyData, Error> {
-    let p = crate::proto::MyResponse::decode(bytes)?;
+    let p = crate::proto::MyResponse::decode_proto(bytes)?;
     Ok(MyData {
         field: p.field.unwrap_or_default(),
     })
@@ -205,7 +208,7 @@ impl Client {
         request_helpers::blocking::one_shot_shared(
             self,
             OutgoingMessages::MyRequest,
-            || encoders::encode_my_request(self.next_request_id(), param),
+            || encoders::encode_my_request(self.mint_request_id().raw(), param),
             expect_proto(IncomingMessages::MyResponse, decoders::decode_my_response_proto),
         )
     }
@@ -227,7 +230,7 @@ impl Client {
         request_helpers::one_shot_shared(
             self,
             OutgoingMessages::MyRequest,
-            || encoders::encode_my_request(self.next_request_id(), param),
+            || encoders::encode_my_request(self.mint_request_id().raw(), param),
             expect_proto(IncomingMessages::MyResponse, decoders::decode_my_response_proto),
         ).await
     }
@@ -318,7 +321,7 @@ pub fn my_api_call(&self) -> Result<MyData, Error> {
     request_helpers::blocking::one_shot_shared(
         self,
         OutgoingMessages::MyRequest,
-        || encode_my_request(self.next_request_id()),
+        || encode_my_request(self.mint_request_id().raw()),
         expect_proto(IncomingMessages::MyResponse, decode_my_response_proto),
     )
 }
@@ -328,7 +331,7 @@ pub async fn my_api_call(&self) -> Result<MyData, Error> {
     request_helpers::one_shot_shared(
         self,
         OutgoingMessages::MyRequest,
-        || encode_my_request(self.next_request_id()),
+        || encode_my_request(self.mint_request_id().raw()),
         expect_proto(IncomingMessages::MyResponse, decode_my_response_proto),
     ).await
 }

@@ -1,6 +1,7 @@
 //! Common request/response helper functions to reduce boilerplate across modules
 
 use crate::messages::ResponseMessage;
+use crate::proto::decoders::DecodeProto;
 use crate::proto::payload::ProtoPayload;
 use crate::Error;
 
@@ -89,7 +90,7 @@ where
 {
     move |message| {
         let bytes = message.expect_type(P::MESSAGE_ID)?.require_proto()?;
-        decode(P::decode(bytes)?)
+        decode(P::decode_proto(bytes)?)
     }
 }
 
@@ -159,8 +160,8 @@ mod sync_helpers {
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
         crate::common::retry::blocking::retry_on_connection_reset(client, || {
-            let request_id = client.next_request_id();
-            let request = encoder(request_id)?;
+            let request_id = client.mint_request_id();
+            let request = encoder(request_id.raw())?;
             let subscription = client.send_request(request_id, request)?;
 
             super::fold_one_shot(subscription.next(), &processor)
@@ -230,8 +231,8 @@ mod async_helpers {
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
         crate::common::retry::retry_on_connection_reset(client, || async {
-            let request_id = client.next_request_id();
-            let request = encoder(request_id)?;
+            let request_id = client.mint_request_id();
+            let request = encoder(request_id.raw())?;
             let mut subscription = client.send_request(request_id, request).await?;
 
             super::fold_one_shot(subscription.next().await, &processor)

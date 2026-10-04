@@ -196,6 +196,104 @@ utoipa = "6"
 
 Enabling `utoipa` alone, as 4.x did, now fails to compile with a message naming `utoipa-6`: the name remains as an internal switch. utoipa 6 needs Rust 1.88 or later. Users without the feature are not affected.
 
+### 15. `Error::ProtobufDecode` carries `errors::ProtobufDecodeError`
+
+`Error::ProtobufDecode` held a `prost::DecodeError`, and `Error` implemented `From<prost::DecodeError>`. prost is pre-1.0, so each prost minor release would have been a breaking change to `ibapi` through this variant, its only public exposure. The payload is now the opaque `ibapi::errors::ProtobufDecodeError` (`Debug`, `Clone`, `Display`, `std::error::Error`, `Send + Sync`), and the `From` impl is removed.
+
+- **The variant and its `Display` text are unchanged** (`protobuf decode error: ...`), so matching `Error::ProtobufDecode(_)` and printing the error still work.
+- **Code that named `prost::DecodeError` from the payload, or converted one with `?` / `.into()`, no longer compiles.** Use the payload's `Display`, or map your own prost errors into your own error type (`Error::Simple(e.to_string())` if it must be an `ibapi::Error`).
+- **`ProtobufDecodeError` has no public constructor**, so code outside the crate can't build an `Error::ProtobufDecode` (e.g. in tests); use another variant.
+- **`source()` on `Error::ProtobufDecode` now returns `None`.** The decode detail was in both the message and the source, so chain printers (`anyhow`'s `{:#}`) showed it twice; it stays in the message.
+
+```rust,ignore
+// 4.2
+if let Err(Error::ProtobufDecode(e)) = result {
+    let e: prost::DecodeError = e;
+    eprintln!("{e}");
+}
+
+// 5.0
+if let Err(Error::ProtobufDecode(e)) = result {
+    eprintln!("{e}"); // ibapi::errors::ProtobufDecodeError
+}
+```
+
+`Error::ParseTime` keeps its `time::error::Parse` payload: `time` is part of the API through `OffsetDateTime` and `Date`, so wrapping its error would gain nothing.
+
+### 16. Order methods take `impl Into<OrderId>`
+
+`place_order`, `submit_order`, `cancel_order`, `order_builder::market_f_hedge`, `order_builder::bracket_order` and `OrderBuilder::parent` take `impl Into<OrderId>` instead of `i32`, so the ids in `BracketOrderIds` and `AttachedOrderIds` pass straight in. An `i32` value or literal still compiles. What breaks is an argument whose type was inferred from the old `i32` parameter: with a generic parameter, the compiler can no longer tell what to convert to.
+
+```rust,ignore
+// 4.2: the i32 parameter picked the target type
+client.place_order(row_id.try_into()?, &contract, &order)?; // row_id: i64
+client.cancel_order(text.parse().unwrap(), "")?;
+let cancel = Client::cancel_order;
+
+// 5.0: name the type
+client.place_order(i32::try_from(row_id)?, &contract, &order)?;
+client.cancel_order(text.parse::<i32>().unwrap(), "")?;
+let cancel: fn(&Client, i32, &str) -> _ = Client::cancel_order;
+```
+
+The same applies to `.into()` from a narrower integer and to `Default::default()`. `OrderId::from(..)` works too.
+
+### 17. `order_builder::auction_limit` and the `OrderType` auction variants are removed
+
+Since 4.2 dropped `auction_limit`'s strategy parameter ([4.x guide §15](migration-4.0.md#15-orderbuilder-covers-the-integer-coded-order-enums-and-auctionstrategy-is-removed)), it has built the same `Order` as `limit_order`. Routing the contract to `BOX` is what makes it an auction order. `orders::builder::OrderType::AuctionLimit` and `OrderType::AuctionRelative` are removed for the same reason. They sent `LMT` and `REL`, the same as `OrderType::Limit` and `OrderType::Relative`, and validated the same way; serialized `OrderType` values naming them no longer deserialize. TWS still applies the account's configured auction strategy.
+
+```rust,ignore
+// 4.2
+let order = auction_limit(Action::Buy, 10.0, 1.25);
+let builder = builder.order_type(OrderType::AuctionLimit);
+
+// 5.0
+let order = limit_order(Action::Buy, 10.0, 1.25);
+let builder = builder.order_type(OrderType::Limit);
+```
+
+### 18. `MarketDepths` gains `Reset`
+
+A market-depth subscription used to yield code 317 ("Market depth data has been RESET") as `SubscriptionItem::Notice`, which `filter_data()` / `iter_data()` log and drop. A consumer on those adapters never saw the reset and merged the rebuilt rows into its stale book. The subscription now yields `MarketDepths::Reset` as data instead, so exhaustive matches on `MarketDepths` need the arm. On it, empty the book you hold; the rows that follow rebuild it. Code 316 (depth HALTED) still ends the stream with `Err` (#899).
+
+```rust,ignore
+// 5.0
+match depth? {
+    MarketDepths::MarketDepth(row) => apply(&mut book, row),
+    MarketDepths::MarketDepthL2(row) => apply_l2(&mut book, row),
+    MarketDepths::Reset => book.clear(),
+}
+```
+
+If you matched `SubscriptionItem::Notice` with code 317 on a depth subscription, move that handling to the `Reset` arm.
+
+### 19. `NoticeCategory::RequestError`; notice predicates follow `category()`
+
+Every code in 200..=399 not claimed by an earlier rule was `NoticeCategory::OrderRejection`, although some are failed requests that have nothing to do with orders: 316 (depth HALTED), 354 (market data not subscribed), 366 (no historical query). Those codes, listed in `REQUEST_ERROR_CODES`, are now `NoticeCategory::RequestError`, with `Notice::is_request_error()`. They still end the request, as before. Codes that also answer orders stay `OrderRejection`: 200 (no security definition) and 320-323 (server errors on a request). `NoticeCategory` is `#[non_exhaustive]`, so a match needs no new arm, but a wildcard arm will now see these codes (#898).
+
+`Notice::is_warning()` and `Notice::is_order_rejection()` tested a code range; every `is_*` category predicate is now `category() == X` for its variant `X`, so they never overlap:
+
+| Predicate | No longer `true` for |
+|---|---|
+| `is_warning()` | 2188 (a `DataAdvisory`) |
+| `is_order_rejection()` | 202 (`Cancellation`), 317 (`DataAdvisory`), 399 with a `Warning:` line (`Warning`), `REQUEST_ERROR_CODES` (`RequestError`) |
+
+If you need the old range test, use the constant:
+
+```rust,ignore
+// 4.x
+if notice.is_order_rejection() { /* any 200..=399 */ }
+
+// 5.0
+if ibapi::ORDER_REJECTION_CODE_RANGE.contains(&notice.code) { /* any 200..=399 */ }
+// or, usually what was meant:
+if notice.is_order_rejection() || notice.is_request_error() { /* failed */ }
+```
+
+### 20. `Client::next_request_id()` is removed
+
+`next_request_id()` (blocking and async) handed out a fresh request id that no request used. Nothing in the API accepts a caller-chosen request id, so the value had no use: passing it to `cancel_contract_details` or `cancel_historical_ticks` cancelled nothing. The ids of requests in flight come from `Subscription::request_id()` and `ContractDetailsBuilder::request_id()`, both unchanged, and the new `TickSubscription::request_id()`. Delete any call; to cancel a request, drop its subscription or call `cancel()` on it.
+
 ## Behavioral changes
 
 No code changes required, but observable at runtime:
@@ -203,6 +301,9 @@ No code changes required, but observable at runtime:
 - **Shared streams are cancelled by their last subscriber.** `positions`, `account_updates` and `news_bulletins` are one stream per client at TWS, and their cancel carries no id. Dropping one of several live subscriptions to the same stream used to send that cancel and end the stream for the others; both clients now send it only when the last one ends. An async `Subscription` can be dropped on any thread, including one with no Tokio runtime; its cancel still goes out.
 - **Blocking shared subscriptions each receive the whole stream.** On the blocking client, live subscriptions of the same shared type (`positions`, `open_orders`, ...) used to read one queue, so each response reached whichever of them read it first. Every live subscription of the type now receives every response, as on the async client, and a new subscription no longer starts with items left over from before it was made. Responses still cannot be attributed to the request that caused them — see [Multi-Threading](../README.md#multi-threading).
 - **A position frame without its contract is an error.** `Position` (`positions`), `PositionMulti` (`positions_multi`) and `PortfolioValue` (`account_updates`) decoded a frame with no `contract` submessage as `Contract::default()` — a US stock with contract id `0` on `SMART` in `USD`, indistinguishable from a real position. Each now fails with `Error::Parse` whose field is `contract` and whose reason names the message (`missing in Position` and so on), as `OpenOrder`, `CompletedOrder` and `ExecutionDetails` have since #829; the subscription yields the error and ends, as for any decode error. A `PortfolioValue` arriving during the connection handshake is decoded only when a startup callback is installed, and a failure there becomes a `HANDSHAKE_DECODE_FAILURE_CODE` notice on the notice stream (at the first connect, only a stream pre-bound with `ClientBuilder::connect_with_notice_stream` sees it). The reference clients do the same for these three messages: Java `EDecoder.processPositionMsgProtoBuf`, `processPositionMultiMsgProtoBuf` and `processPortfolioValueMsgProtoBuf` (and the Python `decoder.py` equivalents, TWS API 10.50) return before the typed callback when the contract is absent. `SymbolSamples` and `ScannerData` are unchanged, still decoding a contract-less row with `Contract::default()`, because the reference clients still deliver those rows; `ContractData` is covered in [§10](#10-securitytype-parses-through-fromstr-and-contractdata-needs-both-submessages).
+- **`Subscription::cancel()` always ends the subscription.** It used to end only subscriptions it wrote a TWS cancel for; order subscriptions (`place_order`, `submit_order`, `cancel_order`, `exercise_options`), `order_update_stream`, `executions`, `option_chain` and streams that had already ended kept delivering until dropped. On the blocking client, the subscription now yields what was already queued, then `Err(Error::Cancelled)`, then ends. On the async client, every clone yields `Err(Error::Cancelled)` at its next poll, then ends. Cancelling an order subscription still does not cancel the order at TWS: use `cancel_order` (#911).
+- **Request ids start at 1,500,000,000.** `Subscription::request_id()` and `ContractDetailsBuilder::request_id()` return values at or above 1,500,000,000 instead of 9000-based ones, and order ids must stay below it: `place_order`, `submit_order` and `cancel_order` return `Error::OrderIdInRequestRange` for an order id at or above it, including the `parent_id`, `preset_stop_loss_order_id` and `preset_profit_taker_order_id` it carries, and so do `exercise_options` and `next_valid_order_id` when the next order id reaches it. Request ids and order ids used to share one range, and an error frame carries a single id, so an order's cancellation or rejection could be delivered to a data subscription holding the same number, and a late error for a finished request could appear on the order-update stream as if it belonged to an order. Routing now decides by range. Ids from `next_order_id()` and `next_valid_order_id()` are unaffected unless your account's sequence has reached the floor, which also makes `connect` fail with `Error::ConnectionRejected`. If you number orders yourself, keep the numbers below 1,500,000,000 (#789).
+- **An unknown message id during the handshake raises `UNKNOWN_MESSAGE_TYPE_CODE`.** A handshake frame whose message id maps to no `IncomingMessages` kind raised `HANDSHAKE_UNKNOWN_FRAME_CODE` (-3); it now raises `UNKNOWN_MESSAGE_TYPE_CODE` (-5), the code the same frame gets after the handshake, so a desynchronized stream reads the same whether or not a reconnect is in flight. `is_handshake_synthetic()` is false for it. `HANDSHAKE_UNKNOWN_FRAME_CODE` still covers a recognized kind with no `StartupMessage` variant, and its text no longer carries the message id. The new `Notice::is_client_synthesized()` is true for every client-synthesized code (any negative code) (#906).
 
 ## Quick migration checklist
 
@@ -220,7 +321,13 @@ No code changes required, but observable at runtime:
 12. Replace `BracketOrderIds::from(vec)` with `BracketOrderIds::try_from(vec)?` — see [§12](#12-bracketorderids-converts-from-veci32-through-tryfrom).
 13. Replace `orders::builder::OrderAnalysis` with `orders::OrderState` — see [§13](#13-orderanalysis-is-removed).
 14. If you enable the `utoipa` feature, rename it to `utoipa-6` and upgrade to utoipa 6 — see [§14](#14-the-utoipa-feature-is-renamed-utoipa-6-and-requires-utoipa-6).
-15. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
+15. Replace uses of `prost::DecodeError` from `Error::ProtobufDecode`, and any `From<prost::DecodeError> for ibapi::Error` conversion — see [§15](#15-errorprotobufdecode-carries-errorsprotobufdecodeerror).
+16. Where an order id argument is converted with `.try_into()`, `.into()`, `.parse()` or `Default::default()`, name the target type (`i32::try_from(..)`, `.parse::<i32>()`) — see [§16](#16-order-methods-take-impl-intoorderid).
+17. Replace `auction_limit(..)` with `limit_order(..)` (same arguments), and `OrderType::AuctionLimit` / `AuctionRelative` with `OrderType::Limit` / `Relative` — see [§17](#17-order_builderauction_limit-and-the-ordertype-auction-variants-are-removed).
+18. Add a `MarketDepths::Reset` arm that empties your book to exhaustive matches on `MarketDepths`, and drop any code-317 notice handling on depth subscriptions — see [§18](#18-marketdepths-gains-reset).
+19. Check code that treats `NoticeCategory::OrderRejection` or `is_order_rejection()` as "any 200..=399 failure": request errors now come as `RequestError` / `is_request_error()`, and `is_warning()` is false for 2188 — see [§19](#19-noticecategoryrequesterror-notice-predicates-follow-category).
+20. Delete calls to `Client::next_request_id()`; take a live request's id from `Subscription::request_id()`, `ContractDetailsBuilder::request_id()` or `TickSubscription::request_id()` — see [§20](#20-clientnext_request_id-is-removed).
+21. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
 
 ## Need help?
 

@@ -2,61 +2,28 @@
 
 use std::time::Duration;
 
-use log::{info, log, warn, Level};
+use log::info;
 
-use crate::connection::common::NoticeSink;
+use crate::client::ids::WireId;
 use crate::errors::Error;
-use crate::messages::{
-    ConnectivityStatus, IncomingMessages, Notice, NoticeCategory, ResponseMessage, CONNECTIVITY_RESTORED_DATA_LOST_CODE,
-    CONNECTIVITY_RESTORED_DATA_MAINTAINED_CODE, UNKNOWN_MESSAGE_TYPE_CODE,
-};
+use crate::messages::{unknown_message_type_notice, IncomingMessages, Notice, ResponseMessage, MESSAGE_ID_LEN};
 use crate::subscriptions::common::RoutedItem;
 
-/// Log severity for a notice, derived from [`Notice::category`] so that every
-/// code in a category logs alike regardless of which numeric band it sits in.
-///
-/// Informational categories log at `warn` (the caller may want to act:
-/// a fallback engaged, a book must be cleared), with two exceptions at `info`:
-/// the cancellation confirmation, and data-farm notices that need no action.
-/// A farm that is OK, `Inactive` ("…available upon demand") or `Connecting` is
-/// routine on nearly every connect; only `Broken` warns.
-/// System connectivity codes are graded by how much they matter: 1102
-/// (restored, data maintained) → info; 1101 (restored, data lost —
-/// resubscribe required) → warn; 1100 (connectivity lost) and 1300 (socket
-/// reset) → error. Order rejections and errors log at `error`.
-fn notice_log_level(notice: &Notice) -> Level {
-    match notice.category() {
-        NoticeCategory::Cancellation => Level::Info,
-        NoticeCategory::Warning
-            if matches!(
-                notice.connectivity_status(),
-                Some(ConnectivityStatus::Ok | ConnectivityStatus::Inactive | ConnectivityStatus::Connecting)
-            ) =>
-        {
-            Level::Info
-        }
-        NoticeCategory::Warning | NoticeCategory::DataAdvisory => Level::Warn,
-        NoticeCategory::SystemMessage => match notice.code {
-            CONNECTIVITY_RESTORED_DATA_MAINTAINED_CODE => Level::Info,
-            CONNECTIVITY_RESTORED_DATA_LOST_CODE => Level::Warn,
-            _ => Level::Error,
-        },
-        NoticeCategory::OrderRejection | NoticeCategory::Error => Level::Error,
-    }
-}
-
-/// Log a notice at [`notice_log_level`].
-pub(crate) fn log_notice(notice: &Notice) {
-    log!(notice_log_level(notice), "{notice}");
+/// Sink for unrouted notices observed during the handshake. Production impls
+/// forward to the per-feature notice broadcaster owned by `Connection`, so
+/// handshake-time notices reach any pre-bound `NoticeStream` the user obtained
+/// from `ClientBuilder::connect_with_notice_stream`.
+pub(crate) trait NoticeSink: Send + Sync {
+    fn deliver(&self, notice: Notice);
 }
 
 /// Log a routed notice/error that arrived bound to an id with no matching
 /// request or order channel. The dispatcher only constructs `Notice` and
 /// `Error` variants for this path; `Response` is unreachable here.
-pub(crate) fn log_orphan(request_id: i32, item: &RoutedItem) {
+pub(crate) fn log_orphan(id: WireId, item: &RoutedItem) {
     match item {
-        RoutedItem::Notice(n) => info!("no recipient for notice (id={request_id}): {n}"),
-        RoutedItem::Error(e) => info!("no recipient for error (id={request_id}): {e}"),
+        RoutedItem::Notice(n) => info!("no recipient for notice (id={id}): {n}"),
+        RoutedItem::Error(e) => info!("no recipient for error (id={id}): {e}"),
         RoutedItem::Response(_) => {}
     }
 }
@@ -68,27 +35,18 @@ pub(crate) fn log_orphan(request_id: i32, item: &RoutedItem) {
 ///
 /// - **Unknown message kind** ([`IncomingMessages::NotValid`]) — nothing can
 ///   ever route this, and it is the shape a framing slip takes. Published to
-///   the notice stream as [`UNKNOWN_MESSAGE_TYPE_CODE`] so a consumer can react
+///   the notice stream as [`UNKNOWN_MESSAGE_TYPE_CODE`](crate::messages::UNKNOWN_MESSAGE_TYPE_CODE) so a consumer can react
 ///   programmatically rather than by reading logs.
 /// - **Known kind, nobody listening** — an ordinary steady-state condition, so
 ///   it stays at `info` and raises no notice.
 ///
 /// The blocking transport logged both at `info` and the async transport logged
 /// neither, which is how the incident in
-/// `plans/tick-by-tick-reconnect-decode-desync.md` produced farm notices and no
+/// #891 produced farm notices and no
 /// decode error.
 pub(crate) fn report_unroutable_frame(message: &ResponseMessage, notice_sink: &dyn NoticeSink) {
     if message.message_type() == IncomingMessages::NotValid {
-        // The Debug dump already carries the id; the notice has no such
-        // fallback, so it interpolates.
-        warn!("unroutable frame: message id maps to no known type — the stream may be desynchronized: {message:?}");
-        notice_sink.deliver(Notice::synthesized(
-            UNKNOWN_MESSAGE_TYPE_CODE,
-            format!(
-                "received a frame with message id {}, which maps to no known type; the stream may be desynchronized",
-                message.message_id()
-            ),
-        ));
+        notice_sink.deliver(unknown_message_type_notice(message));
     } else {
         info!("no recipient found for: {message:?}");
     }
@@ -109,7 +67,7 @@ pub(crate) const MAX_FRAME_LENGTH: usize = 0x00FF_FFFF;
 /// Smallest valid frame body: every TWS frame is `[4-byte BE msg_id][payload]`,
 /// so a body that cannot hold the message id is malformed by definition. An
 /// empty payload after the id is legal.
-pub(crate) const MIN_FRAME_LENGTH: usize = 4;
+pub(crate) const MIN_FRAME_LENGTH: usize = MESSAGE_ID_LEN;
 
 /// Reject a length prefix that cannot describe a TWS frame, before it is used
 /// to size an allocation or drive a `read_exact`.

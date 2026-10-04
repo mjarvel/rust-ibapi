@@ -9,12 +9,12 @@ use crate::accounts::AccountUpdate;
 use crate::common::timezone::{find_timezone, resolve_local};
 use crate::errors::Error;
 use crate::messages::{
-    encode_length, encode_protobuf_message, IncomingMessages, Notice, OutgoingMessages, ResponseMessage, HANDSHAKE_DECODE_FAILURE_CODE,
-    HANDSHAKE_UNKNOWN_FRAME_CODE, PROTOBUF_MSG_ID,
+    encode_length, encode_protobuf_message, unknown_message_type_notice, IncomingMessages, Notice, OutgoingMessages, ResponseMessage,
+    HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, MESSAGE_ID_LEN, PROTOBUF_MSG_ID,
 };
 use crate::orders::{CommissionReport, ExecutionData, OrderData, OrderStatus};
 use crate::server_versions;
-use crate::transport::common::{log_notice, MIN_FRAME_LENGTH};
+use crate::transport::common::NoticeSink;
 
 /// Domain-typed messages delivered to the startup callback during the
 /// connection handshake (initial connect *and* auto-reconnect).
@@ -27,7 +27,9 @@ use crate::transport::common::{log_notice, MIN_FRAME_LENGTH};
 /// ([`Client::notice_stream`](crate::Client::notice_stream)) instead, using
 /// the synthesized codes
 /// [`HANDSHAKE_UNKNOWN_FRAME_CODE`](crate::HANDSHAKE_UNKNOWN_FRAME_CODE) and
-/// [`HANDSHAKE_DECODE_FAILURE_CODE`](crate::HANDSHAKE_DECODE_FAILURE_CODE).
+/// [`HANDSHAKE_DECODE_FAILURE_CODE`](crate::HANDSHAKE_DECODE_FAILURE_CODE). A
+/// frame whose message id maps to no kind raises
+/// [`UNKNOWN_MESSAGE_TYPE_CODE`](crate::UNKNOWN_MESSAGE_TYPE_CODE).
 #[derive(Debug)]
 #[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
@@ -81,28 +83,6 @@ impl StartupMessage {
             StartupMessage::ExecutionDataEnd => IncomingMessages::ExecutionDataEnd,
             StartupMessage::CompletedOrdersEnd => IncomingMessages::CompletedOrdersEnd,
         }
-    }
-}
-
-/// Sink for unrouted notices observed during the handshake. Production impls
-/// forward to the per-feature notice broadcaster owned by `Connection`, so
-/// handshake-time notices reach any pre-bound `NoticeStream` the user obtained
-/// from `ClientBuilder::connect_with_notice_stream`.
-pub(crate) trait NoticeSink: Send + Sync {
-    fn deliver(&self, notice: Notice);
-}
-
-#[cfg(feature = "sync")]
-impl NoticeSink for crate::transport::sync::NoticeBroadcaster {
-    fn deliver(&self, notice: Notice) {
-        self.broadcast(notice);
-    }
-}
-
-#[cfg(feature = "async")]
-impl NoticeSink for crate::transport::r#async::NoticeBroadcaster {
-    fn deliver(&self, notice: Notice) {
-        self.broadcast(notice);
     }
 }
 
@@ -216,17 +196,17 @@ impl ConnectionProtocol for ConnectionHandler {
         message: &mut ResponseMessage,
         ctx: &StartupHandshakeContext<'_>,
     ) -> Result<AccountInfo, Self::Error> {
-        use prost::Message;
+        use crate::proto::decoders::DecodeProto;
 
         let mut info = AccountInfo::default();
 
         match message.message_type() {
             IncomingMessages::NextValidId => {
-                let proto = crate::proto::NextValidId::decode(message.require_proto()?)?;
+                let proto = crate::proto::NextValidId::decode_proto(message.require_proto()?)?;
                 info.next_order_id = proto.order_id;
             }
             IncomingMessages::ManagedAccounts => {
-                let proto = crate::proto::ManagedAccounts::decode(message.require_proto()?)?;
+                let proto = crate::proto::ManagedAccounts::decode_proto(message.require_proto()?)?;
                 info.managed_accounts = proto.accounts_list;
             }
             _ => dispatch_unsolicited_message(server_version, message, ctx),
@@ -242,9 +222,10 @@ impl ConnectionProtocol for ConnectionHandler {
 /// typed frames (`OpenOrder` / `OrderStatus` / account-update / execution /
 /// commission / completed-order, plus the corresponding end markers) decode
 /// into typed [`StartupMessage`] values for the optional startup callback.
-/// Decode failures and unknown frame kinds route to the notice sink with
-/// synthesized codes ([`HANDSHAKE_DECODE_FAILURE_CODE`] and
-/// [`HANDSHAKE_UNKNOWN_FRAME_CODE`]) so observers via
+/// Decode failures, recognized kinds with no typed variant, and unrecognized
+/// message ids route to the notice sink with synthesized codes
+/// ([`HANDSHAKE_DECODE_FAILURE_CODE`], [`HANDSHAKE_UNKNOWN_FRAME_CODE`] and
+/// [`UNKNOWN_MESSAGE_TYPE_CODE`](crate::UNKNOWN_MESSAGE_TYPE_CODE)) so observers via
 /// [`Client::notice_stream`](crate::Client::notice_stream) can detect them.
 pub(crate) fn dispatch_unsolicited_message(_server_version: i32, message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) {
     use crate::accounts::common::decode_account_update_message;
@@ -282,7 +263,7 @@ pub(crate) fn dispatch_unsolicited_message(_server_version: i32, message: &mut R
     match kind {
         IncomingMessages::Error => {
             let notice = Notice::from(&*message);
-            log_notice(&notice);
+            notice.log();
             ctx.notice_sink.deliver(notice);
         }
         IncomingMessages::OpenOrder => dispatch_typed(ctx, kind, || decode_open_order(message), StartupMessage::OpenOrder),
@@ -297,19 +278,18 @@ pub(crate) fn dispatch_unsolicited_message(_server_version: i32, message: &mut R
         IncomingMessages::CompletedOrder => dispatch_typed(ctx, kind, || decode_completed_order(message), StartupMessage::CompletedOrder),
         IncomingMessages::ExecutionDataEnd => dispatch_unit(ctx, StartupMessage::ExecutionDataEnd),
         IncomingMessages::CompletedOrdersEnd => dispatch_unit(ctx, StartupMessage::CompletedOrdersEnd),
+        // An id that maps to no kind is the shape a framing slip takes; it
+        // raises the same code here as in steady-state routing, since a
+        // reconnect runs through this window.
+        IncomingMessages::NotValid => ctx.notice_sink.deliver(unknown_message_type_notice(message)),
         _ => {
-            // Unknown frame kind: log + emit synthesized notice. Fires
-            // regardless of callback presence (no typed variant to receive).
-            //
-            // The id accompanies the kind because an *unrecognized* id renders
-            // as the bare `NotValid` — the same loss `report_unroutable_frame`
-            // repairs for steady-state frames. This is that condition during
-            // the handshake, which is the window a reconnect runs through.
-            let id = message.message_id();
-            warn!("unrouted handshake frame: {kind:?} (message id {id})");
+            // Recognized kind with no typed variant: log + emit synthesized
+            // notice. Fires regardless of callback presence (no typed variant
+            // to receive).
+            warn!("unrouted handshake frame: {kind:?}");
             ctx.notice_sink.deliver(Notice::synthesized(
                 HANDSHAKE_UNKNOWN_FRAME_CODE,
-                format!("unsolicited handshake frame with no typed variant: {kind:?} (message id {id})"),
+                format!("unsolicited handshake frame with no typed variant: {kind:?}"),
             ));
         }
     }
@@ -385,7 +365,7 @@ pub fn parse_connection_time(connection_time: &str) -> (Option<OffsetDateTime>, 
 /// stream fixtures, which supply bodies directly and skip the length prefix
 /// entirely. It used to index straight past the end and panic the dispatcher.
 pub fn parse_raw_message(data: &[u8]) -> Result<ResponseMessage, Error> {
-    let Some((header, payload)) = data.split_first_chunk::<MIN_FRAME_LENGTH>() else {
+    let Some((header, payload)) = data.split_first_chunk::<MESSAGE_ID_LEN>() else {
         return Err(Error::InvalidFrame(format!(
             "frame body of {} bytes cannot hold a message id",
             data.len()

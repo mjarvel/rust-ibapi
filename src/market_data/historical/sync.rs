@@ -195,12 +195,15 @@ impl Client {
     ///
     /// ```no_run
     /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
     ///
     /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
     ///
-    /// // `request_id` is the id the in-flight `historical_ticks` request was issued with.
-    /// let request_id = client.next_request_id();
-    /// client.cancel_historical_ticks(request_id).expect("cancel failed");
+    /// let contract = Contract::stock("MSFT").build();
+    /// let subscription = client.historical_ticks(&contract, 100).trade().expect("request failed");
+    ///
+    /// // Holding the subscription, `subscription.cancel()` (or dropping it) does the same.
+    /// client.cancel_historical_ticks(subscription.request_id()).expect("cancel failed");
     /// ```
     pub fn cancel_historical_ticks(&self, request_id: i32) -> Result<(), Error> {
         check_version(self.server_version(), Features::CANCEL_CONTRACT_DATA)?;
@@ -475,7 +478,13 @@ impl<T: TickDecoder<T>> TickSubscription<T> {
         }
     }
 
-    /// Cancel the historical-ticks request. Safe to call after completion (no-op).
+    /// The request ID TWS knows this request by, for [`Client::cancel_historical_ticks`](crate::client::blocking::Client::cancel_historical_ticks)
+    /// from code that does not hold the subscription, or to match it in logs.
+    pub fn request_id(&self) -> i32 {
+        self.request_id
+    }
+
+    /// Cancel the historical-ticks request. After completion nothing is written.
     /// Also fired automatically on `Drop` for unfinished subscriptions; explicit calls are idempotent.
     ///
     /// # Examples
@@ -494,15 +503,19 @@ impl<T: TickDecoder<T>> TickSubscription<T> {
             return;
         }
 
-        match encoders::encode_cancel_historical_ticks(self.request_id) {
-            Ok(message) => {
-                if let Err(e) = self.message_bus.cancel_subscription(self.request_id, &message) {
-                    log_cancel_error("historical ticks subscription", &e);
+        // After the last batch TWS has finished the request: nothing to
+        // write, but the registration still goes.
+        if !self.done.load(Ordering::Relaxed) {
+            match encoders::encode_cancel_historical_ticks(self.request_id) {
+                Ok(message) => {
+                    if let Err(e) = self.message_bus.send_message(&message) {
+                        log_cancel_error("historical ticks subscription", &e);
+                    }
                 }
-                self.messages.cancel();
+                Err(e) => error!("error encoding cancel historical ticks: {e}"),
             }
-            Err(e) => error!("error encoding cancel historical ticks: {e}"),
         }
+        self.messages.cancel();
     }
 
     /// Blocking iterator yielding `Result<SubscriptionItem<T>, Error>` — both
@@ -744,9 +757,7 @@ impl<T: TickDecoder<T>> TickSubscription<T> {
 
 impl<T: TickDecoder<T>> Drop for TickSubscription<T> {
     fn drop(&mut self) {
-        if !self.done.load(Ordering::Relaxed) {
-            self.cancel();
-        }
+        self.cancel();
     }
 }
 

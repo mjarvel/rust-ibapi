@@ -52,7 +52,7 @@ fn place_and_cleanup(client: &Client, contract: &Contract) -> OrderId {
         .expect("placing order after cancel should succeed");
     assert!(order_id.0 > 0, "new order id should be positive");
     rate_limit();
-    let _ = client.cancel_order(order_id.0, "").expect("cleanup cancel failed");
+    let _ = client.cancel_order(order_id, "").expect("cleanup cancel failed");
     order_id
 }
 
@@ -188,7 +188,7 @@ fn order_builder_limit() {
 
     // Cancel the placed order
     rate_limit();
-    let _ = client.cancel_order(order_id.0, "").expect("cancel_order failed");
+    let _ = client.cancel_order(order_id, "").expect("cancel_order failed");
 }
 
 // Regression test for https://github.com/wboayue/rust-ibapi/issues/426
@@ -200,7 +200,7 @@ fn cancel_bracket_order() {
     let ids = place_bracket_order(&client, &contract);
 
     rate_limit();
-    let cancel_sub = client.cancel_order(ids.parent.0, "").expect("cancel_order failed");
+    let cancel_sub = client.cancel_order(ids.parent, "").expect("cancel_order failed");
 
     // TWS may push the parent's current working status (Submitted / PendingCancel)
     // before the terminal Cancelled confirmation, so drain status updates until
@@ -244,7 +244,7 @@ fn cancel_bracket_order_then_place_new_order() {
     let ids = place_bracket_order(&client, &contract);
 
     rate_limit();
-    let _cancel_sub = client.cancel_order(ids.parent.0, "").expect("cancel_order failed");
+    let _cancel_sub = client.cancel_order(ids.parent, "").expect("cancel_order failed");
     std::thread::sleep(Duration::from_millis(500));
 
     place_and_cleanup(&client, &contract);
@@ -363,7 +363,6 @@ fn observe_execution_then_commission(sub: &Subscription<PlaceOrder>) -> Result<(
         match sub.next_timeout(deadline.saturating_duration_since(Instant::now())) {
             Some(Ok(SubscriptionItem::Data(PlaceOrder::ExecutionData(exec)))) => execution_id = Some(exec.execution.execution_id),
             Some(Ok(SubscriptionItem::Data(PlaceOrder::CommissionReport(report)))) => commission_id = Some(report.execution_id),
-            Some(Ok(SubscriptionItem::Notice(notice))) if notice.is_order_rejection() => return Err(format!("order rejected: {notice}")),
             Some(Ok(_)) => continue,
             Some(Err(e)) => return Err(format!("subscription error: {e}")),
             // A commission that reached TWS's wire before its execution is dropped
@@ -469,5 +468,5 @@ fn preset_attached_orders_accepted() {
     println!("preset attached orders: {outcome}");
 
     rate_limit();
-    let _ = client.cancel_order(ids.parent.0, "");
+    let _ = client.cancel_order(ids.parent, "");
 }

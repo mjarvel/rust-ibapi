@@ -40,7 +40,7 @@
 //! `.buy()` / `.sell()` instead.
 
 use crate::orders::builder::ValidationError;
-use crate::orders::{Action, OcaType, Order, OrderComboLeg, TagValue, TimeInForce, VolatilityType, COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID};
+use crate::orders::{Action, OcaType, Order, OrderComboLeg, OrderId, TagValue, TimeInForce, VolatilityType, COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID};
 
 /// An auction order is entered into the electronic trading system during the pre-market opening period for execution at the
 /// Calculated Opening Price (COP). If your order is not filled on the open, the order is re-submitted as a limit order with
@@ -226,28 +226,6 @@ pub fn sweep_to_fill(action: Action, quantity: f64, price: f64) -> Order {
     }
 }
 
-/// For option orders routed to the Boston Options Exchange (BOX) you may elect to participate in the BOX's price improvement auction in
-/// pennies. All BOX-directed price improvement orders are immediately sent from Interactive Brokers to the BOX order book, and when the
-/// terms allow, IB will evaluate it for inclusion in a price improvement auction based on price and volume priority. In the auction, your
-/// order will have priority over broker-dealer price improvement orders at the same price.
-/// An Auction Limit order at a specified price. Use of a limit order ensures that you will not receive an execution at a price less favorable
-/// than the limit price. Enter limit orders in penny increments with your auction improvement amount computed as the difference between your
-/// limit order price and the nearest listed increment.
-/// Products: OPT
-/// Supported Exchanges: BOX
-///
-/// Note: TWS's protobuf `Order` message carries no auction-strategy field, so the strategy
-/// cannot be set from the API — TWS applies the account's configured default.
-pub fn auction_limit(action: Action, quantity: f64, price: f64) -> Order {
-    Order {
-        action,
-        order_type: "LMT".to_owned(),
-        total_quantity: quantity,
-        limit_price: Some(price),
-        ..Order::default()
-    }
-}
-
 /// For option orders routed to the Boston Options Exchange (BOX) you may elect to participate in the BOX's price improvement auction in pennies.
 /// All BOX-directed price improvement orders are immediately sent from Interactive Brokers to the BOX order book, and when the terms allow,
 /// IB will evaluate it for inclusion in a price improvement auction based on price and volume priority. In the auction, your order will have
@@ -323,6 +301,10 @@ pub fn box_top(action: Action, quantity: f64) -> Order {
 /// A Limit order is an order to buy or sell at a specified price or better. The Limit order ensures that if the order fills,
 /// it will not fill at a price less favorable than your limit price, but it does not guarantee a fill.
 /// Products: BOND, CFD, CASH, FUT, FOP, OPT, STK, WAR
+///
+/// An option order routed to BOX with this limit price is an Auction Limit order: IB may enter it in
+/// BOX's price improvement auction, with your improvement amount the difference between the limit price
+/// and the nearest listed increment. TWS applies the account's configured auction strategy.
 pub fn limit_order(action: Action, quantity: f64, limit_price: f64) -> Order {
     Order {
         action,
@@ -429,13 +411,15 @@ pub fn pegged_to_midpoint(action: Action, quantity: f64, offset: f64, limit_pric
 /// stop order and a low side buy limit order.
 /// Products: CFD, BAG, FOP, CASH, FUT, OPT, STK, WAR
 pub fn bracket_order(
-    parent_order_id: i32,
+    parent_order_id: impl Into<OrderId>,
     action: Action,
     quantity: f64,
     limit_price: f64,
     take_profit_limit_price: f64,
     stop_loss_price: f64,
 ) -> Vec<Order> {
+    let parent_order_id = parent_order_id.into().value();
+
     //This will be our main or "parent" order
     let parent = Order {
         order_id: parent_order_id,
@@ -741,10 +725,10 @@ pub fn volatility(action: Action, quantity: f64, volatility_percent: f64, volati
 }
 
 /// Create an FX hedge order tied to the specified parent order id.
-pub fn market_f_hedge(parent_order_id: i32, action: Action) -> Order {
+pub fn market_f_hedge(parent_order_id: impl Into<OrderId>, action: Action) -> Order {
     //FX Hedge orders can only have a quantity of 0
     let mut order = market_order(action, 0.0);
-    order.parent_id = parent_order_id;
+    order.parent_id = parent_order_id.into().value();
     order.hedge_type = "F".to_owned();
 
     order

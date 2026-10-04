@@ -216,14 +216,17 @@ impl Client {
     ///
     /// ```no_run
     /// use ibapi::Client;
+    /// use ibapi::contracts::Contract;
     ///
     /// #[tokio::main]
     /// async fn main() {
     ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
     ///
-    ///     // `request_id` is the id the in-flight `historical_ticks` request was issued with.
-    ///     let request_id = client.next_request_id();
-    ///     client.cancel_historical_ticks(request_id).await.expect("cancel failed");
+    ///     let contract = Contract::stock("MSFT").build();
+    ///     let subscription = client.historical_ticks(&contract, 100).trade().await.expect("request failed");
+    ///
+    ///     // Holding the subscription, `subscription.cancel().await` (or dropping it) does the same.
+    ///     client.cancel_historical_ticks(subscription.request_id()).await.expect("cancel failed");
     /// }
     /// ```
     pub async fn cancel_historical_ticks(&self, request_id: i32) -> Result<(), Error> {
@@ -501,7 +504,13 @@ impl<T: TickDecoder<T> + Send> TickSubscription<T> {
         }
     }
 
-    /// Cancel the historical-ticks request. Safe to call after completion (no-op).
+    /// The request ID TWS knows this request by, for [`Client::cancel_historical_ticks`](crate::Client::cancel_historical_ticks)
+    /// from code that does not hold the subscription, or to match it in logs.
+    pub fn request_id(&self) -> i32 {
+        self.request_id
+    }
+
+    /// Cancel the historical-ticks request. After completion nothing is written.
     /// Also fired automatically on `Drop` for unfinished subscriptions; explicit calls are idempotent.
     ///
     /// # Examples
@@ -518,13 +527,16 @@ impl<T: TickDecoder<T> + Send> TickSubscription<T> {
     /// # }
     /// ```
     pub async fn cancel(&self) {
-        if self.cancelled.swap(true, Ordering::Relaxed) {
+        // After the last batch TWS has finished the request: nothing to write.
+        if self.done || self.cancelled.swap(true, Ordering::Relaxed) {
             return;
         }
 
         match encoders::encode_cancel_historical_ticks(self.request_id) {
             Ok(message) => {
-                if let Err(e) = self.message_bus.cancel_subscription(self.request_id, message).await {
+                // The registration is released at drop, by liveness: removing
+                // it here by key could take out a newer request under the id.
+                if let Err(e) = self.message_bus.send_message(message).await {
                     log_cancel_error("historical ticks subscription", &e);
                 }
             }
@@ -552,6 +564,12 @@ impl<T: TickDecoder<T> + Send + Unpin> Stream for TickSubscription<T> {
             // either ends it once the buffer is drained.
             if this.done || this.stream_ended {
                 return Poll::Ready(None);
+            }
+
+            // `cancel()` ends the stream locally, reporting it once.
+            if this.cancelled.load(Ordering::Relaxed) {
+                this.stream_ended = true;
+                return Poll::Ready(Some(Err(Error::Cancelled)));
             }
 
             // Lag is converted to an in-band gap notice inside
@@ -591,7 +609,7 @@ impl<T: TickDecoder<T> + Send> Drop for TickSubscription<T> {
         let message_bus = self.message_bus.clone();
         if let Ok(message) = encoders::encode_cancel_historical_ticks(request_id) {
             self.message_bus.runtime_handle().spawn(async move {
-                if let Err(e) = message_bus.cancel_subscription(request_id, message).await {
+                if let Err(e) = message_bus.send_message(message).await {
                     log_cancel_error("historical ticks subscription", &e);
                 }
             });

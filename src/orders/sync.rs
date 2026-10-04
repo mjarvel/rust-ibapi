@@ -6,6 +6,7 @@ use crate::client::blocking::Subscription;
 use crate::common::request_helpers::{self, expect_proto};
 use crate::contracts::Contract;
 use crate::messages::OutgoingMessages;
+use crate::orders::OrderId;
 use crate::{client::sync::Client, server_versions, Error};
 use time::OffsetDateTime;
 
@@ -89,6 +90,9 @@ impl Client {
     /// * `order_id` - ID of the [`crate::orders::Order`] to cancel.
     /// * `manual_order_cancel_time` - Optional timestamp to specify the cancellation time. Use an empty string to use the current time.
     ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if `order_id` is at or above 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -111,7 +115,7 @@ impl Client {
     ///     }
     /// }
     /// ```
-    pub fn cancel_order(&self, order_id: i32, manual_order_cancel_time: &str) -> Result<Subscription<CancelOrder>, Error> {
+    pub fn cancel_order(&self, order_id: impl Into<OrderId>, manual_order_cancel_time: &str) -> Result<Subscription<CancelOrder>, Error> {
         if !manual_order_cancel_time.is_empty() {
             self.check_server_version(
                 server_versions::MANUAL_ORDER_TIME,
@@ -119,7 +123,8 @@ impl Client {
             )?
         }
 
-        let request = encoders::encode_cancel_order(order_id, manual_order_cancel_time)?;
+        let order_id = order_id.into().checked()?;
+        let request = encoders::encode_cancel_order(order_id.value(), manual_order_cancel_time)?;
         let subscription = self.send_order(order_id, request)?;
 
         Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))
@@ -129,6 +134,9 @@ impl Client {
     ///
     /// Observe outcomes through order_update_stream; Ok only proves local writing.
     /// This avoids diverting concurrent execution downloads into a cancel receiver.
+    ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if the ID is in the range reserved for requests.
     ///
     /// # Examples
     ///
@@ -141,7 +149,7 @@ impl Client {
     /// }
     /// # Ok(()) }
     /// ```
-    pub fn cancel_order_untracked(&self, order_id: i32, manual_order_cancel_time: &str) -> Result<(), Error> {
+    pub fn cancel_order_untracked(&self, order_id: impl Into<OrderId>, manual_order_cancel_time: &str) -> Result<(), Error> {
         if !manual_order_cancel_time.is_empty() {
             self.check_server_version(
                 server_versions::MANUAL_ORDER_TIME,
@@ -149,7 +157,8 @@ impl Client {
             )?
         }
 
-        let request = encoders::encode_cancel_order(order_id, manual_order_cancel_time)?;
+        let order_id = order_id.into().checked()?;
+        let request = encoders::encode_cancel_order(order_id.value(), manual_order_cancel_time)?;
         self.send_message(request)
     }
 
@@ -211,9 +220,9 @@ impl Client {
     /// }
     /// ```
     pub fn executions(&self, filter: ExecutionFilter) -> Result<Subscription<Executions>, Error> {
-        let request_id = self.next_request_id();
+        let request_id = self.mint_request_id();
 
-        let request = encoders::encode_executions(request_id, &filter)?;
+        let request = encoders::encode_executions(request_id.raw(), &filter)?;
         let subscription = self.send_request(request_id, request)?;
 
         Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))
@@ -251,6 +260,9 @@ impl Client {
     ///
     /// Use this method when coordinating order IDs across multiple client instances or when you need to synchronize with the server's order ID sequence at the start of a session.
     ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if TWS returns an id at or above 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -271,8 +283,9 @@ impl Client {
             expect_proto(decoders::decode_next_valid_id_proto),
         )?;
 
+        let next_order_id = OrderId::from(next_order_id).checked()?;
         self.raise_next_order_id(next_order_id);
-        Ok(next_order_id)
+        Ok(next_order_id.value())
     }
 
     /// Requests all open orders places by this specific API client (identified by the API client id).
@@ -307,6 +320,9 @@ impl Client {
     /// * `contract` - [Contract] to submit order for.
     /// * `order` - [`crate::orders::Order`] to submit.
     ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -338,12 +354,13 @@ impl Client {
     /// }
     /// # Ok::<(), ibapi::Error>(())
     /// ```
-    pub fn place_order(&self, order_id: i32, contract: &Contract, order: &super::Order) -> Result<Subscription<PlaceOrder>, Error> {
-        verify::verify_order(self, order, order_id)?;
-        verify::verify_order_contract(self, contract, order_id)?;
+    pub fn place_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &super::Order) -> Result<Subscription<PlaceOrder>, Error> {
+        let checked_id = verify::verify_order_ids(order_id.into(), order)?;
+        verify::verify_order(self, order, checked_id.value())?;
+        verify::verify_order_contract(self, contract, checked_id.value())?;
 
-        let request = encoders::encode_place_order(order_id, contract, order)?;
-        let subscription = self.send_order(order_id, request)?;
+        let request = encoders::encode_place_order(checked_id.value(), contract, order)?;
+        let subscription = self.send_order(checked_id, request)?;
 
         Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))
     }
@@ -363,6 +380,9 @@ impl Client {
     /// # Returns
     /// * `Ok(())` if the order was successfully sent
     /// * `Err(Error)` if validation failed or sending failed
+    ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
     ///
     /// # Examples
     ///
@@ -400,11 +420,12 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn submit_order(&self, order_id: i32, contract: &Contract, order: &super::Order) -> Result<(), Error> {
-        verify::verify_order(self, order, order_id)?;
-        verify::verify_order_contract(self, contract, order_id)?;
+    pub fn submit_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &super::Order) -> Result<(), Error> {
+        let checked_id = verify::verify_order_ids(order_id.into(), order)?;
+        verify::verify_order(self, order, checked_id.value())?;
+        verify::verify_order_contract(self, contract, checked_id.value())?;
 
-        let request = encoders::encode_place_order(order_id, contract, order)?;
+        let request = encoders::encode_place_order(checked_id.value(), contract, order)?;
         self.send_message(request)?;
 
         Ok(())
@@ -537,6 +558,9 @@ impl Client {
     /// * `account`           - Destination account.
     /// * `ovrd`              - Specifies whether your setting will override the system's natural action. For example, if your action is "exercise" and the option is not in-the-money, by natural action the option would not exercise. If you have override set to true the natural action would be overridden and the out-of-the money option would be exercised.
     /// * `manual_order_time` - Specify the time at which the options should be exercised. If `None`, the current time will be used. Requires TWS API 10.26 or higher.
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if the client's next order id has reached 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -567,9 +591,17 @@ impl Client {
         ovrd: bool,
         manual_order_time: Option<OffsetDateTime>,
     ) -> Result<Subscription<ExerciseOptions>, Error> {
-        let order_id = self.next_order_id();
+        let order_id = OrderId::from(self.next_order_id()).checked()?;
 
-        let request = encoders::encode_exercise_options(order_id, contract, exercise_action, exercise_quantity, account, ovrd, manual_order_time)?;
+        let request = encoders::encode_exercise_options(
+            order_id.value(),
+            contract,
+            exercise_action,
+            exercise_quantity,
+            account,
+            ovrd,
+            manual_order_time,
+        )?;
         let subscription = self.send_order(order_id, request)?;
 
         Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))

@@ -4,6 +4,7 @@ use time::OffsetDateTime;
 
 use crate::common::request_helpers::{self, expect_proto};
 use crate::messages::OutgoingMessages;
+use crate::orders::OrderId;
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::Subscription;
 use crate::{Client, Error};
@@ -125,6 +126,9 @@ impl Client {
 
     /// Submits an Order (fire-and-forget).
     ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -144,17 +148,21 @@ impl Client {
     ///     client.submit_order(order_id, &contract, &order).await.expect("submit failed");
     /// }
     /// ```
-    pub async fn submit_order(&self, order_id: i32, contract: &Contract, order: &Order) -> Result<(), Error> {
-        verify::verify_order(self, order, order_id)?;
-        verify::verify_order_contract(self, contract, order_id)?;
+    pub async fn submit_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<(), Error> {
+        let checked_id = verify::verify_order_ids(order_id.into(), order)?;
+        verify::verify_order(self, order, checked_id.value())?;
+        verify::verify_order_contract(self, contract, checked_id.value())?;
 
-        let request = encoders::encode_place_order(order_id, contract, order)?;
+        let request = encoders::encode_place_order(checked_id.value(), contract, order)?;
         self.send_message(request).await?;
 
         Ok(())
     }
 
     /// Submits an Order with a subscription for updates.
+    ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
     ///
     /// # Examples
     ///
@@ -179,12 +187,13 @@ impl Client {
     ///     }
     /// }
     /// ```
-    pub async fn place_order(&self, order_id: i32, contract: &Contract, order: &Order) -> Result<Subscription<PlaceOrder>, Error> {
-        verify::verify_order(self, order, order_id)?;
-        verify::verify_order_contract(self, contract, order_id)?;
+    pub async fn place_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<Subscription<PlaceOrder>, Error> {
+        let checked_id = verify::verify_order_ids(order_id.into(), order)?;
+        verify::verify_order(self, order, checked_id.value())?;
+        verify::verify_order_contract(self, contract, checked_id.value())?;
 
-        let request = encoders::encode_place_order(order_id, contract, order)?;
-        let internal_subscription = self.send_order(order_id, request).await?;
+        let request = encoders::encode_place_order(checked_id.value(), contract, order)?;
+        let internal_subscription = self.send_order(checked_id, request).await?;
 
         Ok(Subscription::new_from_internal_simple(
             internal_subscription,
@@ -199,6 +208,9 @@ impl Client {
     /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem);
     /// the subscription stays open until dropped, so break once cancellation
     /// is observed.
+    ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if `order_id` is at or above 1,500,000,000 (reserved for request ids).
     ///
     /// # Examples
     ///
@@ -223,12 +235,13 @@ impl Client {
     ///     }
     /// }
     /// ```
-    pub async fn cancel_order(&self, order_id: i32, manual_order_cancel_time: &str) -> Result<Subscription<CancelOrder>, Error> {
+    pub async fn cancel_order(&self, order_id: impl Into<OrderId>, manual_order_cancel_time: &str) -> Result<Subscription<CancelOrder>, Error> {
         if !manual_order_cancel_time.is_empty() {
             check_version(self.server_version(), Features::MANUAL_ORDER_TIME)?;
         }
 
-        let request = encoders::encode_cancel_order(order_id, manual_order_cancel_time)?;
+        let order_id = order_id.into().checked()?;
+        let request = encoders::encode_cancel_order(order_id.value(), manual_order_cancel_time)?;
         let internal_subscription = self.send_order(order_id, request).await?;
 
         Ok(Subscription::new_from_internal_simple(
@@ -243,6 +256,9 @@ impl Client {
     /// Observe outcomes through order_update_stream; Ok only proves local writing.
     /// This avoids diverting concurrent execution downloads into a cancel receiver.
     ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if the ID is in the range reserved for requests.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -255,12 +271,13 @@ impl Client {
     /// }
     /// # Ok(()) }
     /// ```
-    pub async fn cancel_order_untracked(&self, order_id: i32, manual_order_cancel_time: &str) -> Result<(), Error> {
+    pub async fn cancel_order_untracked(&self, order_id: impl Into<OrderId>, manual_order_cancel_time: &str) -> Result<(), Error> {
         if !manual_order_cancel_time.is_empty() {
             check_version(self.server_version(), Features::MANUAL_ORDER_TIME)?;
         }
 
-        let request = encoders::encode_cancel_order(order_id, manual_order_cancel_time)?;
+        let order_id = order_id.into().checked()?;
+        let request = encoders::encode_cancel_order(order_id.value(), manual_order_cancel_time)?;
         self.send_message(request).await
     }
 
@@ -293,6 +310,9 @@ impl Client {
     /// allocated order IDs, including IDs whose order has not yet reached the
     /// server.
     ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if TWS returns an id at or above 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -314,8 +334,9 @@ impl Client {
         )
         .await?;
 
+        let next_order_id = OrderId::from(next_order_id).checked()?;
         self.raise_next_order_id(next_order_id);
-        Ok(next_order_id)
+        Ok(next_order_id.value())
     }
 
     /// Requests completed [Order]s.
@@ -470,8 +491,8 @@ impl Client {
     /// }
     /// ```
     pub async fn executions(&self, filter: ExecutionFilter) -> Result<Subscription<Executions>, Error> {
-        let request_id = self.next_request_id();
-        let request = encoders::encode_executions(request_id, &filter)?;
+        let request_id = self.mint_request_id();
+        let request = encoders::encode_executions(request_id.raw(), &filter)?;
         let internal_subscription = self.send_request(request_id, request).await?;
         Ok(Subscription::new_from_internal_simple(
             internal_subscription,
@@ -481,6 +502,9 @@ impl Client {
     }
 
     /// Exercise an option contract.
+    ///
+    /// # Errors
+    /// [`Error::OrderIdInRequestRange`] if the client's next order id has reached 1,500,000,000 (reserved for request ids).
     ///
     /// # Examples
     ///
@@ -515,8 +539,16 @@ impl Client {
         ovrd: bool,
         manual_order_time: Option<OffsetDateTime>,
     ) -> Result<Subscription<ExerciseOptions>, Error> {
-        let order_id = self.next_order_id();
-        let request = encoders::encode_exercise_options(order_id, contract, exercise_action, exercise_quantity, account, ovrd, manual_order_time)?;
+        let order_id = OrderId::from(self.next_order_id()).checked()?;
+        let request = encoders::encode_exercise_options(
+            order_id.value(),
+            contract,
+            exercise_action,
+            exercise_quantity,
+            account,
+            ovrd,
+            manual_order_time,
+        )?;
         let internal_subscription = self.send_order(order_id, request).await?;
         Ok(Subscription::new_from_internal_simple(
             internal_subscription,

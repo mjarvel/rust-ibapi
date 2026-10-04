@@ -54,6 +54,8 @@ precedents. Every rule now lives in a node; nothing is inline.
 - **Adding a `ResponseMessage` accessor, or a public API on a proto inbound message type** →
   [proto-aware accessors](docs/rules/wire/proto-aware-accessors.md)
 - **Typing a `String` field as an enum** → [wire enum typing](docs/rules/wire/enum-typing.md)
+- **Accepting an order id, minting a request id, or routing by an inbound id** →
+  [id partition](docs/rules/wire/id-partition.md)
 - **Adding a one-shot client method, or passing a processor to a `one_shot_*` helper** →
   [one-shot narrowing](docs/rules/wire/one-shot-narrowing.md) — the `(message type, decoder)`
   pair lives on the payload's `ProtoPayload` impl, so the call site names neither
@@ -112,6 +114,9 @@ precedents. Every rule now lives in a node; nothing is inline.
   `pub(crate)`** → [restrict after callers](docs/rules/workflow/restrict-after-callers.md)
 - **A clippy lint fires locally but not in CI, or you are upgrading Rust** →
   [pinned toolchain](docs/rules/workflow/pinned-toolchain.md)
+- **Planning a change, or deferring a follow-up past the PR** →
+  [plans and issues](docs/rules/workflow/plans-and-issues.md) — `plans/` is untracked
+  scratch for the change at hand; open work goes in GitHub issues, cited as `#N`
 
 ### Documentation
 
@@ -146,7 +151,7 @@ ids, `related`, no `@`-imports, no `file.rs:NNN`) and cannot tell whether a node
   above, or it is not a convention. Changed: rewrite the directive, extend `precedents`.
   Retired: `status: historical`, drop the index line, never delete the node — a concluded arc
   has no trigger, but its reasoning is the expensive part.
-- **Deleting or renaming anything a node might cite** → `grep -rn <symbol> docs/rules/ plans/`
+- **Deleting or renaming anything a node might cite** → `grep -rn <symbol> docs/rules/`
   in the same PR. A node describing a function that no longer exists reads exactly like one
   that is correct.
 - **Writing a count or completeness claim** — "all N sites", "fully applied", "zero remaining",
@@ -159,7 +164,7 @@ ids, `related`, no `@`-imports, no `file.rs:NNN`) and cannot tell whether a node
 - **Reading a node that calls its own failure mode silent, unenforced, or ungated** → that is a
   missing gate, not a documentation problem. Make the failure loud; then rewrite the node's
   claim rather than appending to it, and delete regression tests the gate made impossible.
-- **Touching `AGENTS.md`, `docs/rules/`, or `plans/`** → `just rules-check` before the PR.
+- **Touching `AGENTS.md` or `docs/rules/`** → `just rules-check` before the PR.
 
 ## Quick Commands
 
@@ -201,7 +206,7 @@ Situational — run when the change touches the matching surface:
 cargo build -p ibapi-integration-sync  --tests
 cargo build -p ibapi-integration-async --tests
 
-# AGENTS.md, docs/rules/, or plans/ — validates the rule graph and its index
+# AGENTS.md or docs/rules/ — validates the rule graph and its index
 just rules-check
 
 # Coverage report, nightly-only. See docs/rules/testing/coverage-floor.md.
@@ -235,4 +240,7 @@ IBAPI_RAW_CAPTURE_DIR=/tmp/tws-raw cargo run --example <example_name>
 
 - DO NOT include "Generated with Claude Code" or similar attribution in commit messages
 - Keep commit messages focused on the technical changes and their purpose
+- Choose the merge strategy by what the branch holds:
+  - **Merge commit** (`gh pr merge N --merge`) for stacked PRs (a squashed parent leaves the child with duplicate commits) and for multi-commit branches where every commit stands alone and builds
+  - **Squash** (`gh pr merge N --squash`) for single-commit PRs (no merge bubble), fork PRs, and branches carrying fixup, review-response or merge-from-main commits; pass `--body-file` summarizing the final design when the branch holds an abandoned approach
 

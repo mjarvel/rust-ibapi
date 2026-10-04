@@ -9,6 +9,8 @@ use std::time::Duration;
 #[cfg(feature = "sync")]
 use crossbeam::channel::{Receiver, Sender};
 
+#[cfg(feature = "sync")]
+use crate::client::ids::{OrderId, RequestId};
 use crate::errors::Error;
 use crate::messages::ResponseMessage;
 
@@ -215,14 +217,12 @@ impl SharedCounts {
 // MessageBus trait - defines the interface for message handling
 #[cfg(feature = "sync")]
 pub(crate) trait MessageBus: Send + Sync {
-    fn send_request(&self, request_id: i32, packet: &[u8]) -> Result<InternalSubscription, Error>;
+    fn send_request(&self, request_id: RequestId, packet: &[u8]) -> Result<InternalSubscription, Error>;
 
     /// [`send_request`](Self::send_request) with a cap on unread items: see
     /// [`BoundState::admit`]. Past the cap the route queues
     /// `Error::BufferLimitExceeded` and discards later frames.
-    fn send_request_bounded(&self, request_id: i32, packet: &[u8], bound: BufferBound) -> Result<InternalSubscription, Error>;
-
-    fn cancel_subscription(&self, request_id: i32, packet: &[u8]) -> Result<(), Error>;
+    fn send_request_bounded(&self, request_id: RequestId, packet: &[u8], bound: BufferBound) -> Result<InternalSubscription, Error>;
 
     fn send_shared_request(&self, message_id: OutgoingMessages, packet: &[u8]) -> Result<InternalSubscription, Error>;
 
@@ -235,13 +235,11 @@ pub(crate) trait MessageBus: Send + Sync {
     /// releases the count.
     fn cancel_shared_subscription(&self, ticket: SharedTicket, packet: Option<&[u8]>) -> Result<(), Error>;
 
-    fn send_order_request(&self, request_id: i32, packet: &[u8]) -> Result<InternalSubscription, Error>;
+    fn send_order_request(&self, order_id: OrderId, packet: &[u8]) -> Result<InternalSubscription, Error>;
 
     fn send_message(&self, packet: &[u8]) -> Result<(), Error>;
 
     fn create_order_update_subscription(&self) -> Result<InternalSubscription, Error>;
-
-    fn cancel_order_subscription(&self, request_id: i32, packet: &[u8]) -> Result<(), Error>;
 
     fn notice_subscribe(&self) -> crate::subscriptions::notice_stream::sync_impl::NoticeStream;
 
@@ -258,12 +256,12 @@ pub(crate) trait MessageBus: Send + Sync {
 #[cfg(feature = "sync")]
 #[derive(Debug, Default)]
 pub(crate) struct InternalSubscription {
-    receiver: Option<Receiver<RoutedItem>>,  // this subscription's own queue
-    sender: Option<Sender<RoutedItem>>,      // feeds `receiver`; the drop signal's identity
-    signaler: Option<Sender<Signal>>,        // for client to signal termination
-    pub(crate) request_id: Option<i32>,      // initiating request id
-    pub(crate) order_id: Option<i32>,        // initiating order id
-    pub(crate) shared: Option<SharedTicket>, // shared-channel identity, when routed by message type
+    receiver: Option<Receiver<RoutedItem>>,   // this subscription's own queue
+    sender: Option<Sender<RoutedItem>>,       // feeds `receiver`; the drop signal's identity
+    signaler: Option<Sender<Signal>>,         // for client to signal termination
+    pub(crate) request_id: Option<RequestId>, // initiating request id
+    pub(crate) order_id: Option<OrderId>,     // initiating order id
+    pub(crate) shared: Option<SharedTicket>,  // shared-channel identity, when routed by message type
 }
 
 #[cfg(feature = "sync")]
@@ -321,18 +319,28 @@ impl InternalSubscription {
         if let Err(e) = sender.send(Error::Cancelled.into()) {
             log::warn!("error sending cancel notification: {e}")
         }
-        // A cancelled shared subscription is unregistered by the cleanup
-        // thread once it processes this signal, rather than at the handle's
-        // drop: a handle kept after `cancel()` must not go on collecting
-        // every frame of its type. Frames dispatched before the signal is
-        // processed still land on the queue. The registration is identified
-        // by this sender, so the drop signal for the same sender is later a
-        // no-op. Id-routed subscriptions are unregistered by the bus's
-        // `cancel_*` call instead.
-        if let (Some(_), Some(signaler)) = (&self.shared, &self.signaler) {
-            if let Err(e) = signaler.send(Signal::Shared(sender.clone())) {
+        // A cancelled subscription is unregistered by the cleanup thread once
+        // it processes this signal, rather than at the handle's drop: a handle
+        // kept after `cancel()` must not go on collecting frames. Frames
+        // dispatched before the signal is processed still land on the queue,
+        // behind `Cancelled`. The signal carries this sender, so cleanup
+        // removes only this subscription's registration, never a newer one
+        // under the same id, and the later drop signal is a no-op.
+        if let Some(signaler) = &self.signaler {
+            if let Err(e) = signaler.send(self.signal(sender.clone())) {
                 log::warn!("error sending cancel signal: {e}");
             }
+        }
+    }
+
+    /// The cleanup signal for this subscription, identified by `sender`.
+    fn signal(&self, sender: Sender<RoutedItem>) -> Signal {
+        match (self.request_id, self.order_id, self.shared) {
+            (Some(request_id), _, _) => Signal::Request(request_id, sender),
+            (_, Some(order_id), _) => Signal::Order(order_id, sender),
+            (_, _, Some(_)) => Signal::Shared(sender),
+            // No request, order id or shared ticket: the order update stream.
+            _ => Signal::OrderUpdateStream(sender),
         }
     }
 
@@ -374,28 +382,21 @@ impl Drop for InternalSubscription {
         let (Some(signaler), Some(sender)) = (&self.signaler, self.sender.clone()) else {
             return;
         };
-        let signal = match (self.request_id, self.order_id, self.shared) {
-            (Some(request_id), _, _) => Signal::Request(request_id, sender),
-            (_, Some(order_id), _) => Signal::Order(order_id, sender),
-            (_, _, Some(_)) => Signal::Shared(sender),
-            // No request, order id or shared ticket: the order update stream.
-            _ => Signal::OrderUpdateStream(sender),
-        };
-        if let Err(e) = signaler.send(signal) {
+        if let Err(e) = signaler.send(self.signal(sender)) {
             log::warn!("error sending drop signal: {e}");
         }
     }
 }
 
-// Signals are used to notify the backend when a subscriber is dropped.
-// This facilitates the cleanup of the SenderHashes. Each signal carries the
-// dropped subscription's data sender; cleanup removes a registration only
+// Signals are used to notify the backend when a subscriber is cancelled or
+// dropped. This facilitates the cleanup of the SenderHashes. Each signal
+// carries the subscription's data sender; cleanup removes a registration only
 // when it is `same_channel` with it, so a stale signal cannot remove a newer
 // registration under the same key.
 #[cfg(feature = "sync")]
-pub enum Signal {
-    Request(i32, Sender<RoutedItem>),
-    Order(i32, Sender<RoutedItem>),
+pub(crate) enum Signal {
+    Request(RequestId, Sender<RoutedItem>),
+    Order(OrderId, Sender<RoutedItem>),
     OrderUpdateStream(Sender<RoutedItem>),
     Shared(Sender<RoutedItem>),
 }
@@ -406,8 +407,8 @@ pub(crate) struct SubscriptionBuilder {
     receiver: Option<Receiver<RoutedItem>>,
     sender: Option<Sender<RoutedItem>>,
     signaler: Option<Sender<Signal>>,
-    order_id: Option<i32>,
-    request_id: Option<i32>,
+    order_id: Option<OrderId>,
+    request_id: Option<RequestId>,
     shared: Option<SharedTicket>,
 }
 
@@ -439,12 +440,12 @@ impl SubscriptionBuilder {
         self
     }
 
-    pub(crate) fn order_id(mut self, order_id: i32) -> Self {
+    pub(crate) fn order_id(mut self, order_id: OrderId) -> Self {
         self.order_id = Some(order_id);
         self
     }
 
-    pub(crate) fn request_id(mut self, request_id: i32) -> Self {
+    pub(crate) fn request_id(mut self, request_id: RequestId) -> Self {
         self.request_id = Some(request_id);
         self
     }

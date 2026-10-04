@@ -17,6 +17,7 @@ use crate::testdata::builders::orders::{
 use crate::testdata::builders::{ResponseEncoder, ResponseProtoEncoder};
 
 use super::*;
+use crate::client::ids::{OrderId, REQUEST_ID_FLOOR};
 use crate::orders::common::order_builder;
 
 #[test]
@@ -877,7 +878,7 @@ fn analyze_returns_order_state_for_the_matching_order() {
         IncomingMessages::OpenOrder,
         open_order().order_id(9090).status(OrderStatusKind::PreSubmitted).encode_proto(),
     )]);
-    client.raise_next_order_id(9090);
+    client.raise_next_order_id(OrderId::from(9090));
     let contract = Contract::stock("AAPL").build();
 
     let state = client.order(&contract).buy(100).limit(50.0).analyze().expect("analyze should succeed");
@@ -904,7 +905,7 @@ fn analyze_reports_end_of_stream_when_no_order_arrives() {
 #[test]
 fn submit_assigns_the_next_order_id_and_sends_the_order() {
     let (client, bus) = create_blocking_test_client();
-    client.raise_next_order_id(9100);
+    client.raise_next_order_id(OrderId::from(9100));
     let contract = Contract::stock("AAPL").build();
 
     let order_id = client.order(&contract).buy(100).limit(50.0).submit().expect("submit should succeed");
@@ -938,7 +939,7 @@ fn submit_rejects_an_invalid_order_before_sending() {
 #[test]
 fn submit_all_reserves_three_ids_and_wires_the_bracket() {
     let (client, bus) = create_blocking_test_client();
-    client.raise_next_order_id(9200);
+    client.raise_next_order_id(OrderId::from(9200));
     let contract = Contract::stock("AAPL").build();
 
     let ids = client
@@ -990,7 +991,7 @@ fn submit_all_reserves_three_ids_and_wires_the_bracket() {
 #[test]
 fn submit_oca_orders_numbers_each_order_and_keeps_the_group() {
     let (client, bus) = create_blocking_test_client();
-    client.raise_next_order_id(9300);
+    client.raise_next_order_id(OrderId::from(9300));
     let apple = Contract::stock("AAPL").build();
     let microsoft = Contract::stock("MSFT").build();
 
@@ -1101,7 +1102,7 @@ fn order_update_stream_delivers_order_binding() {
 #[test]
 fn preset_legs_submit_one_request_with_attached_ids() {
     let (client, bus) = crate::common::test_utils::helpers::create_blocking_test_client_with_version(server_versions::ATTACHED_ORDERS);
-    client.raise_next_order_id(9400);
+    client.raise_next_order_id(OrderId::from(9400));
     let contract = Contract::stock("AAPL").build();
 
     let ids = client
@@ -1160,5 +1161,85 @@ fn sender_only_cancel_version_gate_sends_nothing() {
     let client = Client::stubbed(bus.clone(), server_versions::MANUAL_ORDER_TIME - 1);
     let result = client.cancel_order_untracked(42, "20261004-00:00:00");
     assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
+    assert_eq!(request_message_count(&bus), 0);
+}
+
+/// Order ids in the request range are refused before anything is sent: their
+/// frames would route as a request's (#789).
+#[test]
+fn order_entry_points_reject_request_range_ids() {
+    let floor = REQUEST_ID_FLOOR;
+    let (client, message_bus) = create_blocking_test_client();
+    let contract = Contract::stock("AAPL").build();
+    let order = order_builder::market_order(Action::Buy, 100.0);
+    let with_parent = crate::orders::Order {
+        parent_id: floor,
+        ..order.clone()
+    };
+    let rejected = |result: Result<(), Error>, what: &str| assert!(matches!(result, Err(Error::OrderIdInRequestRange { .. })), "{what}: {result:?}");
+
+    rejected(client.place_order(floor, &contract, &order).map(|_| ()), "place_order");
+    rejected(client.place_order(1, &contract, &with_parent).map(|_| ()), "place_order parent_id");
+    rejected(client.submit_order(floor, &contract, &order), "submit_order");
+    rejected(client.cancel_order(floor, "").map(|_| ()), "cancel_order");
+
+    client.raise_next_order_id(OrderId::from(floor));
+    rejected(
+        client
+            .exercise_options(&contract, ExerciseAction::Exercise, 1, "", false, None)
+            .map(|_| ()),
+        "exercise_options",
+    );
+
+    assert_eq!(request_message_count(&message_bus), 0, "nothing reaches the wire");
+}
+
+/// A server answer in the request range is refused, and does not raise the
+/// local order-id generator into it (#789).
+#[test]
+fn next_valid_order_id_rejects_request_range() {
+    let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![proto_response(
+        IncomingMessages::NextValidId,
+        prost::Message::encode_to_vec(&crate::proto::NextValidId {
+            order_id: Some(REQUEST_ID_FLOOR),
+        }),
+    )]);
+
+    let result = client.next_valid_order_id();
+    assert!(
+        matches!(result, Err(Error::OrderIdInRequestRange { order_id }) if order_id == REQUEST_ID_FLOOR),
+        "{result:?}"
+    );
+    assert!(client.next_order_id() < REQUEST_ID_FLOOR, "generator raised into the request range");
+}
+
+/// The order methods take `impl Into<OrderId>`: ids from `BracketOrderIds`
+/// and `AttachedOrderIds` pass straight in, as do plain `i32`s.
+#[test]
+fn order_methods_accept_typed_order_ids() {
+    let (client, message_bus) = create_blocking_test_client();
+    let contract = Contract::stock("AAPL").build();
+    let ids = crate::orders::BracketOrderIds::new(41, 42, 43);
+    let order = order_builder::market_order(Action::Buy, 100.0);
+
+    client.submit_order(ids.parent, &contract, &order).expect("submit_order");
+    let _cancel = client.cancel_order(ids.take_profit, "").expect("cancel_order");
+    let _placed = client.place_order(ids.stop_loss, &contract, &order).expect("place_order");
+
+    let placed_id = |index| decode_request_proto::<crate::proto::PlaceOrderRequest>(&message_bus, index).order_id;
+    assert_eq!(placed_id(0), Some(41), "submit_order");
+    assert_request(&message_bus, 1, &cancel_order_request().order_id(42));
+    assert_eq!(placed_id(2), Some(43), "place_order");
+
+    assert_eq!(order_builder::market_f_hedge(ids.parent, Action::Sell).parent_id, 41);
+    let bracket = order_builder::bracket_order(ids.parent, Action::Buy, 100.0, 50.0, 55.0, 45.0);
+    assert_eq!(bracket[1].parent_id, 41, "bracket_order");
+}
+
+#[test]
+fn sender_only_cancel_rejects_request_range_without_writing() {
+    let (client, bus) = create_blocking_test_client();
+    let result = client.cancel_order_untracked(OrderId::from(REQUEST_ID_FLOOR), "");
+    assert!(matches!(result, Err(Error::OrderIdInRequestRange { .. })));
     assert_eq!(request_message_count(&bus), 0);
 }

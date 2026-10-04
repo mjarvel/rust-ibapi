@@ -680,8 +680,6 @@ fn test_notice_is_cancellation() {
         advanced_order_reject_json: String::new(),
     };
     assert!(cancellation.is_cancellation());
-    assert!(!cancellation.is_warning());
-    assert!(!cancellation.is_system_message());
     assert!(cancellation.is_informational());
     assert!(!cancellation.is_error());
 
@@ -708,8 +706,6 @@ fn test_notice_is_warning() {
     for code in warning_codes {
         let notice = notice_with_code(code);
         assert!(notice.is_warning(), "Code {} should be a warning", code);
-        assert!(!notice.is_cancellation());
-        assert!(!notice.is_system_message());
         assert!(notice.is_informational());
         assert!(!notice.is_error());
     }
@@ -730,8 +726,9 @@ fn test_notice_is_warning() {
         assert!(!notice.is_error());
     }
 
-    // Codes outside WARNING_CODE_RANGE are not warnings
-    let non_warning_codes = [*WARNING_CODE_RANGE.start() - 1, *WARNING_CODE_RANGE.end() + 1, 200, 202, 1000];
+    // Codes outside WARNING_CODE_RANGE are not warnings, nor is the advisory
+    // 2188 inside it.
+    let non_warning_codes = [*WARNING_CODE_RANGE.start() - 1, *WARNING_CODE_RANGE.end() + 1, 200, 202, 1000, 2188];
     for code in non_warning_codes {
         let notice = notice_with_code(code);
         assert!(!notice.is_warning(), "Code {} should not be a warning", code);
@@ -779,8 +776,6 @@ fn test_notice_is_system_message() {
             advanced_order_reject_json: String::new(),
         };
         assert!(notice.is_system_message(), "Code {} should be a system message", code);
-        assert!(!notice.is_cancellation());
-        assert!(!notice.is_warning());
         assert!(notice.is_informational());
         assert!(!notice.is_error());
     }
@@ -810,7 +805,7 @@ fn test_notice_is_informational() {
     }
 
     // Non-informational (actual errors)
-    let error_codes = [100, 200, 201, 321, 502, 10000];
+    let error_codes = [100, 200, 201, 316, 321, 354, 502, 10000];
     for code in error_codes {
         let notice = notice_with_code(code);
         assert!(!notice.is_informational(), "Code {} should not be informational", code);
@@ -870,12 +865,58 @@ fn test_notice_is_order_rejection() {
     let start = *ORDER_REJECTION_CODE_RANGE.start();
     let end = *ORDER_REJECTION_CODE_RANGE.end();
 
-    for code in [start, start + 1, ORDER_CANCELLED_CODE, end - 1, end] {
+    for code in [201, 203, 355, end - 1, end] {
         assert!(notice_with_code(code).is_order_rejection(), "code {code} should be order rejection");
     }
 
+    // Codes inside the band that an earlier category claims are covered by
+    // test_notice_category_predicates_are_disjoint.
     for code in [start - 1, end + 1, 100, *WARNING_CODE_RANGE.start(), SYSTEM_MESSAGE_CODES[0], 10000] {
         assert!(!notice_with_code(code).is_order_rejection(), "code {code} should not be order rejection");
+    }
+}
+
+#[test]
+fn test_notice_is_request_error() {
+    for &code in REQUEST_ERROR_CODES {
+        let notice = notice_with_code(code);
+        assert!(notice.is_request_error(), "code {code} should be a request error");
+        assert!(
+            ORDER_REJECTION_CODE_RANGE.contains(&code),
+            "code {code} outside the band it is carved from"
+        );
+        assert!(notice.is_error(), "code {code} should be terminal");
+    }
+    for code in [201, 202, 317, 355, 399, 502, 2104, 10000] {
+        assert!(!notice_with_code(code).is_request_error(), "code {code} should not be a request error");
+    }
+}
+
+/// Every category predicate is `category() == X`: at most one is true, and it
+/// names the category. `Error` has no predicate of its own.
+#[test]
+fn test_notice_category_predicates_are_disjoint() {
+    let messages = ["", "Order Message:\nWarning: outside RTH"];
+    for code in -10..=11000 {
+        for message in messages {
+            let notice = Notice::synthesized(code, message.to_string());
+            let hits: Vec<NoticeCategory> = [
+                (notice.is_cancellation(), NoticeCategory::Cancellation),
+                (notice.is_data_advisory(), NoticeCategory::DataAdvisory),
+                (notice.is_warning(), NoticeCategory::Warning),
+                (notice.is_system_message(), NoticeCategory::SystemMessage),
+                (notice.is_request_error(), NoticeCategory::RequestError),
+                (notice.is_order_rejection(), NoticeCategory::OrderRejection),
+            ]
+            .into_iter()
+            .filter_map(|(hit, category)| hit.then_some(category))
+            .collect();
+            let expected: Vec<NoticeCategory> = match notice.category() {
+                NoticeCategory::Error => vec![],
+                category => vec![category],
+            };
+            assert_eq!(hits, expected, "code {code} message {message:?}");
+        }
     }
 }
 
@@ -889,12 +930,17 @@ fn test_notice_category_partition() {
         (SYSTEM_MESSAGE_CODES[0], NoticeCategory::SystemMessage),
         (SYSTEM_MESSAGE_CODES[3], NoticeCategory::SystemMessage),
         (*WARNING_CODE_RANGE.end() + 1, NoticeCategory::Error),
-        (*ORDER_REJECTION_CODE_RANGE.start(), NoticeCategory::OrderRejection), // 200
-        (*ORDER_REJECTION_CODE_RANGE.start() + 1, NoticeCategory::OrderRejection), // 201 — hard rejection
-        (316, NoticeCategory::OrderRejection), // depth HALTED — terminal; the label is the band's, not a real order rejection
-        (*ORDER_REJECTION_CODE_RANGE.end(), NoticeCategory::OrderRejection), // 399
-        (317, NoticeCategory::DataAdvisory),   // precedence over the 200..=399 band (#806)
-        (2188, NoticeCategory::DataAdvisory),  // precedence over the 21xx band
+        (*ORDER_REJECTION_CODE_RANGE.start(), NoticeCategory::OrderRejection), // 200 — also answers orders
+        (201, NoticeCategory::OrderRejection),                                 // hard rejection
+        (316, NoticeCategory::RequestError),                                   // depth HALTED
+        (320, NoticeCategory::OrderRejection),                                 // answers invalid attached orders (#842)
+        (321, NoticeCategory::OrderRejection),                                 // server error validating a request
+        (354, NoticeCategory::RequestError),                                   // market data not subscribed
+        (366, NoticeCategory::RequestError),                                   // no historical query
+        (355, NoticeCategory::OrderRejection),                                 // order size vs market rule
+        (*ORDER_REJECTION_CODE_RANGE.end(), NoticeCategory::OrderRejection),   // 399
+        (317, NoticeCategory::DataAdvisory),                                   // precedence over the 200..=399 band (#806)
+        (2188, NoticeCategory::DataAdvisory),                                  // precedence over the 21xx band
         (10089, NoticeCategory::DataAdvisory),
         (10090, NoticeCategory::DataAdvisory),
         (10091, NoticeCategory::DataAdvisory),
@@ -1015,12 +1061,44 @@ fn test_is_handshake_synthetic() {
         *ORDER_REJECTION_CODE_RANGE.end(),
         -2, // shutdown sentinel — distinct sentinel, must not be confused with handshake-synthetic
         -1,
+        UNKNOWN_MESSAGE_TYPE_CODE, // synthesized, but not handshake-specific
         100,
     ] {
         assert!(
             !notice_with_code(code).is_handshake_synthetic(),
             "code {code} should not be flagged handshake-synthetic"
         );
+    }
+}
+
+#[test]
+fn test_is_client_synthesized() {
+    for code in [
+        HANDSHAKE_UNKNOWN_FRAME_CODE,
+        HANDSHAKE_DECODE_FAILURE_CODE,
+        UNKNOWN_MESSAGE_TYPE_CODE,
+        SUBSCRIPTION_LAG_CODE,
+        NOTICE_STREAM_LAG_CODE,
+        TRANSPORT_RECONNECT_CODE,
+        // Any negative code, named or not.
+        -1,
+        -2,
+        i32::MIN,
+    ] {
+        assert!(notice_with_code(code).is_client_synthesized(), "code {code}");
+    }
+
+    // TWS-emitted codes, including the code-less 0.
+    for code in [
+        0,
+        ORDER_CANCELLED_CODE,
+        *WARNING_CODE_RANGE.start(),
+        *WARNING_CODE_RANGE.end(),
+        SYSTEM_MESSAGE_CODES[0],
+        *ORDER_REJECTION_CODE_RANGE.start(),
+        10000,
+    ] {
+        assert!(!notice_with_code(code).is_client_synthesized(), "code {code}");
     }
 }
 
@@ -1120,10 +1198,15 @@ fn test_message_type_is_resolved_once_at_construction() {
     assert_eq!(proto.message_type(), IncomingMessages::OpenOrder);
     assert!(proto.fields.is_empty(), "a proto frame allocates no text fields");
 
-    // An unparseable or absent discriminant is NotValid, as before.
-    assert_eq!(ResponseMessage::from("nonsense\0").message_type(), IncomingMessages::NotValid);
-    assert_eq!(ResponseMessage::from("").message_type(), IncomingMessages::NotValid);
-    assert_eq!(ResponseMessage::default().message_type(), IncomingMessages::NotValid);
+    // An unparseable or absent discriminant is NotValid with no id. It used to
+    // be -1 here and 0 from Default - two encodings, and -1 is NotValid's own
+    // discriminant.
+    for message in [ResponseMessage::from("nonsense\0"), ResponseMessage::from(""), ResponseMessage::default()] {
+        assert_eq!(message.message_type(), IncomingMessages::NotValid);
+        assert_eq!(message.message_id(), None);
+    }
+    // An unrecognized id that did parse is kept.
+    assert_eq!(ResponseMessage::from("-1\0").message_id(), Some(-1));
 }
 
 #[test]
@@ -1392,4 +1475,65 @@ fn expect_type_narrows_or_rejects() {
 
     let err = message.expect_type(IncomingMessages::UserInfo).expect_err("mismatched type is rejected");
     assert!(matches!(err, Error::UnexpectedResponse(_)), "got {err:?}");
+}
+
+#[test]
+fn test_log_level_follows_category() {
+    // Farm OK/inactive/connecting, 1102 (restored, data maintained) and the
+    // cancellation confirmation: info.
+    for code in FARM_OK_CODES
+        .into_iter()
+        .chain(FARM_INACTIVE_CODES)
+        .chain(FARM_CONNECTING_CODES)
+        .chain([CONNECTIVITY_RESTORED_DATA_MAINTAINED_CODE, ORDER_CANCELLED_CODE])
+    {
+        assert_eq!(Notice::synthesized(code, String::new()).log_level(), log::Level::Info, "code {code}");
+    }
+    // Broken farms, the rest of the warning band, code-less frames (0), every
+    // data advisory, and 1101: warn. The advisories are the point - 317 and the
+    // 10xxx codes used to log at error while 2188 logged at warn, the same
+    // category twice.
+    for code in [
+        0,
+        *WARNING_CODE_RANGE.start(),
+        *WARNING_CODE_RANGE.end(),
+        CONNECTIVITY_RESTORED_DATA_LOST_CODE,
+    ]
+    .into_iter()
+    .chain(FARM_BROKEN_CODES)
+    .chain(DATA_ADVISORY_CODES.iter().copied())
+    {
+        assert_eq!(Notice::synthesized(code, String::new()).log_level(), log::Level::Warn, "code {code}");
+    }
+    // 399 grades by its text: a `Warning:` line warns, anything else is a rejection.
+    let order_warning = Notice::synthesized(ORDER_MESSAGE_CODE, "Order Message:\nWarning: outside RTH".into());
+    assert_eq!(order_warning.log_level(), log::Level::Warn);
+    assert_eq!(Notice::synthesized(ORDER_MESSAGE_CODE, "rejected".into()).log_level(), log::Level::Error);
+    // Connectivity lost, socket reset, request errors (316, 354), order
+    // rejections (200, 201) and errors: error.
+    for code in [
+        CONNECTIVITY_LOST_CODE,
+        SOCKET_PORT_RESET_CODE,
+        200,
+        201,
+        316,
+        354,
+        *WARNING_CODE_RANGE.end() + 1,
+        10000,
+    ] {
+        assert_eq!(Notice::synthesized(code, String::new()).log_level(), log::Level::Error, "code {code}");
+    }
+}
+
+#[test]
+fn test_unknown_message_type_notice_names_the_id_or_its_absence() {
+    let notice = unknown_message_type_notice(&ResponseMessage::from("9999\0"));
+    assert_eq!(notice.code, UNKNOWN_MESSAGE_TYPE_CODE);
+    assert!(notice.message.contains("message id 9999"), "{:?}", notice.message);
+
+    // Unreachable off the wire (parse_raw_message always yields an id), but
+    // the notice must not invent one.
+    let notice = unknown_message_type_notice(&ResponseMessage::default());
+    assert_eq!(notice.code, UNKNOWN_MESSAGE_TYPE_CODE);
+    assert!(notice.message.contains("no message id"), "{:?}", notice.message);
 }

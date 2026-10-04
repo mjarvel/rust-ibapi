@@ -2,9 +2,9 @@
 
 use super::{common, BarTimestamp};
 use crate::messages::{IncomingMessages, ResponseMessage};
+use crate::proto::decoders::DecodeProto;
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{proto, Error};
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -58,7 +58,7 @@ impl StreamDecoder<HistoricalSnapshotUpdate> for HistoricalSnapshotUpdate {
     fn decode(_context: &DecoderContext, message: &ResponseMessage) -> Result<Self, Error> {
         match message.message_type() {
             IncomingMessages::HistoricalData => {
-                let raw = proto::HistoricalData::decode(message.require_proto()?)?;
+                let raw = proto::HistoricalData::decode_proto(message.require_proto()?)?;
                 let mut bars = Vec::with_capacity(raw.historical_data_bars.len());
                 for bar in raw.historical_data_bars {
                     let date = bar

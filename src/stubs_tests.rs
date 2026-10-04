@@ -111,20 +111,20 @@ mod sync_tests {
     #[test]
     fn send_request_captures_message_and_yields_responses() {
         let stub = MessageBusStub::with_responses(vec!["1|9001|hi".to_string()]);
-        let sub = MessageBus::send_request(&stub, 42, b"req-bytes").expect("send_request");
+        let sub = MessageBus::send_request(&stub, RequestId::nth(42), b"req-bytes").expect("send_request");
 
         assert_eq!(stub.request_messages(), vec![b"req-bytes".to_vec()]);
-        assert_eq!(sub.request_id, Some(42));
+        assert_eq!(sub.request_id, Some(RequestId::nth(42)));
         assert_eq!(drain_subscription(&sub).len(), 1);
     }
 
     #[test]
     fn send_order_request_captures_and_yields() {
         let stub = MessageBusStub::with_responses(vec!["1|9001|".to_string()]);
-        let sub = MessageBus::send_order_request(&stub, 7, b"order-bytes").expect("send_order_request");
+        let sub = MessageBus::send_order_request(&stub, OrderId::from(7), b"order-bytes").expect("send_order_request");
 
         assert_eq!(stub.request_messages(), vec![b"order-bytes".to_vec()]);
-        assert_eq!(sub.request_id, Some(7));
+        assert_eq!(sub.order_id, Some(OrderId::from(7)));
         assert_eq!(drain_subscription(&sub).len(), 1);
     }
 
@@ -133,13 +133,6 @@ mod sync_tests {
         let stub = MessageBusStub::default();
         MessageBus::send_message(&stub, b"fire-and-forget").expect("send_message");
         assert_eq!(stub.request_messages(), vec![b"fire-and-forget".to_vec()]);
-    }
-
-    #[test]
-    fn cancel_subscription_captures_packet() {
-        let stub = MessageBusStub::default();
-        MessageBus::cancel_subscription(&stub, 99, b"cancel-bytes").expect("cancel_subscription");
-        assert_eq!(stub.request_messages(), vec![b"cancel-bytes".to_vec()]);
     }
 
     #[test]
@@ -173,17 +166,6 @@ mod sync_tests {
             Err(Error::AlreadySubscribed) => {}
             other => panic!("expected AlreadySubscribed, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn cancel_order_subscription_releases_tracker() {
-        let stub = MessageBusStub::default();
-        let _first = MessageBus::create_order_update_subscription(&stub).expect("subscribe");
-
-        MessageBus::cancel_order_subscription(&stub, 0, b"cancel-order").expect("cancel_order_subscription");
-        assert_eq!(stub.request_messages(), vec![b"cancel-order".to_vec()]);
-
-        let _second = MessageBus::create_order_update_subscription(&stub).expect("re-subscribe after cancel");
     }
 
     #[test]
@@ -224,7 +206,9 @@ mod async_tests {
     #[tokio::test]
     async fn send_request_captures_and_yields() {
         let stub = MessageBusStub::with_responses(vec!["1|9001|".to_string()]);
-        let mut sub = AsyncMessageBus::send_request(&stub, 1, b"req".to_vec()).await.expect("send_request");
+        let mut sub = AsyncMessageBus::send_request(&stub, RequestId::nth(1), b"req".to_vec())
+            .await
+            .expect("send_request");
 
         assert_eq!(stub.request_messages(), vec![b"req".to_vec()]);
         assert_eq!(drain_async(&mut sub).await.len(), 1);
@@ -233,7 +217,7 @@ mod async_tests {
     #[tokio::test]
     async fn send_order_request_captures_and_yields() {
         let stub = MessageBusStub::with_responses(vec!["1|9001|".to_string()]);
-        let mut sub = AsyncMessageBus::send_order_request(&stub, 2, b"order".to_vec())
+        let mut sub = AsyncMessageBus::send_order_request(&stub, OrderId::from(2), b"order".to_vec())
             .await
             .expect("send_order_request");
 
@@ -257,24 +241,6 @@ mod async_tests {
         let stub = MessageBusStub::default();
         AsyncMessageBus::send_message(&stub, b"async-fire".to_vec()).await.expect("send_message");
         assert_eq!(stub.request_messages(), vec![b"async-fire".to_vec()]);
-    }
-
-    #[tokio::test]
-    async fn cancel_subscription_captures_message() {
-        let stub = MessageBusStub::default();
-        AsyncMessageBus::cancel_subscription(&stub, 1, b"async-cancel".to_vec())
-            .await
-            .expect("cancel_subscription");
-        assert_eq!(stub.request_messages(), vec![b"async-cancel".to_vec()]);
-    }
-
-    #[tokio::test]
-    async fn cancel_order_subscription_is_noop() {
-        let stub = MessageBusStub::default();
-        AsyncMessageBus::cancel_order_subscription(&stub, 7, b"ignored".to_vec())
-            .await
-            .expect("cancel_order_subscription");
-        assert!(stub.request_messages().is_empty());
     }
 
     #[tokio::test]

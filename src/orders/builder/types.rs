@@ -1,40 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Represents a unique order identifier
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct OrderId(pub i32);
-
-impl OrderId {
-    /// Creates a new OrderId
-    pub fn new(id: i32) -> Self {
-        Self(id)
-    }
-
-    /// Returns the inner i32 value
-    pub fn value(&self) -> i32 {
-        self.0
-    }
-}
-
-impl fmt::Display for OrderId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<i32> for OrderId {
-    fn from(id: i32) -> Self {
-        Self(id)
-    }
-}
-
-impl From<OrderId> for i32 {
-    fn from(id: OrderId) -> i32 {
-        id.0
-    }
-}
+use crate::orders::OrderId;
 
 /// Order IDs from [`AttachedOrdersBuilder::submit`](crate::orders::AttachedOrdersBuilder).
 ///
@@ -230,10 +197,6 @@ pub enum OrderType {
     Volatility,
     /// Box-top order that converts to market at the best price.
     BoxTop,
-    /// Auction limit order.
-    AuctionLimit,
-    /// Auction relative (pegged) order.
-    AuctionRelative,
 
     // Combo Orders (special handling required)
     /// Limit order for combo legs.
@@ -293,8 +256,6 @@ impl OrderType {
             // Special Orders
             Self::Volatility => "VOL",
             Self::BoxTop => "BOX TOP",
-            Self::AuctionLimit => "LMT",
-            Self::AuctionRelative => "REL",
 
             // Combo Orders
             Self::ComboLimit => "LMT",
@@ -313,7 +274,6 @@ impl OrderType {
                 | Self::LimitOnClose
                 | Self::LimitOnOpen
                 | Self::LimitIfTouched
-                | Self::AuctionLimit
                 | Self::ComboLimit
                 | Self::RelativeLimitCombo
                 | Self::AtAuction // TrailingStopLimit uses limit_price_offset, not limit_price
@@ -333,7 +293,6 @@ impl OrderType {
                 | Self::TrailingStopLimit
                 | Self::Relative
                 | Self::PassiveRelative
-                | Self::AuctionRelative
                 | Self::PeggedToMarket
         )
     }

@@ -14,6 +14,7 @@ use log::{debug, error, info, trace, warn};
 
 use crate::accounts::types::AccountId;
 use crate::client::id_generator::ClientIdManager;
+use crate::client::ids::{OrderId, RequestId, WireId};
 use crate::connection::sync::Connection;
 
 use super::common::{log_orphan, report_unroutable_frame, validate_frame_length};
@@ -33,11 +34,30 @@ use crate::Error;
 // pub(crate) const MAX_SERVER_VERSION: i32 = server_versions::WSH_EVENT_DATA_FILTERS_DATE;
 const TWS_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long a frame may stall after its first byte before the read gives up
+/// and the dispatcher reconnects. A healthy gateway never pauses this long
+/// inside a frame.
+const MID_FRAME_STALL: Duration = Duration::from_secs(30);
+
+/// [`MID_FRAME_STALL`] in read timeouts: [`FrameRead`] counts timeouts rather
+/// than reading a clock.
+const MID_FRAME_TIMEOUT_LIMIT: u32 = (MID_FRAME_STALL.as_millis() / TWS_READ_TIMEOUT.as_millis()) as u32;
+const _: () = assert!(MID_FRAME_TIMEOUT_LIMIT > 0, "MID_FRAME_STALL must exceed TWS_READ_TIMEOUT");
+
+/// How long connect waits for each startup frame (handshake ack, account
+/// info) before giving up. A loaded gateway can take longer than one read
+/// timeout to answer.
+const STARTUP_STALL: Duration = Duration::from_secs(30);
+
+/// [`STARTUP_STALL`] in read timeouts, counted like [`MID_FRAME_TIMEOUT_LIMIT`].
+pub(crate) const STARTUP_TIMEOUT_LIMIT: u32 = (STARTUP_STALL.as_millis() / TWS_READ_TIMEOUT.as_millis()) as u32;
+const _: () = assert!(STARTUP_TIMEOUT_LIMIT > 0, "STARTUP_STALL must exceed TWS_READ_TIMEOUT");
+
 /// Queue depth at which (and at every further multiple of which) a growing
 /// sync channel logs a warning. Sync channels are unbounded — they never drop,
 /// so the failure mode of a stalled consumer is silent memory growth. The
 /// watermark makes it loud without changing the lossless semantics; see
-/// `plans/broadcast-lag-visibility.md` (#779).
+/// #779 and #896.
 const BACKLOG_WATERMARK: usize = 10_000;
 
 /// `true` exactly when `depth` sits on a watermark multiple — one warning per
@@ -82,7 +102,8 @@ struct SharedChannels {
     // types is a shared response whether or not anybody is subscribed.
     response_types: HashSet<IncomingMessages>,
     // Live subscriptions, added in `send_shared_request` and removed by the
-    // cleanup thread on drop or, lazily, when a send finds the queue gone.
+    // cleanup thread on cancel or drop or, lazily, when a send finds the
+    // queue gone.
     subscribers: Mutex<Vec<SharedSubscriber>>,
     // Live subscriptions per request type; see `SharedCounts`.
     counts: Mutex<SharedCounts>,
@@ -230,6 +251,12 @@ pub(crate) struct NoticeBroadcaster {
     senders: Mutex<Option<Vec<Sender<Notice>>>>,
 }
 
+impl super::common::NoticeSink for NoticeBroadcaster {
+    fn deliver(&self, notice: Notice) {
+        self.broadcast(notice);
+    }
+}
+
 impl NoticeBroadcaster {
     pub(crate) fn new() -> Self {
         Self {
@@ -264,8 +291,8 @@ impl NoticeBroadcaster {
 pub struct TcpMessageBus<S: Stream> {
     connection: Connection<S>,
     handles: Mutex<Vec<JoinHandle<()>>>,
-    requests: SenderHash<i32, RoutedItem>,
-    orders: SenderHash<i32, RoutedItem>,
+    requests: SenderHash<RequestId, RoutedItem>,
+    orders: SenderHash<OrderId, RoutedItem>,
     executions: SenderHash<String, RoutedItem>,
     shared_channels: SharedChannels,
     signals_send: Sender<Signal>,
@@ -401,22 +428,33 @@ impl<S: Stream> TcpMessageBus<S> {
     }
 
     // The three cleanup handlers below remove a registration only when it is
-    // `same_channel` with the dropped subscription's sender: a drop signal can
-    // be processed arbitrarily late, and unconditional removal would take out
-    // a newer registration under the same key (place then cancel on one order
-    // id, or an order update stream recreated after a reconnect reset).
+    // `same_channel` with the cancelled or dropped subscription's sender: a
+    // signal can be processed arbitrarily late, and unconditional removal
+    // would take out a newer registration under the same key (place then
+    // cancel on one order id, or an order update stream recreated after a
+    // reconnect reset).
+    //
+    // `clean_request` and `clean_order` also drop the subscription's
+    // execution-id aliases, matched by channel rather than key, so a stale
+    // signal still releases its own aliases and never a newer registration's.
+    // Not gated on `removed`: a stale signal still owns aliases to release.
 
-    fn clean_request(&self, request_id: i32, sender: &Sender<RoutedItem>) {
+    fn clean_request(&self, request_id: RequestId, sender: &Sender<RoutedItem>) {
         let removed = self.requests.remove_if_same(&request_id, sender);
+        let aliases = self.executions.remove_all_same(sender);
         debug!(
-            "cleanup request_id {request_id}: removed={removed}, requests.len()={}",
+            "cleanup request_id {request_id}: removed={removed}, aliases={aliases}, requests.len()={}",
             self.requests.len()
         );
     }
 
-    fn clean_order(&self, order_id: i32, sender: &Sender<RoutedItem>) {
+    fn clean_order(&self, order_id: OrderId, sender: &Sender<RoutedItem>) {
         let removed = self.orders.remove_if_same(&order_id, sender);
-        debug!("cleanup order_id {order_id}: removed={removed}, orders.len()={}", self.orders.len());
+        let aliases = self.executions.remove_all_same(sender);
+        debug!(
+            "cleanup order_id {order_id}: removed={removed}, aliases={aliases}, orders.len()={}",
+            self.orders.len()
+        );
     }
 
     fn clear_order_update_stream(&self, sender: &Sender<RoutedItem>) {
@@ -498,7 +536,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 // as live so a caller gating on `is_connected()` cannot
                 // allocate below the new floor.
                 if let Some(order_ids) = self.order_ids.get() {
-                    order_ids.raise_order_id(self.connection.connection_metadata().next_order_id);
+                    order_ids.raise_order_id_from_server(self.connection.connection_metadata().next_order_id);
                 }
 
                 info!("successfully reconnected to TWS/Gateway");
@@ -549,7 +587,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 self.process_orders(message);
             }
             RoutingDecision::ByRequestId(id) => {
-                self.process_response_with_id(id, message, false);
+                self.process_response_with_id(WireId::classify(id), message, false);
             }
             _ => {
                 // All other messages
@@ -561,51 +599,61 @@ impl<S: Stream> TcpMessageBus<S> {
     /// Route an error frame by severity and request id. Mirrors the async
     /// transport's `route_error_message`.
     fn route_error_message(&self, payload: DecodedError) {
-        let sent_to_update_stream = order_update_notice(&payload, self.requests.contains(&payload.request_id))
-            .is_some_and(|notice| self.send_order_update_item(RoutedItem::Notice(notice)));
+        let sent_to_update_stream = order_update_notice(&payload).is_some_and(|notice| self.send_order_update_item(RoutedItem::Notice(notice)));
         match classify_error(payload) {
             ErrorDisposition::NoticeOnly(notice) => {
-                super::common::log_notice(&notice);
+                notice.log();
                 self.connection.notice_broadcaster.broadcast(notice);
             }
             ErrorDisposition::NoticeAndFailOneShots(notice, error) => {
-                super::common::log_notice(&notice);
+                notice.log();
                 self.connection.notice_broadcaster.broadcast(notice);
                 self.shared_channels.fail_one_shot_channels(|| RoutedItem::Error(error.clone()));
             }
-            ErrorDisposition::Route(request_id, item) => {
-                self.deliver_to_request_id(request_id, item, sent_to_update_stream);
+            ErrorDisposition::Route(id, item) => {
+                self.deliver(id, item, sent_to_update_stream);
             }
         }
     }
 
     fn process_response(&self, message: ResponseMessage, routed: bool) {
-        let request_id = message.request_id().unwrap_or(-1);
-        self.process_response_with_id(request_id, message, routed);
+        let id = message.request_id().and_then(WireId::classify);
+        self.process_response_with_id(id, message, routed);
     }
 
-    fn process_response_with_id(&self, request_id: i32, message: ResponseMessage, routed: bool) {
-        if self.requests.contains(&request_id) {
-            self.requests.send(&request_id, message.into()).unwrap();
-        } else if self.orders.contains(&request_id) {
-            self.orders.send(&request_id, message.into()).unwrap();
-        } else if self.shared_channels.is_shared_response(message.message_type()) {
+    /// The id's range picks the table: a request and an order can never be
+    /// confused, whatever is registered under the number.
+    fn process_response_with_id(&self, id: Option<WireId>, message: ResponseMessage, routed: bool) {
+        match id {
+            Some(WireId::Request(request_id)) if self.requests.contains(&request_id) => {
+                self.requests.send(&request_id, message.into()).unwrap();
+                return;
+            }
+            Some(WireId::Order(order_id)) if self.orders.contains(&order_id) => {
+                self.orders.send(&order_id, message.into()).unwrap();
+                return;
+            }
+            _ => {}
+        }
+        if self.shared_channels.is_shared_response(message.message_type()) {
             self.shared_channels.send_message(message.message_type(), &message);
         } else if !routed {
             report_unroutable_frame(&message, &*self.connection.notice_broadcaster);
         }
     }
 
-    /// Deliver a pre-classified Notice or Error to its owning subscription.
-    /// Tries the request-channel first, falls back to the order-channel for
-    /// notices/errors that arrive bound to an order_id.
-    fn deliver_to_request_id(&self, request_id: i32, item: RoutedItem, sent_to_update_stream: bool) {
-        if self.requests.contains(&request_id) {
-            let _ = self.requests.send(&request_id, item);
-        } else if self.orders.contains(&request_id) {
-            let _ = self.orders.send(&request_id, item);
-        } else if !sent_to_update_stream {
-            log_orphan(request_id, &item);
+    /// Deliver a pre-classified Notice or Error to the request or order
+    /// subscription its id names.
+    fn deliver(&self, id: WireId, item: RoutedItem, sent_to_update_stream: bool) {
+        match id {
+            WireId::Request(request_id) if self.requests.contains(&request_id) => {
+                let _ = self.requests.send(&request_id, item);
+            }
+            WireId::Order(order_id) if self.orders.contains(&order_id) => {
+                let _ = self.orders.send(&order_id, item);
+            }
+            _ if sent_to_update_stream => {}
+            _ => log_orphan(id, &item),
         }
     }
 
@@ -620,18 +668,18 @@ impl<S: Stream> TcpMessageBus<S> {
                 let sent_to_update_stream = self.send_order_update(&message);
 
                 // Try order_id channel first, then request_id, storing execution_id mapping
-                if let Some(order_id) = message.order_id() {
+                if let Some(order_id) = message.order_id().map(OrderId::from) {
                     if self.orders.contains(&order_id) {
-                        self.store_execution_mapping_orders(&message, order_id);
+                        self.store_execution_mapping(&message, &self.orders, order_id);
                         if let Err(e) = self.orders.send(&order_id, message.into()) {
                             warn!("error routing message for order_id({order_id}): {e}");
                         }
                         return;
                     }
                 }
-                if let Some(request_id) = message.request_id() {
+                if let Some(request_id) = message.request_id().and_then(RequestId::from_raw) {
                     if self.requests.contains(&request_id) {
-                        self.store_execution_mapping_requests(&message, request_id);
+                        self.store_execution_mapping(&message, &self.requests, request_id);
                         if let Err(e) = self.requests.send(&request_id, message.into()) {
                             warn!("error routing message for request_id({request_id}): {e}");
                         }
@@ -643,7 +691,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 }
             }
             OrderRoutingStrategy::ExecutionDataEnd => {
-                if let Some(order_id) = message.order_id() {
+                if let Some(order_id) = message.order_id().map(OrderId::from) {
                     if self.orders.contains(&order_id) {
                         if let Err(e) = self.orders.send(&order_id, message.into()) {
                             warn!("error routing message for order_id({order_id}): {e}");
@@ -651,7 +699,7 @@ impl<S: Stream> TcpMessageBus<S> {
                         return;
                     }
                 }
-                if let Some(request_id) = message.request_id() {
+                if let Some(request_id) = message.request_id().and_then(RequestId::from_raw) {
                     if self.requests.contains(&request_id) {
                         if let Err(e) = self.requests.send(&request_id, message.into()) {
                             warn!("error routing message for request_id({request_id}): {e}");
@@ -664,7 +712,7 @@ impl<S: Stream> TcpMessageBus<S> {
             OrderRoutingStrategy::OrderOrShared => {
                 let sent_to_update_stream = self.send_order_update(&message);
 
-                if let Some(order_id) = message.order_id() {
+                if let Some(order_id) = message.order_id().map(OrderId::from) {
                     if self.orders.contains(&order_id) {
                         if let Err(e) = self.orders.send(&order_id, message.into()) {
                             warn!("error routing message for order_id({order_id}): {e}");
@@ -702,7 +750,7 @@ impl<S: Stream> TcpMessageBus<S> {
 
     /// Register `request_id`'s channel, optionally with an unread-item cap,
     /// then write the request.
-    fn open_request(&self, request_id: i32, message: &[u8], bound: Option<BufferBound>) -> Result<InternalSubscription, Error> {
+    fn open_request(&self, request_id: RequestId, message: &[u8], bound: Option<BufferBound>) -> Result<InternalSubscription, Error> {
         self.ensure_connected()?;
 
         let (sender, receiver) = channel::unbounded();
@@ -732,19 +780,17 @@ impl<S: Stream> TcpMessageBus<S> {
         Ok(subscription)
     }
 
-    fn store_execution_mapping_orders(&self, message: &ResponseMessage, order_id: i32) {
-        if let Some(sender) = self.orders.copy_sender(order_id) {
-            if let Some(execution_id) = message.execution_id() {
-                self.executions.insert(execution_id, sender);
-            }
-        }
-    }
-
-    fn store_execution_mapping_requests(&self, message: &ResponseMessage, request_id: i32) {
-        if let Some(sender) = self.requests.copy_sender(request_id) {
-            if let Some(execution_id) = message.execution_id() {
-                self.executions.insert(execution_id, sender);
-            }
+    /// Alias the execution id to `id`'s channel in `channels`. The insert runs
+    /// under `channels`' read lock, so a concurrent cleanup either removes the
+    /// registration first (no alias is stored) or prunes the alias after it.
+    fn store_execution_mapping<K: std::hash::Hash + Eq + std::fmt::Debug>(
+        &self,
+        message: &ResponseMessage,
+        channels: &SenderHash<K, RoutedItem>,
+        id: K,
+    ) {
+        if let Some(execution_id) = message.execution_id() {
+            channels.with_sender(&id, |sender| self.executions.insert(execution_id, sender.clone()));
         }
     }
 
@@ -768,9 +814,10 @@ impl<S: Stream> TcpMessageBus<S> {
         false
     }
 
-    // The cleanup thread receives signals as subscribers are dropped and
-    // releases the sender channels. Exits promptly on shutdown via select!
-    // over the signal channel and the shutdown-notify channel — no polling.
+    // The cleanup thread receives signals as subscribers are cancelled or
+    // dropped and releases the sender channels. Exits promptly on shutdown via
+    // select! over the signal channel and the shutdown-notify channel — no
+    // polling.
     fn start_cleanup_thread(self: &Arc<Self>) -> JoinHandle<()> {
         let message_bus = Arc::clone(self);
 
@@ -856,30 +903,15 @@ impl<S: Stream> TcpMessageBus<S> {
 }
 
 impl<S: Stream> MessageBus for TcpMessageBus<S> {
-    fn send_request(&self, request_id: i32, message: &[u8]) -> Result<InternalSubscription, Error> {
+    fn send_request(&self, request_id: RequestId, message: &[u8]) -> Result<InternalSubscription, Error> {
         self.open_request(request_id, message, None)
     }
 
-    fn send_request_bounded(&self, request_id: i32, message: &[u8], bound: BufferBound) -> Result<InternalSubscription, Error> {
+    fn send_request_bounded(&self, request_id: RequestId, message: &[u8], bound: BufferBound) -> Result<InternalSubscription, Error> {
         self.open_request(request_id, message, Some(bound))
     }
 
-    fn cancel_subscription(&self, request_id: i32, message: &[u8]) -> Result<(), Error> {
-        // The local registration goes whether or not the cancel reaches TWS:
-        // a cancel that cannot be sent is one whose session is already
-        // gone, and leaving the entry behind would outlive the subscription.
-        let written = self.write_message(message);
-
-        if let Err(e) = self.requests.send(&request_id, Error::Cancelled.into()) {
-            info!("error sending cancel notification: {e}");
-        }
-
-        self.requests.remove(&request_id);
-
-        written
-    }
-
-    fn send_order_request(&self, order_id: i32, message: &[u8]) -> Result<InternalSubscription, Error> {
+    fn send_order_request(&self, order_id: OrderId, message: &[u8]) -> Result<InternalSubscription, Error> {
         self.ensure_connected()?;
 
         let (sender, receiver) = channel::unbounded();
@@ -935,19 +967,6 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             .build();
 
         Ok(subscription)
-    }
-
-    fn cancel_order_subscription(&self, request_id: i32, message: &[u8]) -> Result<(), Error> {
-        // See `cancel_subscription`: the local registration goes either way.
-        let written = self.write_message(message);
-
-        if let Err(e) = self.orders.send(&request_id, Error::Cancelled.into()) {
-            info!("error sending cancel notification: {e}");
-        }
-
-        self.orders.remove(&request_id);
-
-        written
     }
 
     fn send_shared_request(&self, message_type: OutgoingMessages, message: &[u8]) -> Result<InternalSubscription, Error> {
@@ -1006,9 +1025,17 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         }
     }
 
+    #[cfg(test)]
     pub fn copy_sender(&self, id: K) -> Option<Sender<V>> {
         let senders = self.senders.read().unwrap();
         senders.get(&id).map(|entry| entry.sender.clone())
+    }
+
+    /// Run `f` on `id`'s sender while holding the read lock, so no removal can
+    /// land between the lookup and `f`.
+    pub fn with_sender<R>(&self, id: &K, f: impl FnOnce(&Sender<V>) -> R) -> Option<R> {
+        let senders = self.senders.read().unwrap();
+        senders.get(id).map(|entry| f(&entry.sender))
     }
 
     pub fn insert(&self, id: K, sender: Sender<V>) -> Option<Sender<V>> {
@@ -1026,11 +1053,6 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         senders.insert(id, entry).map(|entry| entry.sender)
     }
 
-    pub fn remove(&self, id: &K) -> Option<Sender<V>> {
-        let mut senders = self.senders.write().unwrap();
-        senders.remove(id).map(|entry| entry.sender)
-    }
-
     /// Remove the entry for `id` only if it is the same channel as `sender`.
     /// Returns whether an entry was removed. Used by drop-signal cleanup so a
     /// stale signal cannot remove a newer registration under the same key.
@@ -1042,6 +1064,15 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         } else {
             false
         }
+    }
+
+    /// Remove every entry on the same channel as `sender`. Returns how many
+    /// were removed.
+    pub fn remove_all_same(&self, sender: &Sender<V>) -> usize {
+        let mut senders = self.senders.write().unwrap();
+        let before = senders.len();
+        senders.retain(|_, registered| !registered.sender.same_channel(sender));
+        before - senders.len()
     }
 
     pub fn contains(&self, id: &K) -> bool {
@@ -1192,23 +1223,77 @@ pub(crate) trait Reconnect {
 pub(crate) trait Stream: Io + Reconnect + Sync + Send + 'static + std::fmt::Debug {}
 impl Stream for TcpSocket {}
 
+/// Reads one frame's bytes, keeping partial progress across read timeouts.
+///
+/// `read_exact` drops the bytes it consumed when a read times out, and the
+/// dispatcher treats a timeout as idle, so a frame straddling the socket's
+/// read timeout used to desync the stream for good (#892). Here a timeout
+/// before the frame's first byte is returned as-is (idle: the dispatcher
+/// polls its shutdown flag, the handshake fails fast); after it, timeouts are
+/// waited out, up to [`MID_FRAME_TIMEOUT_LIMIT`] in a row for the frame.
+struct FrameRead<'a, R> {
+    reader: &'a mut R,
+    /// Any byte of this frame consumed.
+    started: bool,
+    /// Consecutive timeouts since the last progress, across prefix and body.
+    timeouts: u32,
+}
+
+impl<'a, R: Read> FrameRead<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            started: false,
+            timeouts: 0,
+        }
+    }
+
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.reader.read(&mut buf[filled..]) {
+                // `read_exact`'s message, which the handshake surfaces in `ConnectionRejected`.
+                Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer").into()),
+                Ok(n) => {
+                    filled += n;
+                    self.started = true;
+                    self.timeouts = 0;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    if !self.started {
+                        return Err(e.into());
+                    }
+                    self.timeouts += 1;
+                    if self.timeouts > MID_FRAME_TIMEOUT_LIMIT {
+                        return Err(Error::InvalidFrame(format!("frame stalled mid-read for {} read timeouts", self.timeouts)));
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Read the 4-byte big-endian length prefix, taps it, then validates it.
 ///
 /// The tap runs *before* [`validate_frame_length`] on purpose — a prefix that
 /// fails validation is exactly the byte sequence a framing desync leaves
 /// behind, so it has to reach the capture even though it never reaches a
 /// caller. See [`RawFrameTap`].
-fn read_header(reader: &mut impl Read, tap: &RawFrameTap) -> Result<usize, Error> {
+fn read_header(frame: &mut FrameRead<'_, impl Read>, tap: &RawFrameTap) -> Result<usize, Error> {
     let mut buffer = [0_u8; 4];
-    reader.read_exact(&mut buffer)?;
+    frame.fill(&mut buffer)?;
     tap.record_length_prefix(&buffer);
     validate_frame_length(u32::from_be_bytes(buffer) as usize)
 }
 
 pub(crate) fn read_message(reader: &mut impl Read, tap: &RawFrameTap) -> Result<Vec<u8>, Error> {
-    let message_size = read_header(reader, tap)?;
+    let mut frame = FrameRead::new(reader);
+    let message_size = read_header(&mut frame, tap)?;
     let mut data = vec![0_u8; message_size];
-    reader.read_exact(&mut data)?;
+    frame.fill(&mut data)?;
     tap.record_body(&data);
     Ok(data)
 }
