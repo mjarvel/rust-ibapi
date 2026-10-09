@@ -294,6 +294,165 @@ if notice.is_order_rejection() || notice.is_request_error() { /* failed */ }
 
 `next_request_id()` (blocking and async) handed out a fresh request id that no request used. Nothing in the API accepts a caller-chosen request id, so the value had no use: passing it to `cancel_contract_details` or `cancel_historical_ticks` cancelled nothing. The ids of requests in flight come from `Subscription::request_id()` and `ContractDetailsBuilder::request_id()`, both unchanged, and the new `TickSubscription::request_id()`. Delete any call; to cancel a request, drop its subscription or call `cancel()` on it.
 
+### 21. `SpreadBuilder` takes `impl Into<ContractId>`, and `iron_condor` is removed
+
+`SpreadBuilder::add_leg` and `vertical` (and `calendar`'s replacements, [§29](#29-spreadbuildercalendar-is-replaced-by-long_calendar-and-short_calendar)) take `impl Into<ContractId>` instead of `i32`, as the condition constructors do ([§5](#5-price-volume-and-percent-change-conditions-take-impl-intocontractid)). Integer literals, `i32` values (for example `contract.contract_id`) and `ContractId` all compile. An argument converted with `.into()`, `.try_into()` or `.parse()` that relied on the old `i32` parameter to pick its type now needs the type named.
+
+`SpreadBuilder::iron_condor(long_put, short_put, short_call, long_call)` is removed. It took four contract ids of one type in a fixed order, so swapping two compiled and built a different strategy. Chain two verticals instead, each long the wing and short the body:
+
+```rust,ignore
+// 4.2
+let spread = Contract::spread().iron_condor(long_put, short_put, short_call, long_call).build()?;
+
+// 5.0
+let spread = Contract::spread()
+    .vertical(long_put, short_put)
+    .vertical(long_call, short_call)
+    .build()?;
+```
+
+The legs come out as buy long put, sell short put, buy long call, sell short call; `iron_condor` put the call legs the other way round. In a paper what-if, TWS accepted both orders with the same order state. To keep the old order, add the legs with `add_leg`.
+
+### 22. Fluent trailing stops take `TrailBy`, and `OrderBuilder` is generic over its target
+
+`OrderBuilder::trailing_stop` and `trailing_stop_limit` take a `orders::builder::TrailBy` instead of an `f64` percent, so a trailing stop can trail by a fixed amount as well as a percentage. `TrailBy::Percent` is the old behavior and sets `trailing_percent`; `TrailBy::Amount` sets `aux_price`. A bare `f64` no longer compiles:
+
+```rust,ignore
+// 4.2
+client.order(&contract).sell(100).trailing_stop(5.0, 95.0).submit()?;
+client.order(&contract).sell(100).trailing_stop_limit(5.0, 95.0, 0.5).submit()?;
+
+// 5.0
+use ibapi::orders::builder::TrailBy;
+
+client.order(&contract).sell(100).trailing_stop(TrailBy::Percent(5.0), 95.0).submit()?;
+client.order(&contract).sell(100).trailing_stop_limit(TrailBy::Percent(5.0), 95.0, 0.5).submit()?;
+```
+
+`OrderBuilder<'a, C>` is now `OrderBuilder<T>`, where `T` is `orders::ClientBound<'a, C>` for the builder `Client::order` returns and `orders::Detached` for the new `Order::builder()`, which builds an `Order` without a client. `BracketOrderBuilder<'a, C>` is unchanged. This only affects code that names the type, for example a function returning `OrderBuilder<'a, Client>`: write `OrderBuilder<ClientBound<'a, Client>>`. Chains starting from `client.order(..)` are unchanged.
+
+### 23. `order_builder` free functions with swappable prices are removed; use `Order::builder()`
+
+`order_builder::stop_limit`, `limit_if_touched`, `relative_pegged_to_primary`, `trailing_stop_limit`, `pegged_to_stock`, `auction_pegged_to_stock` and the `PeggedToBenchmark` builder are removed. Each took two or more prices of the same type, in a different order from the fluent builder's method of the same name (`stop_limit(.., limit, stop)` vs `.stop_limit(stop, limit)`), so a swap compiled and placed a different order. Build the order with `Order::builder()` and pass it to `place_order` / `submit_order` as before:
+
+| 4.2 | 5.0 |
+| --- | --- |
+| `stop_limit(Action::Buy, q, limit, stop)` | `Order::builder().buy(q).stop_limit(stop, limit).build()?` |
+| `limit_if_touched(Action::Buy, q, limit, trigger)` | `Order::builder().buy(q).limit_if_touched(trigger, limit).build()?` |
+| `relative_pegged_to_primary(Action::Buy, q, cap, offset)` | `Order::builder().buy(q).relative(offset, Some(cap)).build()?` |
+| `trailing_stop_limit(Action::Buy, q, offset, amount, stop)` | `Order::builder().buy(q).trailing_stop_limit(TrailBy::Amount(amount), stop, offset).build()?` |
+| `pegged_to_stock(Action::Buy, q, delta, ref_price, start)` | `Order::builder().buy(q).pegged_to_stock(delta, start).stock_reference_price(ref_price).build()?` |
+| `auction_pegged_to_stock(Action::Buy, q, start, delta)` | `Order::builder().buy(q).pegged_to_stock(delta, start).build()?`, contract routed to `BOX` |
+| `PeggedToBenchmark::new(Action::Buy, q, start).reference_contract(id, exch)…build()?` | `Order::builder().buy(q).pegged_to_benchmark(start).reference_contract(id, exch)…build()?` |
+
+`PeggedToBenchmark`'s other setters keep their names on the builder, except `pegged_change_amount_decrease(true)`, which is now `pegged_change_amount_decrease()` with no argument. `build()` checks prices are finite and returns `Result<Order, ValidationError>`; the free functions checked nothing. `q` is any `impl Into<f64>`, so `100` and `100.0` both work. `TrailBy` is `orders::builder::TrailBy`.
+
+### 24. Combo order functions drop `non_guaranteed: bool`; wrap them in `non_guaranteed`
+
+`order_builder::combo_limit_order`, `combo_market_order`, `limit_order_for_combo_with_leg_prices`, `relative_limit_combo` and `relative_market_combo` no longer take a trailing `non_guaranteed: bool`. Pass the order through the new `order_builder::non_guaranteed` instead:
+
+```rust,ignore
+// 4.2
+let order = combo_limit_order(Action::Buy, 1.0, 2.5, true);
+let order = combo_market_order(Action::Buy, 1.0, false);
+
+// 5.0
+let order = non_guaranteed(combo_limit_order(Action::Buy, 1.0, 2.5));
+let order = combo_market_order(Action::Buy, 1.0);
+```
+
+On the fluent builder, the same tag is `.non_guaranteed()`.
+
+### 25. `attach_adjustable_to_*` become `attach_adjustable_stop`
+
+`order_builder::attach_adjustable_to_stop`, `attach_adjustable_to_stop_limit` and `attach_adjustable_to_trail` are replaced by one function that takes what the stop becomes as an `AdjustTo`:
+
+```rust,ignore
+// 4.2
+attach_adjustable_to_stop(&parent, stop, trigger, adjusted_stop);
+attach_adjustable_to_stop_limit(&parent, stop, trigger, adjusted_stop, adjusted_limit);
+attach_adjustable_to_trail(&parent, stop, trigger, adjusted_stop, trail_amount, 100);
+
+// 5.0
+use ibapi::orders::builder::TrailBy;
+use ibapi::orders::order_builder::{attach_adjustable_stop, AdjustTo, Adjustment};
+
+attach_adjustable_stop(&parent, stop, Adjustment { trigger_price: trigger, to: AdjustTo::Stop { stop_price: adjusted_stop } });
+attach_adjustable_stop(&parent, stop, Adjustment {
+    trigger_price: trigger,
+    to: AdjustTo::StopLimit { stop_price: adjusted_stop, limit_price: adjusted_limit },
+});
+attach_adjustable_stop(&parent, stop, Adjustment {
+    trigger_price: trigger,
+    to: AdjustTo::Trail { stop_price: adjusted_stop, trail: TrailBy::Percent(trail_amount) },
+});
+```
+
+The old `trail_unit: i32` was `0` for an amount and `100` for a percent; write `TrailBy::Amount` or `TrailBy::Percent`. In a live check TWS rejected `1`, the value IB's `Order` reference gives for percent.
+
+### 26. `bracket_order` takes `BracketPrices` and returns a `Result`; `BracketOrderBuilder::build` is crate-private
+
+`order_builder::bracket_order` takes its three prices as an `orders::builder::BracketPrices` instead of three `f64`s, and returns `Result<Vec<Order>, ValidationError>`. It now checks the prices as the fluent bracket does: each must be finite, and a buy needs the take profit above the entry and the stop loss below, a sell the reverse, otherwise `ValidationError::InvalidBracketOrder`.
+
+```rust,ignore
+// 4.2
+let orders = bracket_order(parent_id, Action::Buy, 100.0, 50.0, 55.0, 45.0);
+
+// 5.0
+use ibapi::orders::builder::BracketPrices;
+
+let prices = BracketPrices { entry: 50.0, take_profit: 55.0, stop_loss: 45.0 };
+let orders = bracket_order(parent_id, Action::Buy, 100.0, prices)?;
+```
+
+`BracketOrderBuilder::build()` (from `client.order(..).bracket()`) is no longer public. It returned the three orders with placeholder ids that `submit_all()` fills in, so they could not be placed as they were. Use `submit_all()`, or `bracket_order` with your own parent id.
+
+### 27. `exercise_options` returns a builder
+
+`Client::exercise_options` (blocking and async) takes only the contract and returns an `orders::ExerciseOptionsBuilder`. Its six positional arguments, two with defaults and one a bare `bool`, become named setters:
+
+```rust,ignore
+// 4.2
+client.exercise_options(&contract, ExerciseAction::Exercise, 1, "DU123", true, None)?;
+client.exercise_options(&contract, ExerciseAction::Lapse, 2, "", false, Some(time))?;
+
+// 5.0
+client.exercise_options(&contract).exercise(1).account("DU123").override_natural_action().submit()?;
+client.exercise_options(&contract).lapse(2).manual_order_time(time).submit()?;
+```
+
+Async: `.submit().await?`. `ExerciseAction` is still public but no longer needed here. `account` is optional: if unset, no account is sent, and on a single-account login TWS then uses the logged-in account. `submit()` returns `Error::InvalidArgument` without sending anything if neither `exercise` nor `lapse` was called or the quantity is not positive.
+
+### 28. IBKRATS peg functions are removed; use `peg_best` / `peg_mid`
+
+`order_builder::peg_best_order`, `peg_best_up_to_mid_order` and `peg_mid_order` are removed. They took six or seven arguments, with same-typed pairs (`min_trade_qty` / `min_compete_size`, the two mid offsets) that compiled when swapped. The fluent builder's raw `compete_against_best_offset`, `mid_offset_at_whole` and `mid_offset_at_half` setters are removed too; `peg_best` and `peg_mid` set them, the mid offsets are a named `MidOffsets { at_whole, at_half }`, and the "up to mid" mode no longer needs `f64::INFINITY`:
+
+| 4.2 | 5.0 |
+| --- | --- |
+| `peg_best_order(Action::Buy, q, lmt, min_qty, min_size, offset)` | `Order::builder().buy(q).peg_best(lmt, CompeteAgainstBest::Offset(offset)).min_trade_qty(min_qty).min_compete_size(min_size).build()?` |
+| `peg_best_up_to_mid_order(Action::Buy, q, lmt, min_qty, min_size, whole, half)` | `Order::builder().buy(q).peg_best(lmt, CompeteAgainstBest::UpToMid(MidOffsets { at_whole: whole, at_half: half })).min_trade_qty(min_qty).min_compete_size(min_size).build()?` |
+| `peg_mid_order(Action::Buy, q, lmt, min_qty, whole, half)` | `Order::builder().buy(q).peg_mid(lmt, MidOffsets { at_whole: whole, at_half: half }).min_trade_qty(min_qty).build()?` |
+| `.compete_against_best_offset(x)` / `.mid_offset_at_whole(w).mid_offset_at_half(h)` | `.peg_best(lmt, CompeteAgainstBest::Offset(x))` / `.peg_best(lmt, CompeteAgainstBest::UpToMid(MidOffsets { .. }))` or `.peg_mid(lmt, MidOffsets { .. })` |
+
+`CompeteAgainstBest` and `MidOffsets` are in `orders::builder`. Both methods set `not_held`, as the free functions did. Keep `.min_trade_qty` only if you relied on it: TWS may reject it with error 10302, as it did on a paper account. `build()` rejects a non-finite `CompeteAgainstBest::Offset`. `build()` sends `min_compete_size` and the compete offset only for PEG BEST, and the mid offsets only for PEG MID or PEG BEST up to the midpoint.
+
+### 29. `SpreadBuilder::calendar` is replaced by `long_calendar` and `short_calendar`
+
+`SpreadBuilder::calendar(near, far)` bought the near-dated leg and sold the far-dated one, so buying the combo was short the calendar. It is removed rather than flipped, so code relying on it fails to compile instead of trading the other direction. Both replacements take `(near, far)`:
+
+- `long_calendar(near, far)`: sell near, buy far.
+- `short_calendar(near, far)`: buy near, sell far, the legs `calendar` built.
+
+```rust,ignore
+// 4.2
+let spread = Contract::spread().calendar(near, far).build()?;
+
+// 5.0: same legs
+let spread = Contract::spread().short_calendar(near, far).build()?;
+```
+
+If you sold the `calendar` combo to go long the calendar, build `long_calendar(near, far)` and buy it instead.
+
 ## Behavioral changes
 
 No code changes required, but observable at runtime:
@@ -304,6 +463,9 @@ No code changes required, but observable at runtime:
 - **`Subscription::cancel()` always ends the subscription.** It used to end only subscriptions it wrote a TWS cancel for; order subscriptions (`place_order`, `submit_order`, `cancel_order`, `exercise_options`), `order_update_stream`, `executions`, `option_chain` and streams that had already ended kept delivering until dropped. On the blocking client, the subscription now yields what was already queued, then `Err(Error::Cancelled)`, then ends. On the async client, every clone yields `Err(Error::Cancelled)` at its next poll, then ends. Cancelling an order subscription still does not cancel the order at TWS: use `cancel_order` (#911).
 - **Request ids start at 1,500,000,000.** `Subscription::request_id()` and `ContractDetailsBuilder::request_id()` return values at or above 1,500,000,000 instead of 9000-based ones, and order ids must stay below it: `place_order`, `submit_order` and `cancel_order` return `Error::OrderIdInRequestRange` for an order id at or above it, including the `parent_id`, `preset_stop_loss_order_id` and `preset_profit_taker_order_id` it carries, and so do `exercise_options` and `next_valid_order_id` when the next order id reaches it. Request ids and order ids used to share one range, and an error frame carries a single id, so an order's cancellation or rejection could be delivered to a data subscription holding the same number, and a late error for a finished request could appear on the order-update stream as if it belonged to an order. Routing now decides by range. Ids from `next_order_id()` and `next_valid_order_id()` are unaffected unless your account's sequence has reached the floor, which also makes `connect` fail with `Error::ConnectionRejected`. If you number orders yourself, keep the numbers below 1,500,000,000 (#789).
 - **An unknown message id during the handshake raises `UNKNOWN_MESSAGE_TYPE_CODE`.** A handshake frame whose message id maps to no `IncomingMessages` kind raised `HANDSHAKE_UNKNOWN_FRAME_CODE` (-3); it now raises `UNKNOWN_MESSAGE_TYPE_CODE` (-5), the code the same frame gets after the handshake, so a desynchronized stream reads the same whether or not a reconnect is in flight. `is_handshake_synthetic()` is false for it. `HANDSHAKE_UNKNOWN_FRAME_CODE` still covers a recognized kind with no `StartupMessage` variant, and its text no longer carries the message id. The new `Notice::is_client_synthesized()` is true for every client-synthesized code (any negative code) (#906).
+- **Async shutdown ends subscriptions with `Err(Error::Shutdown)`.** On the async client, `disconnect()` or dropping the `Client` used to end live subscriptions (including `order_update_stream`) with no error, so a stream ended by shutdown looked like one that closed normally. Each now yields `Err(Error::Shutdown)`, then ends, as on the blocking client. Code that took the end of the stream as the shutdown signal now sees the error first; `notice_stream` still just ends (#895).
+- **`OrderBuilder::build()` sends only the price fields the order type uses.** Each order-type setter writes only its own fields, so a field from an earlier one used to reach the order: `.trailing_stop(TrailBy::Percent(5.0), 95.0).limit(100.0)` sent a limit order with `trailing_percent` set, `.stop_limit(..)` followed by `.trailing_stop_limit(..)` kept the stop-limit's `limit_price`, and a trail amount survived as `aux_price`. `limit_price`, `aux_price`, `trailing_percent`, `trail_stop_price` and `limit_price_offset` are now sent only for the types that use them; the last setter's type decides. `.order_type(MarketIfTouched | LimitIfTouched | Relative | PassiveRelative | PeggedToMarket)` with no trigger or offset fails with `ValidationError::MissingRequiredField("aux_price")` instead of sending the order without one; use the named setter (`.market_if_touched(price)` and so on) (#901).
+- **Option-computation values not yet computed are `None`.** TWS reports a value it has not computed with a sentinel instead of omitting it: `-1` for `implied_volatility`, `option_price`, `present_value_dividend` and `underlying_price`, `-2` for `delta`, `gamma`, `vega` and `theta`. Since 3.0 the `OptionComputation` returned by `calculate_option_price` and `calculate_implied_volatility`, and delivered as `TickTypes::OptionComputation`, carried the sentinel as `Some(-1.0)` / `Some(-2.0)`. Each field is now `None` in that case, as in 2.x and the reference clients. Code that compared against `-1.0` or `-2.0` to detect this can match on `None` instead (#941).
 
 ## Quick migration checklist
 
@@ -327,7 +489,16 @@ No code changes required, but observable at runtime:
 18. Add a `MarketDepths::Reset` arm that empties your book to exhaustive matches on `MarketDepths`, and drop any code-317 notice handling on depth subscriptions — see [§18](#18-marketdepths-gains-reset).
 19. Check code that treats `NoticeCategory::OrderRejection` or `is_order_rejection()` as "any 200..=399 failure": request errors now come as `RequestError` / `is_request_error()`, and `is_warning()` is false for 2188 — see [§19](#19-noticecategoryrequesterror-notice-predicates-follow-category).
 20. Delete calls to `Client::next_request_id()`; take a live request's id from `Subscription::request_id()`, `ContractDetailsBuilder::request_id()` or `TickSubscription::request_id()` — see [§20](#20-clientnext_request_id-is-removed).
-21. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
+21. Replace `SpreadBuilder::iron_condor(lp, sp, sc, lc)` with `.vertical(lp, sp).vertical(lc, sc)`, and name the target type where a spread leg's contract id is converted with `.into()`, `.try_into()` or `.parse()` — see [§21](#21-spreadbuilder-takes-impl-intocontractid-and-iron_condor-is-removed).
+22. Wrap the trail in `TrailBy::Percent(..)` in `OrderBuilder::trailing_stop` / `trailing_stop_limit` calls, and write `OrderBuilder<ClientBound<'a, C>>` where you named `OrderBuilder<'a, C>` — see [§22](#22-fluent-trailing-stops-take-trailby-and-orderbuilder-is-generic-over-its-target).
+23. Replace the removed `order_builder` stop-limit, limit-if-touched, relative, trailing-stop-limit, pegged-to-stock and `PeggedToBenchmark` constructors with `Order::builder()` chains — see [§23](#23-order_builder-free-functions-with-swappable-prices-are-removed-use-orderbuilder).
+24. Drop the `non_guaranteed` argument from the combo order functions, wrapping the order in `non_guaranteed(..)` where it was `true` — see [§24](#24-combo-order-functions-drop-non_guaranteed-bool-wrap-them-in-non_guaranteed).
+25. Replace `attach_adjustable_to_stop` / `_to_stop_limit` / `_to_trail` with `attach_adjustable_stop(&parent, stop, Adjustment { .. })` — see [§25](#25-attach_adjustable_to_-become-attach_adjustable_stop).
+26. Pass `BracketPrices { entry, take_profit, stop_loss }` to `bracket_order` and handle its `Result`; replace `bracket().build()` with `submit_all()` — see [§26](#26-bracket_order-takes-bracketprices-and-returns-a-result-bracketorderbuilderbuild-is-crate-private).
+27. Replace `exercise_options(&contract, action, quantity, account, ovrd, time)` with `exercise_options(&contract).exercise(quantity)` (or `.lapse(quantity)`) plus `.account(..)`, `.override_natural_action()` and `.manual_order_time(..)` as needed, then `.submit()` — see [§27](#27-exercise_options-returns-a-builder).
+28. Replace `peg_best_order`, `peg_best_up_to_mid_order` and `peg_mid_order`, and the builder's `compete_against_best_offset` / `mid_offset_at_*` setters, with `.peg_best(..)` / `.peg_mid(..)` — see [§28](#28-ibkrats-peg-functions-are-removed-use-peg_best--peg_mid).
+29. Replace `SpreadBuilder::calendar(near, far)` with `short_calendar(near, far)` for the same legs, or with `long_calendar(near, far)` bought instead of sold if you sold it to go long — see [§29](#29-spreadbuildercalendar-is-replaced-by-long_calendar-and-short_calendar).
+30. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
 
 ## Need help?
 

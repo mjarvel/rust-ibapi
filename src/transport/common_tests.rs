@@ -1,4 +1,5 @@
 use super::*;
+use crate::common::test_utils::helpers::CapturingSink;
 use crate::messages::UNKNOWN_MESSAGE_TYPE_CODE;
 
 #[test]
@@ -27,18 +28,6 @@ fn test_validate_frame_length_rejects_out_of_range_lengths() {
     }
 }
 
-/// Collects everything delivered to the notice sink.
-#[derive(Default)]
-struct CapturingSink {
-    notices: std::sync::Mutex<Vec<Notice>>,
-}
-
-impl NoticeSink for CapturingSink {
-    fn deliver(&self, notice: Notice) {
-        self.notices.lock().unwrap().push(notice);
-    }
-}
-
 #[test]
 fn test_report_unroutable_frame_raises_a_notice_for_an_unknown_kind() {
     // Message id 9999 maps to no IncomingMessages variant, which is what a
@@ -49,7 +38,7 @@ fn test_report_unroutable_frame_raises_a_notice_for_an_unknown_kind() {
     let sink = CapturingSink::default();
     report_unroutable_frame(&message, &sink);
 
-    let notices = sink.notices.lock().unwrap();
+    let notices = sink.notices();
     assert_eq!(notices.len(), 1, "an unknown kind must be observable, not just logged");
     assert_eq!(notices[0].code, UNKNOWN_MESSAGE_TYPE_CODE);
     // Naming the id is the whole point: scattered ids mean the framing slipped,
@@ -73,7 +62,7 @@ fn test_report_unroutable_frame_stays_quiet_for_a_known_kind() {
     report_unroutable_frame(&message, &sink);
 
     assert!(
-        sink.notices.lock().unwrap().is_empty(),
+        sink.notices().is_empty(),
         "a known kind with no listener is routine and must raise no notice"
     );
 }
@@ -124,4 +113,34 @@ fn test_fibonacci_backoff_zero_max() {
     let mut backoff = FibonacciBackoff::new(0);
     assert_eq!(backoff.next_delay(), Duration::ZERO);
     assert_eq!(backoff.next_delay(), Duration::ZERO);
+}
+
+#[test]
+fn lease_is_live_while_any_holder_is() {
+    let lease = Lease::new();
+    let lease_ref = lease.downgrade();
+    let clone = lease.clone();
+
+    drop(lease);
+    assert!(lease_ref.is_live(), "a clone still holds the lease");
+
+    drop(clone);
+    assert!(!lease_ref.is_live(), "no holder left");
+}
+
+#[test]
+fn lease_ref_identifies_its_lease() {
+    let lease = Lease::new();
+    let other = Lease::new();
+
+    assert!(lease.downgrade().is(&lease.downgrade()));
+    assert!(lease.downgrade().is(&lease.clone().downgrade()), "clones share identity");
+    assert!(!lease.downgrade().is(&other.downgrade()));
+
+    // Identity outlives the lease: a stale signal still matches its own
+    // dead registration, and only that one.
+    let lease_ref = lease.downgrade();
+    drop(lease);
+    assert!(lease_ref.is(&lease_ref.clone()));
+    assert!(!lease_ref.is(&other.downgrade()));
 }

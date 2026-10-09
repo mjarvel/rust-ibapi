@@ -12,17 +12,18 @@ use crossbeam::channel;
 use crate::accounts::types::AccountId;
 use crate::client::ids::{OrderId, RequestId};
 use crate::messages::{OutgoingMessages, ResponseMessage};
+use crate::transport::common::Lease;
 use crate::transport::routing::{classify_error, determine_routing, ErrorDisposition, RoutingDecision};
 use crate::transport::{RoutedItem, SharedTicket};
 use crate::Error;
 
 #[cfg(feature = "sync")]
-use crate::transport::{InternalSubscription, MessageBus, SubscriptionBuilder};
+use crate::transport::{InternalSubscription, MessageBus, Signal, SubscriptionBuilder};
 
 #[cfg(feature = "async")]
 use {
     crate::transport::{
-        r#async::{AsyncInternalSubscription, CleanupSignal},
+        r#async::{AsyncInternalSubscription, CleanupSignal, RouteKey},
         AsyncMessageBus,
     },
     async_trait::async_trait,
@@ -41,6 +42,9 @@ pub(crate) struct MessageBusStub {
     /// The `limit` of each `send_request_bounded` call, in order. The stub
     /// doesn't enforce it; overflow is tested on the real buses.
     pub buffer_limits: RwLock<Vec<usize>>,
+    /// The request id of each `send_executions_request` call, in order.
+    #[cfg(feature = "async")]
+    pub executions_requests: RwLock<Vec<RequestId>>,
     /// Requests still to be answered with [`Error::ConnectionReset`] before the
     /// configured responses are served. See [`MessageBusStub::with_connection_resets`].
     connection_resets: AtomicUsize,
@@ -48,6 +52,11 @@ pub(crate) struct MessageBusStub {
     /// with none. See [`AsyncMessageBus::runtime_handle`].
     #[cfg(feature = "async")]
     runtime: Option<tokio::runtime::Handle>,
+    /// The cleanup channel stubbed subscriptions signal on drop or cancel.
+    /// Nothing reads it; the receiver is kept so sends succeed rather than
+    /// logging a warning per subscription.
+    #[cfg(feature = "sync")]
+    signals: (channel::Sender<Signal>, channel::Receiver<Signal>),
     // pub next_request_id: i32,
     // pub server_version: i32,
     // pub order_id: i32,
@@ -63,9 +72,13 @@ impl Default for MessageBusStub {
             response_messages: vec![],
             ordered_responses: vec![],
             buffer_limits: RwLock::new(vec![]),
+            #[cfg(feature = "async")]
+            executions_requests: RwLock::new(vec![]),
             connection_resets: AtomicUsize::new(0),
             #[cfg(feature = "async")]
             runtime: tokio::runtime::Handle::try_current().ok(),
+            #[cfg(feature = "sync")]
+            signals: channel::unbounded(),
         }
     }
 }
@@ -98,7 +111,7 @@ impl MessageBusStub {
     /// serving the configured responses.
     ///
     /// The real transport synthesizes `ConnectionReset` in its reconnect path
-    /// (`notify_all`), which the stub bypasses — so before this existed, no test
+    /// (`fail_all`), which the stub bypasses — so before this existed, no test
     /// could reach the retry wiring every one-shot request goes through (#741),
     /// only the combinator in `src/common/retry.rs`. The assertion is a resend
     /// count: `request_messages().len()` is the number of attempts, because each
@@ -234,14 +247,17 @@ impl MessageBus for MessageBusStub {
         drop(tracker); // Release lock early
 
         let (sender, receiver) = channel::unbounded();
-        let (signaler, _) = channel::unbounded();
 
         // Send any pre-configured response messages
         for item in self.routed_items() {
             sender.send(item).unwrap();
         }
 
-        let subscription = SubscriptionBuilder::new().receiver(receiver).signaler(signaler).build();
+        let subscription = SubscriptionBuilder::new()
+            .receiver(receiver)
+            .signaler(self.signals.0.clone())
+            .lease(Lease::new())
+            .build();
 
         Ok(subscription)
     }
@@ -295,13 +311,15 @@ fn mock_request(stub: &MessageBusStub, route: MockRoute, message: &[u8]) -> Inte
     stub.request_messages.write().unwrap().push(message.to_vec());
 
     let (sender, receiver) = channel::unbounded();
-    let (s1, _r1) = channel::unbounded();
 
     for item in stub.routed_items_for_request() {
         sender.send(item).unwrap();
     }
 
-    let subscription = SubscriptionBuilder::new().signaler(s1).receiver(receiver);
+    let subscription = SubscriptionBuilder::new()
+        .signaler(stub.signals.0.clone())
+        .lease(Lease::new())
+        .receiver(receiver);
     match route {
         MockRoute::Request(request_id) => subscription.request_id(request_id),
         MockRoute::Order(order_id) => subscription.order_id(order_id),
@@ -324,6 +342,11 @@ impl AsyncMessageBus for MessageBusStub {
         bound: crate::transport::BufferBound,
     ) -> Result<AsyncInternalSubscription, Error> {
         self.buffer_limits.write().unwrap().push(bound.limit);
+        Ok(self.seeded_subscription(message))
+    }
+
+    async fn send_executions_request(&self, request_id: RequestId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
+        self.executions_requests.write().unwrap().push(request_id);
         Ok(self.seeded_subscription(message))
     }
 
@@ -369,18 +392,14 @@ impl AsyncMessageBus for MessageBusStub {
         let (cleanup_sender, mut cleanup_receiver) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(signal) = cleanup_receiver.recv().await {
-                if matches!(signal, CleanupSignal::OrderUpdateStream) {
+                if matches!(signal, CleanupSignal::OrderUpdateStream(_)) {
                     ORDER_UPDATE_SUBSCRIPTION_TRACKER.lock().unwrap().remove(&stub_id);
                     break;
                 }
             }
         });
 
-        Ok(AsyncInternalSubscription::with_cleanup(
-            receiver,
-            cleanup_sender,
-            CleanupSignal::OrderUpdateStream,
-        ))
+        Ok(AsyncInternalSubscription::with_cleanup(receiver, cleanup_sender).leased(Lease::new(), RouteKey::OrderUpdateStream))
     }
 
     fn notice_subscribe(&self) -> crate::subscriptions::notice_stream::async_impl::NoticeStream {

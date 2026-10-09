@@ -445,7 +445,7 @@ impl Contract {
     /// use ibapi::contracts::{Contract, LegAction};
     ///
     /// let spread = Contract::spread()
-    ///     .calendar(12345, 67890)
+    ///     .long_calendar(12345, 67890)
     ///     .build();
     /// ```
     pub fn spread() -> SpreadBuilder {
@@ -817,6 +817,8 @@ impl ToField for Vec<TagValue> {
 
 /// Receives option specific market data.
 /// TWS’s options model volatility, prices, and deltas, along with the present value of dividends expected on that options underlier.
+///
+/// A value is `None` when TWS has not computed it yet.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, Default)]
 pub struct OptionComputation {

@@ -124,6 +124,54 @@ impl Price {
     }
 }
 
+/// How far a trailing stop trails the market.
+///
+/// Taken by [`OrderBuilder::trailing_stop`](crate::orders::OrderBuilder::trailing_stop) and
+/// [`OrderBuilder::trailing_stop_limit`](crate::orders::OrderBuilder::trailing_stop_limit).
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum TrailBy {
+    /// Trail by a fixed price amount. Sent as `Order::aux_price`.
+    Amount(f64),
+    /// Trail by a percentage of the market price. Sent as `Order::trailing_percent`.
+    Percent(f64),
+}
+
+/// How a PEG BEST order competes. See
+/// [`OrderBuilder::peg_best`](crate::orders::OrderBuilder::peg_best).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CompeteAgainstBest {
+    /// Improve on the best bid (buy) or offer (sell) by this offset. Must be finite.
+    Offset(f64),
+    /// Compete up to the midpoint, offset from it by [`MidOffsets`].
+    UpToMid(MidOffsets),
+}
+
+/// Offsets from the midpoint for IBKRATS pegs, named so they can't be swapped. See
+/// [`OrderBuilder::peg_mid`](crate::orders::OrderBuilder::peg_mid) and
+/// [`CompeteAgainstBest::UpToMid`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MidOffsets {
+    /// Applied when the spread is an even number of cents wide, so the midpoint is a whole
+    /// penny. Whole-penny increments or zero.
+    pub at_whole: f64,
+    /// Applied when the spread is an odd number of cents wide, so the midpoint is a half
+    /// penny. Half-penny increments.
+    pub at_half: f64,
+}
+
+/// Entry, take-profit and stop-loss prices of a bracket order, named so they can't be swapped.
+/// See [`order_builder::bracket_order`](crate::orders::order_builder::bracket_order).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BracketPrices {
+    /// Limit price of the parent order.
+    pub entry: f64,
+    /// Limit price of the take-profit order.
+    pub take_profit: f64,
+    /// Stop price of the stop-loss order.
+    pub stop_loss: f64,
+}
+
 /// Order types supported by Interactive Brokers
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +343,30 @@ impl OrderType {
                 | Self::PassiveRelative
                 | Self::PeggedToMarket
         )
+    }
+
+    // `build()` sends a price field only for the types below, so one left by an earlier
+    // order-type setter is dropped. Sets follow C# `OrderSamples.cs`, plus `limit_price` for
+    // PEG BEST and the fields the REL combos (reachable only through `.order_type(..)`) may carry.
+
+    /// Types whose stop price the builder sends as `aux_price`.
+    pub(crate) fn uses_stop_price(&self) -> bool {
+        matches!(self, Self::Stop | Self::StopLimit | Self::StopWithProtection)
+    }
+
+    /// Types that send `limit_price`, required or as an optional cap.
+    pub(crate) fn uses_limit_price(&self) -> bool {
+        self.requires_limit_price() || matches!(self, Self::Midprice | Self::Relative | Self::PeggedToMidpoint | Self::PegBest)
+    }
+
+    /// Types that send `aux_price` as a trigger, offset or trail amount.
+    pub(crate) fn uses_aux_price(&self) -> bool {
+        self.requires_aux_price() || matches!(self, Self::PeggedToMidpoint | Self::RelativeLimitCombo | Self::RelativeMarketCombo)
+    }
+
+    /// Types that send `trailing_percent` and `trail_stop_price`.
+    pub(crate) fn uses_trail(&self) -> bool {
+        matches!(self, Self::TrailingStop | Self::TrailingStopLimit)
     }
 }
 

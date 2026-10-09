@@ -7,29 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Local fork additions and corrections
 
-- Async disconnect now explicitly closes both TCP halves even while clients or
+- Async disconnect explicitly closes both TCP halves even while clients or
   subscriptions are retained. Shutdown wakes pending socket I/O and permanently
-  prevents that stream from reconnecting; dispatcher exit performs the same
-  physical cleanup for client drop.
+  prevents that stream from reconnecting. Dispatcher exit performs physical
+  cleanup for client drop; this remains separate from upstream's runtime-free
+  subscription shutdown.
+- Historical `snapshot_once` (sync/async) yields finite envelopes preserving
+  notices, optional OHLC/volume/WAP/count values and explicit range-end metadata.
+  It distinguishes zero from absence, rejects invalid/missing dates, sends once
+  without retrying resets, and avoids cancellation after the End envelope.
+- `Client::cancel_order_untracked` (sync/async) writes an individual cancellation
+  without installing a per-order subscription. Observe outcomes through
+  `order_update_stream`; successful writing does not confirm cancellation.
+- Historical `fetch_once` (sync/async) requires `HistoricalDataEnd` and never
+  retries connection resets. Historical `fetch` likewise rejects a response that
+  ends before that marker, while preserving its existing reset retry policy.
 
 ### Added
 
-- Historical `snapshot_once` (sync/async) yields finite envelopes with request
-  notices, optional OHLC/volume/WAP/count values and explicit range-end metadata.
-  It preserves zero separately from absent values, rejects invalid/missing bar
-  dates and sends once without retrying connection resets. Its End envelope marks
-  native completion so cleanup after End writes no cancellation. Existing Bar,
-  fetch/fetch_once and ongoing stream behavior remains unchanged.
+- `generic_tick::ETF_FROZEN_NAV_LAST` (`"623"`, frozen-data ETF NAV last price, tick 97) (#946).
 
-- `Client::cancel_order_untracked` (sync/async) writes an individual cancellation
-  without installing a per-order subscription. Observe broker outcomes through
-  `order_update_stream`; successful writing does not confirm cancellation. This
-  path avoids diverting concurrent execution downloads into a cancel receiver.
-- Historical `fetch_once` (sync/async) requires a `HistoricalDataEnd` response
-  and never retries a connection reset, for applications owning generation/retry policy.
+### Deprecated
 
+- `generic_tick::ETF_NAV_FROZEN_LAST`. Its value, `"578"`, is the generic tick IB's earlier tick table gives for the ETF NAV close and prior close (ticks 92 and 93), not the frozen NAV last price (tick 97) its name and docs promised, and TWS rejects it (error 321). Use `ETF_FROZEN_NAV_LAST` for tick 97 (#946).
+- `generic_tick::ETF_NAV_BID` (`"576"`). TWS rejects it (error 321), and IB's current tick-type page no longer lists it; there is no replacement.
+
+### Fixed
+
+- Blocking `order_update_stream()` can be reopened right after `cancel()`, while the old handle is still held; it used to return `AlreadySubscribed` until the cleanup thread caught up (#932).
+- Blocking client: cancelling or dropping a `contract_news` or `broad_tape_news` subscription now sends `cancelMktData`, as the async client already did. Previously no cancel was sent, and TWS kept the news subscription open until disconnect (#947).
+
+## [5.0.0] - 2026-10-04
+
+### Added
+
+- `OrderBuilder::peg_best(limit, CompeteAgainstBest)` and `peg_mid(limit, MidOffsets)` for IBKRATS pegs, with `orders::builder::CompeteAgainstBest` (`Offset` or `UpToMid(MidOffsets)`) and `MidOffsets { at_whole, at_half }`. Both set `not_held`, which TWS requires for them (#936).
+- `orders::order_builder::non_guaranteed(order)`, which tags a combo order non-guaranteed, `attach_adjustable_stop` with `AdjustTo` / `Adjustment`, and `orders::builder::BracketPrices` (#901).
+- `Order::builder()` starts the fluent `OrderBuilder` without a client; `build()` returns the `Order` to pass to `place_order` / `submit_order`. Same setters and validation as `client.order(&contract)`, without `submit()` / `analyze()` / `bracket()` / preset legs, which need the client to allocate order ids (#901).
+- `OrderBuilder` setters for order fields it carried but could not set: `pegged_to_stock(delta, starting_price)`, `stock_reference_price`, `stock_range`, `pegged_to_benchmark(starting_price)` with `reference_contract`, `pegged_change_amount`, `pegged_change_amount_decrease`, `reference_change_amount` and `reference_range`, plus `non_guaranteed`, `combo_leg_prices`, `manual_order_time` and `cash_qty`. `build()` requires `delta` and `starting_price` for PEG STK, and `starting_price` and `reference_contract` for PEG BENCH. With `cash_qty`, the order quantity may be `0` (#901).
+- `OrderBuilder::pegged_to_market(offset)`, `pegged_to_midpoint(offset, limit_price)` and `box_top()`, for `OrderType` variants that had no named method. `pegged_to_midpoint` takes its arguments in the same order as `order_builder::pegged_to_midpoint` (#901).
 - `TickSubscription::request_id()` (sync and async): the id of the historical-ticks request, so `cancel_historical_ticks` can be called from code that does not hold the subscription.
 - `rust-version = "1.88"` in `Cargo.toml`, the floor set by `time` 0.3.47+. Cargo now reports an older toolchain up front instead of failing partway through the build, and CI checks the library builds on 1.88.
 - `ContractDetailsBuilder::buffer_limit(n)` caps unread items (rows and notices): when `n` are waiting and another arrives, the subscription yields every queued item, then the new `Error::BufferLimitExceeded { limit }`, then ends, and later rows are discarded. TWS's end marker and errors always get through, so a result that fills the cap exactly still ends normally. Without it nothing changes (async: lossy `channel_capacity`; sync: unbounded). `n` must be `1..=contracts::MAX_BUFFER_LIMIT` (#876).
@@ -43,10 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Historical bar `fetch` now returns `UnexpectedEndOfStream` if the response
-  closes after the bars without `HistoricalDataEnd`, instead of incomplete success.
-  Its existing reset retry remains; use `fetch_once` to disable replay.
-
+- `Client::exercise_options` (blocking and async) takes only the contract and returns `orders::ExerciseOptionsBuilder`: `.exercise(n)` or `.lapse(n)`, optional `.account(..)`, `.override_natural_action()` and `.manual_order_time(..)`, then `.submit()`. Invalid requests fail before an order id is used. Added `examples/async/options_exercise.rs`. See `docs/migration-5.0.md` §27 (#901).
+- `order_builder::bracket_order` takes `BracketPrices { entry, take_profit, stop_loss }` instead of three `f64`s and returns `Result<Vec<Order>, ValidationError>`, rejecting a non-finite price or a take profit or stop loss on the wrong side of the entry. `BracketOrderBuilder::build()` is crate-private: its orders carried placeholder ids only `submit_all()` fills in. See `docs/migration-5.0.md` §26 (#901).
+- `order_builder::combo_limit_order`, `combo_market_order`, `limit_order_for_combo_with_leg_prices`, `relative_limit_combo` and `relative_market_combo` drop their `non_guaranteed: bool` argument; wrap the order in `non_guaranteed(..)` instead. See `docs/migration-5.0.md` §24 (#901).
+- `OrderBuilder::build()` sends `limit_price`, `aux_price`, `trailing_percent`, `trail_stop_price` and `limit_price_offset` only for the order types that use them, so a field left by an earlier order-type setter (e.g. a trail percent before `.limit(..)`) no longer reaches the order. MIT, LIT, REL, PASSV REL and PEG MKT without a trigger or offset fail with `ValidationError::MissingRequiredField("aux_price")`. See `docs/migration-5.0.md` Behavioral changes (#901).
+- `OrderBuilder::trailing_stop` and `trailing_stop_limit` take `orders::builder::TrailBy` (`Amount` or `Percent`) instead of an `f64` percent, so the fluent builder can trail by amount as well. Write `TrailBy::Percent(x)` for the old behavior. `OrderBuilder<'a, C>` becomes `OrderBuilder<T>` (`orders::ClientBound<'a, C>` from `Client::order`, `orders::Detached` from `Order::builder()`); only code that names the type changes. See `docs/migration-5.0.md` §22 (#901).
+- `contracts::SpreadBuilder::add_leg` and `vertical` (and the new `long_calendar` / `short_calendar`) take `impl Into<ContractId>` instead of `i32`. Literals, `i32` and `ContractId` compile; a `.into()` / `.try_into()` / `.parse()` argument that relied on the `i32` parameter to pick its type now needs the type named. See `docs/migration-5.0.md` §21 (#901).
+- Async client: order channels no longer follow `ClientBuilder::channel_capacity` down. `place_order`, `cancel_order`, `exercise_options` and `executions` subscriptions hold at least 1024 frames, and `order_update_stream` and the open/completed-order streams at least 8192, so a small capacity set for market data cannot make them drop order updates; a larger `channel_capacity` still raises them. A lag on an order channel now logs at `error!` and its `SUBSCRIPTION_LAG_CODE` notice says to resync with `open_orders()` / `executions()`. Shared channels are allocated on first use rather than at connect (#896).
+- Sync client: the notice stream logs a backlog warning every 10,000 unread notices, like the subscription queues (#896).
+- Async client: shutdown (`disconnect()` or dropping the `Client`) ends live subscriptions with `Err(Error::Shutdown)` before end-of-stream, as the blocking client does; they used to end with no error. See `docs/migration-5.0.md` (#895).
 - A handshake frame whose message id maps to no known type raises `UNKNOWN_MESSAGE_TYPE_CODE` (-5), as it does after the handshake, instead of `HANDSHAKE_UNKNOWN_FRAME_CODE` (-3), so a desynchronized stream reads the same during a reconnect. `-3` still covers recognized kinds with no `StartupMessage` variant, and its text no longer carries the message id (#906, #927).
 - `Notice::category()` reports request errors in the 200..=399 band that never answer an order (`REQUEST_ERROR_CODES`, e.g. 316 depth HALTED, 354 not subscribed, 366 no historical query) as the new `NoticeCategory::RequestError` instead of `OrderRejection`; they still end the request. `Notice::is_warning()` and `is_order_rejection()` follow `category()` instead of testing a code range, so `is_warning()` is false for 2188 and `is_order_rejection()` is false for 202, 317, warning-form 399 and the request errors. Added `Notice::is_request_error()`. See `docs/migration-5.0.md` §19 (#898, #897).
 - `market_depth` subscriptions yield code 317 (depth book RESET) as `MarketDepths::Reset` instead of `SubscriptionItem::Notice`, so it survives `filter_data()` / `iter_data()`, which used to drop it and leave the caller merging rebuilt rows into a stale book. Exhaustive matches on `MarketDepths` need a `Reset` arm, which should empty the book. See `docs/migration-5.0.md` §18 (#899).
@@ -69,6 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `contracts::SpreadBuilder::calendar`. It bought the near leg and sold the far one, so buying the combo was short the calendar. Use `long_calendar(near, far)` (sell near, buy far) or `short_calendar(near, far)` (the old legs). See `docs/migration-5.0.md` §29 (#935).
+- `order_builder::peg_best_order`, `peg_best_up_to_mid_order` and `peg_mid_order`, and the `OrderBuilder` setters `compete_against_best_offset`, `mid_offset_at_whole` and `mid_offset_at_half`. Use `peg_best` / `peg_mid`. See `docs/migration-5.0.md` §28 (#936).
+- `order_builder::stop_limit`, `limit_if_touched`, `relative_pegged_to_primary`, `trailing_stop_limit`, `pegged_to_stock`, `auction_pegged_to_stock` and `PeggedToBenchmark`. Each took same-typed prices in a different order from the fluent method of the same name, so a swap compiled. Use `Order::builder()`. See `docs/migration-5.0.md` §23 (#901).
+- `order_builder::attach_adjustable_to_stop`, `attach_adjustable_to_stop_limit` and `attach_adjustable_to_trail`, replaced by `attach_adjustable_stop`; the trail unit is a `TrailBy` instead of a magic `0` / `100`. See `docs/migration-5.0.md` §25 (#901).
+- `contracts::SpreadBuilder::iron_condor`. Its four same-typed contract ids compiled in any order. Use `.vertical(long_put, short_put).vertical(long_call, short_call)`. See `docs/migration-5.0.md` §21 (#901).
 - `Client::next_request_id()` (blocking and async). It minted a request id no request used, and no API accepts a caller-chosen request id. Use `Subscription::request_id()`, `ContractDetailsBuilder::request_id()` or `TickSubscription::request_id()` for a live request's id. See `docs/migration-5.0.md` §20.
 - `orders::order_builder::auction_limit`, which built the same `Order` as `limit_order` once 4.2 dropped its strategy parameter. Routing the contract to `BOX` is what makes it an auction order. Also `orders::builder::OrderType::AuctionLimit` and `AuctionRelative`, which sent `LMT` and `REL` just like `Limit` and `Relative`. See `docs/migration-5.0.md` §17 (#903).
 - `orders::builder::OrderAnalysis`. No API produced or accepted it: `OrderBuilder::analyze()` has returned `OrderState` since the builder was added (#311). Use `OrderState`. See `docs/migration-5.0.md` §13 (#883).
@@ -84,6 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `OptionComputation` values that TWS has not computed yet are `None`, from `calculate_option_price`, `calculate_implied_volatility` and `TickTypes::OptionComputation` ticks. Previously they were returned as TWS's sentinels, `Some(-1.0)` / `Some(-2.0)`. See `docs/migration-5.0.md` Behavioral changes (#941).
+- `OrderBuilder` sent a stop price left by an earlier `.stop(..)`, `.stop_limit(..)` or `.stop_with_protection(..)` as `aux_price` on any non-stop order type, replacing a trigger price, offset or trail amount (e.g. `.stop(100.0).market_if_touched(105.0)` sent 100). Only stop, stop-limit and stop-with-protection orders read it now; `order_type(OrderType::StopWithProtection)` without a stop price fails with `MissingRequiredField("stop_price")` (#901).
+- Blocking client: `order_update_stream()` can be called again right after the previous stream is dropped. It returned `Error::AlreadySubscribed` until the cleanup thread had processed the drop, so the retry noted in 4.0's #778 entry is no longer needed (#893).
 - `Subscription::cancel()` ends the subscription on both clients, whether or not a cancel is written to TWS. When none was written (order subscriptions such as `place_order`, `order_update_stream`, types without a TWS cancel such as `executions` and `option_chain`, or a stream that had already ended or finished its snapshot), the subscription kept receiving until dropped. Blocking: it now yields what was queued, then `Err(Error::Cancelled)`, then ends, and a cancelled `order_update_stream` frees the slot for a new one. Async: every clone yields `Err(Error::Cancelled)` at its next poll, then ends. Cancelling an order subscription does not cancel the order; use `cancel_order` (#911).
 - `TickSubscription::cancel()` after the last batch writes no `cancelHistoricalTicks`, as documented, on both clients; only `Drop` skipped it (#911).
 - Error frames no longer go to the wrong place when a request id and an order id are the same number. Request ids and order ids shared one range (request ids started at 9000, order ids grow from the account's `nextValidId`), and an error frame carries one id, so an order's cancellation (202) or rejection (201) could reach an unrelated data subscription instead of the order, and a late error for a finished request could appear on the order-update stream. Request ids now start at 1,500,000,000 and every order id must be below that: `place_order`, `submit_order` and `cancel_order` return `Error::OrderIdInRequestRange` for an order id at or above it (including `parent_id` and the preset attached-order ids), as do `exercise_options` and `next_valid_order_id` when the next order id reaches it, and a connection whose `nextValidId` is already there fails with `Error::ConnectionRejected`. Frames are routed by which range their id falls in. See `docs/migration-5.0.md` (#789).
@@ -350,7 +381,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions up to and including [3.0.1] predate this changelog; see the
 [GitHub Releases page](https://github.com/wboayue/rust-ibapi/releases) for their notes.
 
-[Unreleased]: https://github.com/wboayue/rust-ibapi/compare/v4.2.0...HEAD
+[Unreleased]: https://github.com/wboayue/rust-ibapi/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/wboayue/rust-ibapi/compare/v4.2.0...v5.0.0
 [4.2.0]: https://github.com/wboayue/rust-ibapi/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/wboayue/rust-ibapi/compare/v4.0.1...v4.1.0
 [4.0.1]: https://github.com/wboayue/rust-ibapi/compare/v4.0.0...v4.0.1

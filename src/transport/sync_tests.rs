@@ -8,7 +8,9 @@ use crate::transport::common::MAX_RECONNECT_ATTEMPTS;
 // Additional imports for connection tests
 use crate::client::sync::Client;
 use crate::common::test_utils::helpers;
-use crate::common::test_utils::helpers::{binary_proto, error_frame, proto_response};
+use crate::common::test_utils::helpers::{
+    binary_proto, body, error_frame, execution_data_frame, farm_ok_frame_42, farm_ok_frame_unrouted, proto_response, NoticeTestData, FARM_OK_MSG,
+};
 use crate::contracts::Contract;
 use crate::messages::{encode_length, encode_raw_length, OutgoingMessages, RequestMessage, TRANSPORT_RECONNECT_CODE};
 use crate::orders::common::encoders::encode_place_order;
@@ -763,26 +765,6 @@ fn test_request_encoding_roundtrip() {
 // `MemoryStream` lets tests push response frames freely and drive
 // `bus.dispatch()` directly.
 
-/// Build a binary-text-payload response body from a pipe-delimited test input.
-/// `"msg_id|f1|f2|..."` → `[4-byte BE msg_id][f1\0f2\0...]`. Pipes are
-/// stand-ins for NULs so test inputs stay readable. For `Error` frames,
-/// use [`crate::common::test_utils::helpers::error_frame`] — they ship as
-/// protobuf post-floor-213 and the binary-text-payload path defaults to an
-/// empty Notice.
-fn body(text: &str) -> Vec<u8> {
-    let fields: Vec<&str> = text.split_terminator('|').collect();
-    let msg_id: i32 = fields[0].parse().expect("body() fixture must start with a numeric msg_id");
-    debug_assert_ne!(
-        msg_id,
-        crate::messages::IncomingMessages::Error as i32,
-        "Error frames must use error_frame() — protobuf-framed since PR-D1"
-    );
-    let payload: String = fields[1..].iter().map(|f| format!("{f}\0")).collect();
-    let mut data = msg_id.to_be_bytes().to_vec();
-    data.extend_from_slice(payload.as_bytes());
-    data
-}
-
 /// Wrap a fresh `MemoryStream` in a stubbed `TcpMessageBus`. Pins
 /// `server_version` to the current floor so `parse_raw_message` produces
 /// binary-text-payload frames from `body()` inputs.
@@ -1308,8 +1290,8 @@ fn test_send_message_writes_through() -> Result<(), Error> {
 }
 
 /// `MessageBus::create_order_update_subscription` returns `AlreadySubscribed`
-/// on duplicate calls; explicit drop of the first subscription releases the
-/// slot via the cleanup thread, but here we just assert duplicate-rejection.
+/// on duplicate calls while the first is held; dropping it frees the slot at
+/// once (see `test_drop_then_recreate_order_update_stream`).
 #[test]
 fn test_create_order_update_subscription_is_unique() -> Result<(), Error> {
     let (_, bus) = make_bus();
@@ -1876,28 +1858,8 @@ fn test_warning_with_order_id_routes_to_order_channel() -> Result<(), Error> {
 // / `iter_data()` API that the consumer sees `SubscriptionItem::Notice` /
 // `Err(_)` / `None` as expected.
 
-const FARM_OK_MSG: &str = "Market data farm connection is OK:usfarm";
 const CONNECTIVITY_RESTORED_MSG: &str = "Connectivity between IB and TWS has been restored - data maintained.";
 const READ_ONLY_MSG: &str = "The API interface is currently in Read-Only mode.";
-
-fn farm_ok_frame_42() -> Vec<u8> {
-    error_frame(RequestId::nth(42).raw(), 2104, FARM_OK_MSG)
-}
-
-fn farm_ok_frame_unrouted() -> Vec<u8> {
-    error_frame(-1, 2104, FARM_OK_MSG)
-}
-
-#[derive(Debug)]
-struct NoticeTestData;
-
-impl crate::subscriptions::StreamDecoder<NoticeTestData> for NoticeTestData {
-    const RESPONSE_MESSAGE_IDS: &'static [crate::messages::IncomingMessages] = &[crate::messages::IncomingMessages::HistogramData];
-
-    fn decode(_context: &crate::subscriptions::DecoderContext, _msg: &ResponseMessage) -> Result<NoticeTestData, Error> {
-        Ok(NoticeTestData)
-    }
-}
 
 fn wrap_subscription<T: crate::subscriptions::StreamDecoder<T>>(
     bus: Arc<TcpMessageBus<MemoryStream>>,
@@ -2235,30 +2197,12 @@ fn test_notice_stream_closes_on_shutdown() -> Result<(), Error> {
 // shared-only). For each strategy we cover the positive route, every fallback,
 // and the orphan-fallthrough.
 
-/// Proto-framed ExecutionData fixture. `request_id` is at proto tag 1; the
-/// dispatcher's `order_id` / `execution_id` accessors read the nested
-/// `execution.{order_id, exec_id}` sub-message via `ExecutionDetailsMinimal`.
-fn execution_data_body(request_id: i32, order_id: i32, execution_id: &str) -> Vec<u8> {
-    binary_proto(
-        crate::messages::IncomingMessages::ExecutionData as i32,
-        &crate::proto::ExecutionDetails {
-            req_id: Some(request_id),
-            contract: None,
-            execution: Some(crate::proto::Execution {
-                order_id: Some(order_id),
-                exec_id: Some(execution_id.to_string()),
-                ..Default::default()
-            }),
-        },
-    )
-}
-
 #[test]
 fn test_execution_data_routes_to_order_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-1"));
     bus.dispatch()?;
 
     let msg = sub.next_timeout(TICK).expect("order sub got no message")?;
@@ -2273,7 +2217,7 @@ fn test_execution_data_falls_back_to_request_channel() -> Result<(), Error> {
     let request_id = RequestId::nth(99);
     let sub = bus.send_request(request_id, &[])?;
 
-    stream.push_inbound(execution_data_body(request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(request_id.raw(), 7, "exec-1"));
     bus.dispatch()?;
 
     let msg = sub.next_timeout(TICK).expect("request sub got no message")?;
@@ -2326,7 +2270,7 @@ fn test_commission_report_routes_via_execution_id_mapping() -> Result<(), Error>
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 7, "exec-abc"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-abc"));
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::CommissionsReport as i32,
         &crate::proto::CommissionAndFeesReport {
@@ -2508,9 +2452,64 @@ fn drain_cleanup_signals(bus: &Arc<TcpMessageBus<MemoryStream>>) {
     panic!("cleanup thread did not process the marker signal");
 }
 
+/// #893: drop then immediately recreate the order update stream. The dead
+/// registration is replaced without waiting for the cleanup thread (which
+/// used to return `AlreadySubscribed` here), and the old stream's stale signal
+/// must not clear the replacement.
+#[test]
+fn test_drop_then_recreate_order_update_stream() -> Result<(), Error> {
+    let (_, bus) = make_bus();
+
+    // Cleanup thread not running yet: the old stream's signal stays queued.
+    drop(bus.create_order_update_subscription()?);
+    let replacement = bus.create_order_update_subscription().expect("immediate recreation failed");
+
+    let handle = bus.start_cleanup_thread();
+    drain_cleanup_signals(&bus);
+    assert!(
+        bus.send_order_update_item(Error::Cancelled.into()),
+        "stale cleanup cleared the replacement"
+    );
+    let item = replacement.next_timeout_routed(TICK);
+    assert!(matches!(item, Some(RoutedItem::Error(Error::Cancelled))), "{item:?}");
+
+    bus.request_shutdown();
+    handle.join().expect("cleanup thread join");
+    Ok(())
+}
+
+/// #932: cancel then recreate the order update stream, the old handle still
+/// held. `cancel()` releases the lease, so the registration is replaced
+/// without waiting for the cleanup thread; the old stream sends one signal,
+/// none at drop, and that stale signal must not clear the replacement.
+#[test]
+fn test_cancel_then_recreate_order_update_stream() -> Result<(), Error> {
+    let (_, bus) = make_bus();
+
+    // Cleanup thread not running yet: the old stream's signal stays queued.
+    let cancelled = bus.create_order_update_subscription()?;
+    cancelled.cancel();
+    let replacement = bus.create_order_update_subscription().expect("recreation after cancel failed");
+    drop(cancelled);
+    assert_eq!(bus.signals_recv.len(), 1, "cancel then drop should send one signal");
+
+    let handle = bus.start_cleanup_thread();
+    drain_cleanup_signals(&bus);
+    assert!(
+        bus.send_order_update_item(Error::Cancelled.into()),
+        "stale cleanup cleared the replacement"
+    );
+    let item = replacement.next_timeout_routed(TICK);
+    assert!(matches!(item, Some(RoutedItem::Error(Error::Cancelled))), "{item:?}");
+
+    bus.request_shutdown();
+    handle.join().expect("cleanup thread join");
+    Ok(())
+}
+
 /// Regression test for #773: dropping an old order subscription must not
 /// unregister a newer subscription under the same order id (place then cancel
-/// on one id). The stale signal carries the old sender's identity and skips
+/// on one id). The stale signal carries the old subscription's lease and skips
 /// the replacement.
 #[test]
 fn test_stale_order_cleanup_preserves_newer_subscription() -> Result<(), Error> {
@@ -2542,30 +2541,30 @@ fn test_stale_order_cleanup_preserves_newer_subscription() -> Result<(), Error> 
     Ok(())
 }
 
-/// The identity guards directly: a cleanup carrying a foreign sender must not
-/// remove a live registration, and one carrying the registered sender must.
+/// The identity guards directly: a cleanup carrying a foreign lease must not
+/// remove a live registration, and one carrying the registered lease must.
 #[test]
 fn test_cleanup_identity_guards() -> Result<(), Error> {
     let (_, bus) = make_bus();
 
     let order_id = OrderId::from(7);
     let _order_sub = bus.send_order_request(order_id, &[])?;
-    let (foreign, _foreign_rx) = crossbeam::channel::unbounded();
+    let foreign = Lease::new().downgrade();
     bus.clean_order(order_id, &foreign);
-    assert!(bus.orders.contains(&order_id), "foreign sender removed a live order registration");
-    let registered = bus.orders.copy_sender(order_id).unwrap();
+    assert!(bus.orders.contains(&order_id), "foreign lease removed a live order registration");
+    let registered = bus.orders.lease(order_id).unwrap();
     bus.clean_order(order_id, &registered);
-    assert!(!bus.orders.contains(&order_id), "matching sender failed to remove the registration");
+    assert!(!bus.orders.contains(&order_id), "matching lease failed to remove the registration");
 
     let _stream_sub = bus.create_order_update_subscription()?;
     bus.clear_order_update_stream(&foreign);
     assert!(
         bus.order_update_stream.lock().unwrap().is_some(),
-        "foreign sender cleared a live order update stream"
+        "foreign lease cleared a live order update stream"
     );
-    let registered = bus.order_update_stream.lock().unwrap().clone().unwrap();
+    let registered = bus.order_update_stream.lock().unwrap().as_ref().unwrap().lease.clone();
     bus.clear_order_update_stream(&registered);
-    assert!(bus.order_update_stream.lock().unwrap().is_none(), "matching sender failed to clear");
+    assert!(bus.order_update_stream.lock().unwrap().is_none(), "matching lease failed to clear");
 
     Ok(())
 }
@@ -2664,7 +2663,7 @@ fn test_execution_data_orphan_dropped() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let unrelated = bus.send_request(RequestId::nth(42), &[])?;
 
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-1"));
     bus.dispatch()?;
 
     assert!(unrelated.try_next().is_none(), "unrelated sub got an orphan message");
@@ -2715,8 +2714,8 @@ fn test_execution_aliases_pruned_when_subscriptions_drop() -> Result<(), Error> 
 
     let order = bus.send_order_request(OrderId::from(7), &[])?;
     let executions = bus.send_request(RequestId::nth(99), &[])?;
-    stream.push_inbound(execution_data_body(0, 7, "exec-order"));
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 0, "exec-request"));
+    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 0, "exec-request"));
     bus.dispatch()?;
     bus.dispatch()?;
     assert_eq!(bus.executions.len(), 2, "both executions mapped");
@@ -2744,7 +2743,7 @@ fn test_execution_aliases_pruned_on_cancel() -> Result<(), Error> {
 
     let order_id = OrderId::from(7);
     let order = bus.send_order_request(order_id, &[])?;
-    stream.push_inbound(execution_data_body(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
     bus.dispatch()?;
     order.cancel();
     drain_cleanup_signals(&bus);
@@ -2768,10 +2767,10 @@ fn test_stale_cleanup_keeps_newer_execution_aliases() -> Result<(), Error> {
     let handle = bus.start_cleanup_thread();
 
     let sub_a = bus.send_order_request(OrderId::from(42), &[])?;
-    stream.push_inbound(execution_data_body(0, 42, "exec-a"));
+    stream.push_inbound(execution_data_frame(0, 42, "exec-a"));
     bus.dispatch()?;
     let sub_b = bus.send_order_request(OrderId::from(42), &[])?;
-    stream.push_inbound(execution_data_body(0, 42, "exec-b"));
+    stream.push_inbound(execution_data_frame(0, 42, "exec-b"));
     bus.dispatch()?;
 
     drop(sub_a);
@@ -2817,7 +2816,7 @@ fn test_response_with_no_recipient_dropped() -> Result<(), Error> {
 
 /// `reset` notifies every channel category — requests, orders, shared — and
 /// clears the channel maps. All three categories must be live before the call
-/// to exercise each `notify_all` branch. A shared subscription receives the
+/// to exercise each `fail_all` branch. A shared subscription receives the
 /// reset once, however many response types its request maps to
 /// (`RequestAccountData` maps to four).
 #[test]
@@ -3136,10 +3135,9 @@ fn test_short_frame_body_reconnects() -> Result<(), Error> {
     let notices = bus.connection.notice_broadcaster.subscribe();
 
     stream.push_inbound(b"xx".to_vec());
-    let sv = crate::server_versions::PROTOBUF_REST_MESSAGES_3;
-    stream.push_inbound(format!("{sv}\020240120 12:00:00 EST\0").into_bytes());
-    stream.push_inbound(helpers::next_valid_id_frame(5000));
-    stream.push_inbound(helpers::managed_accounts_frame("DU1234567"));
+    for frame in helpers::handshake_frames(crate::server_versions::PROTOBUF_REST_MESSAGES_3, "EST", 5000) {
+        stream.push_inbound(frame);
+    }
 
     bus.dispatch()?;
 
@@ -3473,5 +3471,123 @@ fn test_bounded_request_end_marker_at_limit_still_ends() -> Result<(), Error> {
     assert_eq!(sub.next_timeout(TICK).expect("row")?.message_type(), IncomingMessages::ContractData);
     assert_eq!(sub.next_timeout(TICK).expect("end")?.message_type(), IncomingMessages::ContractDataEnd);
     assert!(sub.try_next().is_none(), "frames after the end marker are discarded");
+    Ok(())
+}
+
+/// A request route, its receiver, and the lease that keeps it live.
+fn sender_hash_route() -> (SenderHash<RequestId, RoutedItem>, Receiver<RoutedItem>, Lease) {
+    let routes = SenderHash::new();
+    let (sender, receiver) = channel::unbounded();
+    let lease = Lease::new();
+    routes.insert(RequestId::nth(1), sender, lease.downgrade());
+    (routes, receiver, lease)
+}
+
+#[test]
+fn sender_hash_deliver_hands_the_item_back_when_unrouted() {
+    let routes = SenderHash::<RequestId, RoutedItem>::new();
+    let item = routes.deliver(&RequestId::nth(1), RoutedItem::Error(Error::Cancelled));
+    assert!(matches!(item, Err(RoutedItem::Error(Error::Cancelled))));
+}
+
+#[test]
+fn sender_hash_deliver_aliased_aliases_the_route() {
+    let (routes, receiver, lease) = sender_hash_route();
+    let aliases = SenderHash::<String, RoutedItem>::new();
+    let alias = "exec-1".to_string();
+
+    routes
+        .deliver_aliased(&RequestId::nth(1), RoutedItem::Error(Error::Cancelled), Some(&alias), &aliases)
+        .unwrap();
+    aliases.deliver(&alias, Error::ConnectionReset.into()).unwrap();
+
+    let items: Vec<_> = receiver.try_iter().collect();
+    assert!(
+        items.len() == 2 && matches!(items[1], RoutedItem::Error(Error::ConnectionReset)),
+        "{items:?}"
+    );
+    assert!(aliases.lease(alias).unwrap().is(&lease.downgrade()), "alias holds another lease");
+}
+
+#[test]
+fn sender_hash_deliver_aliased_without_alias_registers_none() {
+    let (routes, receiver, _lease) = sender_hash_route();
+    let aliases = SenderHash::<String, RoutedItem>::new();
+
+    routes
+        .deliver_aliased(&RequestId::nth(1), RoutedItem::Error(Error::Cancelled), None, &aliases)
+        .unwrap();
+
+    assert_eq!(receiver.try_iter().count(), 1);
+    assert_eq!(aliases.len(), 0);
+}
+
+#[test]
+fn sender_hash_deliver_aliased_hands_the_item_back_when_unrouted() {
+    let routes = SenderHash::<RequestId, RoutedItem>::new();
+    let aliases = SenderHash::<String, RoutedItem>::new();
+
+    let item = routes.deliver_aliased(
+        &RequestId::nth(1),
+        RoutedItem::Error(Error::Cancelled),
+        Some(&"exec-1".to_string()),
+        &aliases,
+    );
+
+    assert!(matches!(item, Err(RoutedItem::Error(Error::Cancelled))));
+    assert_eq!(aliases.len(), 0, "unrouted item was aliased");
+}
+
+/// A panic under the route lock must not take every later route and
+/// teardown down with it.
+#[test]
+fn sender_hash_recovers_from_a_poisoned_lock() {
+    let (routes, receiver, _lease) = sender_hash_route();
+    std::thread::scope(|scope| {
+        let _ = scope
+            .spawn(|| {
+                let _guard = routes.senders.write().unwrap();
+                panic!("poison the route lock");
+            })
+            .join();
+    });
+    assert!(routes.senders.is_poisoned());
+
+    routes.deliver(&RequestId::nth(1), RoutedItem::Error(Error::Cancelled)).unwrap();
+    routes.clear();
+
+    assert_eq!(receiver.try_iter().count(), 1);
+    assert_eq!(routes.len(), 0);
+}
+
+/// A panic under the order-update slot's lock must not silently drop later
+/// order updates or leave the slot uncleanable.
+#[test]
+fn test_order_update_stream_survives_a_poisoned_lock() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let stream_sub = bus.create_order_update_subscription()?;
+    std::thread::scope(|scope| {
+        let _ = scope
+            .spawn(|| {
+                let _guard = bus.order_update_stream.lock().unwrap();
+                panic!("poison the order-update slot");
+            })
+            .join();
+    });
+    assert!(bus.order_update_stream.is_poisoned());
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OpenOrder as i32,
+        &crate::proto::OpenOrder {
+            order_id: Some(42),
+            ..Default::default()
+        },
+    ));
+    bus.dispatch()?;
+    assert!(stream_sub.next_timeout(TICK).is_some(), "update stream missed open order");
+
+    let registered = lock_slot(&bus.order_update_stream).as_ref().unwrap().lease.clone();
+    bus.clear_order_update_stream(&registered);
+    assert!(lock_slot(&bus.order_update_stream).is_none(), "poisoned slot not cleared");
     Ok(())
 }

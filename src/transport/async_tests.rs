@@ -12,33 +12,15 @@ use std::time::Duration;
 use super::*;
 use crate::client::ids::{OrderId, RequestId};
 use crate::common::test_utils::helpers;
-use crate::common::test_utils::helpers::{binary_proto, error_frame, managed_accounts_frame, next_valid_id_frame};
+use crate::common::test_utils::helpers::{
+    binary_proto, body, error_frame, execution_data_frame, farm_ok_frame_42, farm_ok_frame_unrouted, handshake_frames, NoticeTestData, FARM_OK_MSG,
+};
 use crate::connection::r#async::AsyncConnection;
 use crate::messages::{OutgoingMessages, TRANSPORT_RECONNECT_CODE};
 use crate::server_versions;
 use crate::testdata::builders::contracts::contract_data;
 use crate::testdata::builders::orders::order_bound;
 use crate::testdata::builders::ResponseProtoEncoder;
-
-/// Build a binary-text-payload response body from a pipe-delimited test input.
-/// `"msg_id|f1|f2|..."` → `[4-byte BE msg_id][f1\0f2\0...]`. Pipes are
-/// stand-ins for NULs so test inputs stay readable. For `Error` frames,
-/// use [`crate::common::test_utils::helpers::error_frame`] — they ship as
-/// protobuf post-floor-213 and the binary-text-payload path defaults to an
-/// empty Notice.
-fn body(text: &str) -> Vec<u8> {
-    let fields: Vec<&str> = text.split_terminator('|').collect();
-    let msg_id: i32 = fields[0].parse().expect("body() fixture must start with a numeric msg_id");
-    debug_assert_ne!(
-        msg_id,
-        crate::messages::IncomingMessages::Error as i32,
-        "Error frames must use error_frame() — protobuf-framed since PR-D1"
-    );
-    let payload: String = fields[1..].iter().map(|f| format!("{f}\0")).collect();
-    let mut data = msg_id.to_be_bytes().to_vec();
-    data.extend_from_slice(payload.as_bytes());
-    data
-}
 
 /// Wrap a fresh `MemoryStream` in a stubbed `AsyncTcpMessageBus`. Pins
 /// `server_version` to the current floor so `parse_raw_message` produces
@@ -63,7 +45,7 @@ async fn sender_only_cancel_does_not_divert_execution_download_or_end() {
     let client = crate::Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
     let mut observer = client.order_update_stream().await.unwrap();
     client.cancel_order_untracked(42, "").await.unwrap();
-    assert!(bus.order_channels.read().await.is_empty());
+    assert!(bus.orders.is_empty());
     let mut download = client.executions(ExecutionFilter::default()).await.unwrap();
     stream.push_inbound(binary_proto(
         crate::IncomingMessages::ExecutionData as i32,
@@ -106,7 +88,7 @@ async fn sender_only_cancel_does_not_divert_execution_download_or_end() {
         observer.next().await,
         Some(Ok(SubscriptionItem::Data(OrderUpdate::CommissionReport(_))))
     ));
-    assert!(bus.order_channels.read().await.is_empty());
+    assert!(bus.orders.is_empty());
 }
 
 /// `with_channel_capacity` reaches the per-request channels: a capacity-2
@@ -119,11 +101,118 @@ async fn test_with_channel_capacity_bounds_request_channels() {
     let bus = Arc::new(AsyncTcpMessageBus::with_channel_capacity(connection, 2).unwrap());
 
     let _sub = bus.send_request(RequestId::nth(1), vec![]).await.unwrap();
-    let sender = bus.request_channels.read().await.get(&RequestId::nth(1)).unwrap().sender.clone();
+    let sender = bus.requests.sender(&RequestId::nth(1)).unwrap();
     for _ in 0..3 {
         sender.send(RoutedItem::Error(Error::Cancelled)).unwrap();
     }
     assert_eq!(sender.len(), 2, "capacity-2 channel retains only the newest 2 frames");
+}
+
+/// Send `capacity + 1` items through `send`, then expect `subscription` to
+/// report exactly one dropped frame with `class`'s lag notice: proof that its
+/// channel holds `capacity` and that the subscription carries `class`.
+async fn assert_capacity_and_class(name: &str, subscription: &mut AsyncInternalSubscription, send: impl Fn(), capacity: usize, class: ChannelClass) {
+    for _ in 0..=capacity {
+        send();
+    }
+    let expected = match class {
+        ChannelClass::MarketData => crate::messages::subscription_lag_notice(1),
+        ChannelClass::Order | ChannelClass::OrderStream => crate::messages::order_lag_notice(1),
+    };
+    match subscription.next_routed().await {
+        Some(RoutedItem::Notice(notice)) => assert_eq!(notice, expected, "{name}"),
+        other => panic!("{name}: expected a one-frame lag notice, got {other:?}"),
+    }
+}
+
+/// A small `channel_capacity` sizes market-data channels but never shrinks
+/// the order-class floors, and each subscription carries its channel's class
+/// (#896).
+#[tokio::test]
+async fn test_channel_classes_under_small_channel_capacity() {
+    let stream = MemoryStream::default();
+    let connection = AsyncConnection::stubbed(stream.clone(), 28);
+    connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(AsyncTcpMessageBus::with_channel_capacity(connection, 1).unwrap());
+    let cancelled = || RoutedItem::Error(Error::Cancelled);
+
+    let mut market = bus.send_request(RequestId::nth(1), vec![]).await.unwrap();
+    let sender = bus.requests.sender(&RequestId::nth(1)).unwrap();
+    let send = || drop(sender.send(cancelled()));
+    assert_capacity_and_class("request", &mut market, send, 1, ChannelClass::MarketData).await;
+
+    let mut executions = bus.send_executions_request(RequestId::nth(2), vec![]).await.unwrap();
+    let sender = bus.requests.sender(&RequestId::nth(2)).unwrap();
+    let send = || drop(sender.send(cancelled()));
+    assert_capacity_and_class("executions", &mut executions, send, ORDER_CAPACITY, ChannelClass::Order).await;
+
+    let mut order = bus.send_order_request(OrderId::new(3), vec![]).await.unwrap();
+    let sender = bus.orders.sender(&OrderId::new(3)).unwrap();
+    let send = || drop(sender.send(cancelled()));
+    assert_capacity_and_class("order", &mut order, send, ORDER_CAPACITY, ChannelClass::Order).await;
+
+    let mut updates = bus.create_order_update_subscription().await.unwrap();
+    let sender = bus.order_update_stream.lock().unwrap().as_ref().unwrap().sender.clone();
+    let send = || drop(sender.send(cancelled()));
+    assert_capacity_and_class(
+        "order update stream",
+        &mut updates,
+        send,
+        ORDER_STREAM_CAPACITY,
+        ChannelClass::OrderStream,
+    )
+    .await;
+
+    // Shared channels: `notify_all` reaches every allocated one, so each is
+    // subscribed only when its turn comes.
+    let notify = || bus.shared_channels.notify_all(cancelled);
+    let mut positions = bus.send_shared_request(OutgoingMessages::RequestPositions, vec![]).await.unwrap();
+    assert_capacity_and_class("positions", &mut positions, notify, 1, ChannelClass::MarketData).await;
+    let mut open_orders = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+    assert_capacity_and_class("open orders", &mut open_orders, notify, ORDER_STREAM_CAPACITY, ChannelClass::OrderStream).await;
+}
+
+/// A `channel_capacity` above a floor raises the order-class channels too.
+#[test]
+fn test_channel_class_capacity() {
+    assert_eq!(ChannelClass::MarketData.capacity(4), 4);
+    assert_eq!(ChannelClass::Order.capacity(4), ORDER_CAPACITY);
+    assert_eq!(ChannelClass::OrderStream.capacity(4), ORDER_STREAM_CAPACITY);
+    let large = ORDER_STREAM_CAPACITY * 2;
+    assert_eq!(ChannelClass::Order.capacity(large), large);
+    assert_eq!(ChannelClass::OrderStream.capacity(large), large);
+}
+
+#[test]
+fn test_shared_order_channels_are_order_class() {
+    for request in [
+        OutgoingMessages::RequestOpenOrders,
+        OutgoingMessages::RequestAllOpenOrders,
+        OutgoingMessages::RequestAutoOpenOrders,
+        OutgoingMessages::RequestCompletedOrders,
+    ] {
+        assert_eq!(ChannelClass::of_shared(request), ChannelClass::OrderStream, "{request:?}");
+    }
+    assert_eq!(ChannelClass::of_shared(OutgoingMessages::RequestPositions), ChannelClass::MarketData);
+}
+
+/// A lag on an order-class subscription surfaces the order lag notice, and
+/// clones keep the class.
+#[tokio::test]
+async fn test_order_class_lag_surfaces_order_lag_notice() {
+    let (sender, receiver) = broadcast::channel(1);
+    let mut subscription = AsyncInternalSubscription::new(receiver).class(ChannelClass::Order);
+    let mut clone = subscription.clone();
+    for _ in 0..4 {
+        sender.send(RoutedItem::Error(Error::Cancelled)).unwrap();
+    }
+
+    for sub in [&mut subscription, &mut clone] {
+        match sub.next_routed().await {
+            Some(RoutedItem::Notice(notice)) => assert_eq!(notice, crate::messages::order_lag_notice(3)),
+            other => panic!("expected order lag notice, got {other:?}"),
+        }
+    }
 }
 
 /// Receive next message with a deadline; panics with context if the channel
@@ -300,7 +389,7 @@ async fn test_create_order_update_subscription_after_shutdown_fails() {
 
     let err = mb.create_order_update_subscription().await.err().expect("subscribe after shutdown");
     assert!(matches!(err, Error::Shutdown), "got: {err:?}");
-    assert!(bus.order_update_stream.read().await.is_none());
+    assert!(bus.order_update_stream.lock().unwrap().is_none());
 }
 
 /// Shutdown ends a live notice stream, and one opened afterwards is already
@@ -336,9 +425,8 @@ async fn test_notice_stream_ends_on_request_shutdown_sync() {
     assert!(matches!(ended, Ok(None)), "live stream: {ended:?}");
 }
 
-/// `Client::drop` only calls `request_shutdown_sync`; the dispatcher must
-/// finish the shutdown on exit, or a live order-update stream (whose
-/// subscription holds the bus) never ends.
+/// `Client::drop` calls `request_shutdown_sync`, which must end a live
+/// order-update stream (whose subscription holds the bus).
 #[tokio::test]
 async fn test_order_update_stream_ends_on_request_shutdown_sync() {
     let (_, bus) = make_bus();
@@ -349,6 +437,33 @@ async fn test_order_update_stream_ends_on_request_shutdown_sync() {
 
     let drained = tokio::time::timeout(Duration::from_millis(500), async { while updates.next().await.is_some() {} }).await;
     assert!(drained.is_ok(), "order-update stream did not end");
+}
+
+/// Like the sync bus, shutdown fails every kind of subscription with
+/// `Error::Shutdown` before ending it, so a reader can tell shutdown from a
+/// stream that simply closed. Through `request_shutdown_sync`, the
+/// `Client::drop` path, with no dispatcher to finish it.
+#[tokio::test]
+async fn test_shutdown_fails_every_subscription_then_ends_it() {
+    let (_, bus) = make_bus();
+    let subscriptions = [
+        ("request", bus.send_request(RequestId::nth(1), vec![]).await.unwrap()),
+        ("order", bus.send_order_request(OrderId::from(7), vec![]).await.unwrap()),
+        (
+            "shared",
+            bus.send_shared_request(OutgoingMessages::RequestPositions, vec![]).await.unwrap(),
+        ),
+        ("order update", bus.create_order_update_subscription().await.unwrap()),
+    ];
+
+    bus.request_shutdown_sync();
+
+    for (name, mut subscription) in subscriptions {
+        let first = tokio::time::timeout(TICK, subscription.next_routed()).await.expect(name);
+        assert!(matches!(first, Some(RoutedItem::Error(Error::Shutdown))), "{name}: {first:?}");
+        let end = tokio::time::timeout(TICK, subscription.next_routed()).await.expect(name);
+        assert!(end.is_none(), "{name} did not end: {end:?}");
+    }
 }
 
 /// A `place_order` or `executions` subscription that has received an
@@ -363,15 +478,15 @@ async fn test_subscriptions_with_executions_end_on_request_shutdown_sync() {
     let mut executions = bus.send_request(RequestId::nth(99), vec![]).await.unwrap();
 
     // Mapped by order id, and by request id where no order channel matches.
-    stream.push_inbound(execution_data_body(0, 7, "exec-order"));
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 0, "exec-request"));
+    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 0, "exec-request"));
     bus.read_and_route_message().await.unwrap();
     bus.read_and_route_message().await.unwrap();
     for (name, sub) in [("order", &mut order), ("executions", &mut executions)] {
         let message = next_message(sub).await;
         assert_eq!(message.message_type(), crate::messages::IncomingMessages::ExecutionData, "{name}");
     }
-    assert_eq!(bus.execution_channels.read().await.len(), 2, "both executions mapped");
+    assert_eq!(bus.executions.len(), 2, "both executions mapped");
 
     bus.clone().process_messages(0, Duration::from_millis(0)).expect("process_messages");
     bus.request_shutdown_sync();
@@ -380,7 +495,7 @@ async fn test_subscriptions_with_executions_end_on_request_shutdown_sync() {
         let drained = tokio::time::timeout(Duration::from_millis(500), async { while sub.next().await.is_some() {} }).await;
         assert!(drained.is_ok(), "{name} subscription with an execution did not end");
     }
-    assert!(bus.execution_channels.read().await.is_empty());
+    assert!(bus.executions.is_empty());
 }
 
 /// A frame with message id `-2` is `IncomingMessages::Shutdown`: the router
@@ -391,7 +506,7 @@ async fn test_subscriptions_with_executions_end_on_request_shutdown_sync() {
 async fn test_shutdown_frame_ends_subscriptions_with_executions() {
     let (stream, bus) = make_bus();
     let mut order = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
-    stream.push_inbound(execution_data_body(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
     bus.read_and_route_message().await.unwrap();
     let message = next_message(&mut order).await;
     assert_eq!(message.message_type(), crate::messages::IncomingMessages::ExecutionData);
@@ -402,7 +517,7 @@ async fn test_shutdown_frame_ends_subscriptions_with_executions() {
     let drained = tokio::time::timeout(Duration::from_millis(500), async { while order.next().await.is_some() {} }).await;
     assert!(drained.is_ok(), "order subscription with an execution did not end");
     assert!(!bus.is_connected());
-    assert!(bus.execution_channels.read().await.is_empty());
+    assert!(bus.executions.is_empty());
 }
 
 /// An order-update stream dropped while its cleanup signal is still queued
@@ -415,12 +530,14 @@ async fn test_order_frame_routes_while_a_dropped_order_update_stream_awaits_clea
     let mut order = bus.send_order_request(OrderId::from(22), vec![]).await.unwrap();
     let updates = bus.create_order_update_subscription().await.unwrap();
 
-    // Hold the FIFO cleanup task on a map this routing path does not touch,
-    // so the stream's cleanup signal cannot run before the frame is routed.
-    let cleanup_gate = bus.request_channels.write().await;
-    bus.cleanup_sender.send(CleanupSignal::Request(RequestId::nth(987_654))).unwrap();
+    // Stall the cleanup task, so the stream's cleanup signal cannot run
+    // before the frame is routed.
+    let cleanup_gate = bus.cleanup_gate.lock().await;
     drop(updates);
-    assert!(bus.order_update_stream.read().await.is_some(), "the dropped stream is still registered");
+    assert!(
+        bus.order_update_stream.lock().unwrap().is_some(),
+        "the dropped stream is still registered"
+    );
 
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::OrderStatus as i32,
@@ -660,28 +777,8 @@ use crate::subscriptions::r#async::Subscription;
 use crate::subscriptions::{DecoderContext, StreamDecoder, SubscriptionItem, SubscriptionItemStreamExt};
 use futures::StreamExt;
 
-const FARM_OK_MSG: &str = "Market data farm connection is OK:usfarm";
 const CONNECTIVITY_RESTORED_MSG: &str = "Connectivity between IB and TWS has been restored - data maintained.";
 const READ_ONLY_MSG: &str = "The API interface is currently in Read-Only mode.";
-
-fn farm_ok_frame_42() -> Vec<u8> {
-    error_frame(RequestId::nth(42).raw(), 2104, FARM_OK_MSG)
-}
-
-fn farm_ok_frame_unrouted() -> Vec<u8> {
-    error_frame(-1, 2104, FARM_OK_MSG)
-}
-
-#[derive(Debug)]
-struct NoticeTestData;
-
-impl StreamDecoder<NoticeTestData> for NoticeTestData {
-    const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistogramData];
-
-    fn decode(_context: &DecoderContext, _msg: &ResponseMessage) -> Result<NoticeTestData, Error> {
-        Ok(NoticeTestData)
-    }
-}
 
 async fn make_request_subscription(request_id: RequestId) -> (MemoryStream, Arc<AsyncTcpMessageBus<MemoryStream>>, Subscription<NoticeTestData>) {
     let (stream, bus) = make_bus();
@@ -781,7 +878,7 @@ async fn test_shared_subscription_without_cancel_message_releases_count() {
     use crate::orders::Orders;
 
     let (stream, bus) = make_bus();
-    let count = || async { bus.shared_counts.lock().await.live(OutgoingMessages::RequestOpenOrders) };
+    let count = || async { bus.shared_channels.live(OutgoingMessages::RequestOpenOrders).await };
 
     let internal = bus
         .send_shared_request(OutgoingMessages::RequestOpenOrders, b"open-orders".to_vec())
@@ -806,7 +903,7 @@ async fn test_shared_subscription_ended_natively_still_releases_count() {
     use crate::orders::Orders;
 
     let (stream, bus) = make_bus();
-    let count = || async { bus.shared_counts.lock().await.live(OutgoingMessages::RequestOpenOrders) };
+    let count = || async { bus.shared_channels.live(OutgoingMessages::RequestOpenOrders).await };
 
     let internal = bus
         .send_shared_request(OutgoingMessages::RequestOpenOrders, b"open-orders".to_vec())
@@ -845,7 +942,7 @@ fn positions_cancel() -> Vec<u8> {
 }
 
 async fn positions_live(bus: &Arc<AsyncTcpMessageBus<MemoryStream>>) -> usize {
-    bus.shared_counts.lock().await.live(OutgoingMessages::RequestPositions)
+    bus.shared_channels.live(OutgoingMessages::RequestPositions).await
 }
 
 /// Wait until the count for `RequestPositions` reaches `expected`, or the
@@ -924,6 +1021,19 @@ async fn test_stale_shared_handle_neither_cancels_nor_decrements() {
     assert_eq!(wait_for_positions_live(&bus, 0).await, 0);
 }
 
+/// The open-orders channel maps three response types. A reset that walked the
+/// channels by response type failed it three times; it must fail it once.
+#[tokio::test]
+async fn test_reset_fails_a_shared_channel_once() {
+    let (_stream, bus) = make_bus();
+    let mut open_orders = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+
+    bus.reset_channels().await;
+
+    let items: Vec<_> = std::iter::from_fn(|| open_orders.try_next_routed()).collect();
+    assert!(matches!(items.as_slice(), [RoutedItem::Error(Error::ConnectionReset)]), "{items:?}");
+}
+
 type AccountUpdatesSubscription = Subscription<crate::accounts::AccountUpdate>;
 
 fn account(name: &str) -> crate::accounts::types::AccountId {
@@ -951,7 +1061,7 @@ fn account_updates_cancel() -> Vec<u8> {
 }
 
 async fn account_updates_slot(bus: &AsyncTcpMessageBus<MemoryStream>) -> Option<crate::accounts::types::AccountId> {
-    bus.shared_counts.lock().await.account_updates().cloned()
+    bus.shared_channels.account_updates().await
 }
 
 /// The same account again shares the one TWS stream: both requests go out,
@@ -964,7 +1074,7 @@ async fn test_account_updates_same_account_shares() {
     let first = account_updates_subscription(&bus, "DU1").await.unwrap();
     let second = account_updates_subscription(&bus, "DU1").await.unwrap();
     assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 2);
-    assert_eq!(bus.shared_counts.lock().await.live(OutgoingMessages::RequestAccountData), 2);
+    assert_eq!(bus.shared_channels.live(OutgoingMessages::RequestAccountData).await, 2);
 
     first.cancel().await;
     assert_eq!(
@@ -999,7 +1109,7 @@ async fn test_account_updates_other_account_refused() {
         0,
         "refused request was written"
     );
-    assert_eq!(bus.shared_counts.lock().await.live(OutgoingMessages::RequestAccountData), 1);
+    assert_eq!(bus.shared_channels.live(OutgoingMessages::RequestAccountData).await, 1);
 
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::AccountDownloadEnd as i32,
@@ -1336,30 +1446,12 @@ async fn test_notice_stream_late_subscriber_misses_prior() {
 // dispatches by `order_routing_strategy(message_type)`; each strategy has a
 // different fallback order (order_id → request_id, by execution_id, shared-only).
 
-/// Proto-framed ExecutionData fixture. `request_id` is at proto tag 1; the
-/// dispatcher's `order_id` / `execution_id` accessors read the nested
-/// `execution.{order_id, exec_id}` sub-message via `ExecutionDetailsMinimal`.
-fn execution_data_body(request_id: i32, order_id: i32, execution_id: &str) -> Vec<u8> {
-    binary_proto(
-        crate::messages::IncomingMessages::ExecutionData as i32,
-        &crate::proto::ExecutionDetails {
-            req_id: Some(request_id),
-            contract: None,
-            execution: Some(crate::proto::Execution {
-                order_id: Some(order_id),
-                exec_id: Some(execution_id.to_string()),
-                ..Default::default()
-            }),
-        },
-    )
-}
-
 #[tokio::test]
 async fn test_execution_data_routes_to_order_channel() {
     let (stream, bus) = make_bus();
     let mut sub = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
 
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-1"));
     bus.read_and_route_message().await.unwrap();
 
     let msg = next_message(&mut sub).await;
@@ -1372,7 +1464,7 @@ async fn test_execution_data_falls_back_to_request_channel() {
     let request_id = RequestId::nth(99);
     let mut sub = bus.send_request(request_id, vec![]).await.unwrap();
 
-    stream.push_inbound(execution_data_body(request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(request_id.raw(), 7, "exec-1"));
     bus.read_and_route_message().await.unwrap();
 
     let msg = next_message(&mut sub).await;
@@ -1384,7 +1476,7 @@ async fn test_execution_data_orphan_dropped() {
     let (stream, bus) = make_bus();
     let mut unrelated = bus.send_request(RequestId::nth(42), vec![]).await.unwrap();
 
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-1"));
     bus.read_and_route_message().await.unwrap();
 
     assert!(unrelated.try_next_routed().is_none(), "unrelated sub got an orphan message");
@@ -1447,7 +1539,7 @@ async fn test_commission_report_routes_via_execution_id_mapping() {
     let (stream, bus) = make_bus();
     let mut sub = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
 
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 7, "exec-abc"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-abc"));
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::CommissionsReport as i32,
         &crate::proto::CommissionAndFeesReport {
@@ -1489,23 +1581,20 @@ async fn test_execution_aliases_pruned_when_subscriptions_drop() {
     let (stream, bus) = make_bus();
     let order = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
     let executions = bus.send_request(RequestId::nth(99), vec![]).await.unwrap();
-    stream.push_inbound(execution_data_body(0, 7, "exec-order"));
-    stream.push_inbound(execution_data_body(RequestId::nth(99).raw(), 0, "exec-request"));
+    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 0, "exec-request"));
     bus.read_and_route_message().await.unwrap();
     bus.read_and_route_message().await.unwrap();
-    assert_eq!(bus.execution_channels.read().await.len(), 2, "both executions mapped");
+    assert_eq!(bus.executions.len(), 2, "both executions mapped");
 
     drop(order);
     drain_cleanup_signals(&bus).await;
-    {
-        let aliases = bus.execution_channels.read().await;
-        assert!(!aliases.contains_key("exec-order"), "order alias leaked");
-        assert!(aliases.contains_key("exec-request"), "live request alias pruned");
-    }
+    assert!(!bus.executions.contains(&"exec-order".to_string()), "order alias leaked");
+    assert!(bus.executions.contains(&"exec-request".to_string()), "live request alias pruned");
 
     drop(executions);
     drain_cleanup_signals(&bus).await;
-    assert!(bus.execution_channels.read().await.is_empty(), "request alias leaked");
+    assert!(bus.executions.is_empty(), "request alias leaked");
 }
 
 /// Each clone sends its own cleanup signal; the alias stays while any clone
@@ -1514,20 +1603,17 @@ async fn test_execution_aliases_pruned_when_subscriptions_drop() {
 async fn test_execution_alias_kept_while_a_clone_is_alive() {
     let (stream, bus) = make_bus();
     let order = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
-    stream.push_inbound(execution_data_body(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
     bus.read_and_route_message().await.unwrap();
 
     let clone = order.clone();
     drop(order);
     drain_cleanup_signals(&bus).await;
-    assert!(
-        bus.execution_channels.read().await.contains_key("exec-order"),
-        "alias pruned while a clone is alive"
-    );
+    assert!(bus.executions.contains(&"exec-order".to_string()), "alias pruned while a clone is alive");
 
     drop(clone);
     drain_cleanup_signals(&bus).await;
-    assert!(bus.execution_channels.read().await.is_empty(), "alias leaked");
+    assert!(bus.executions.is_empty(), "alias leaked");
 }
 
 /// A stale drop signal releases the old subscription's aliases and keeps those
@@ -1536,23 +1622,20 @@ async fn test_execution_alias_kept_while_a_clone_is_alive() {
 async fn test_stale_cleanup_keeps_newer_execution_aliases() {
     let (stream, bus) = make_bus();
     let sub_a = bus.send_order_request(OrderId::from(42), vec![]).await.unwrap();
-    stream.push_inbound(execution_data_body(0, 42, "exec-a"));
+    stream.push_inbound(execution_data_frame(0, 42, "exec-a"));
     bus.read_and_route_message().await.unwrap();
     let sub_b = bus.send_order_request(OrderId::from(42), vec![]).await.unwrap();
-    stream.push_inbound(execution_data_body(0, 42, "exec-b"));
+    stream.push_inbound(execution_data_frame(0, 42, "exec-b"));
     bus.read_and_route_message().await.unwrap();
 
     drop(sub_a);
     drain_cleanup_signals(&bus).await;
-    {
-        let aliases = bus.execution_channels.read().await;
-        assert!(!aliases.contains_key("exec-a"), "stale subscription's alias leaked");
-        assert!(aliases.contains_key("exec-b"), "newer subscription's alias pruned");
-    }
+    assert!(!bus.executions.contains(&"exec-a".to_string()), "stale subscription's alias leaked");
+    assert!(bus.executions.contains(&"exec-b".to_string()), "newer subscription's alias pruned");
 
     drop(sub_b);
     drain_cleanup_signals(&bus).await;
-    assert!(bus.execution_channels.read().await.is_empty());
+    assert!(bus.executions.is_empty());
 }
 
 #[tokio::test]
@@ -1735,7 +1818,7 @@ pub(super) async fn drain_cleanup_signals<S: AsyncStream>(bus: &Arc<AsyncTcpMess
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if !bus.request_channels.read().await.contains_key(&MARKER_REQUEST_ID) {
+        if !bus.requests.contains(&MARKER_REQUEST_ID) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1757,10 +1840,7 @@ async fn test_stale_order_cleanup_preserves_newer_subscription() {
 
     drain_cleanup_signals(&bus).await;
 
-    let sender = {
-        let channels = bus.order_channels.read().await;
-        channels.get(&order_id).expect("stale cleanup removed the newer subscription").clone()
-    };
+    let sender = bus.orders.sender(&order_id).expect("stale cleanup removed the newer subscription");
     sender
         .send(RoutedItem::Error(Error::Cancelled))
         .expect("registered channel has no receivers");
@@ -1771,7 +1851,7 @@ async fn test_stale_order_cleanup_preserves_newer_subscription() {
     // The replacement's own drop still cleans up.
     drop(sub_b);
     drain_cleanup_signals(&bus).await;
-    assert!(!bus.order_channels.read().await.contains_key(&order_id), "order channel leaked");
+    assert!(!bus.orders.contains(&order_id), "order channel leaked");
 }
 
 /// Dropping a clone must not unregister the channel while a sibling is still
@@ -1786,14 +1866,30 @@ async fn test_dropping_clone_keeps_order_channel_registered() {
     drop(clone);
 
     drain_cleanup_signals(&bus).await;
-    assert!(
-        bus.order_channels.read().await.contains_key(&order_id),
-        "clone drop unregistered a live subscription"
-    );
+    assert!(bus.orders.contains(&order_id), "clone drop unregistered a live subscription");
 
     drop(sub);
     drain_cleanup_signals(&bus).await;
-    assert!(!bus.order_channels.read().await.contains_key(&order_id), "order channel leaked");
+    assert!(!bus.orders.contains(&order_id), "order channel leaked");
+}
+
+/// The lease is released before the cleanup signal is sent, not by the field
+/// drops after it: otherwise a concurrently processed signal could find the
+/// registration still live and skip the removal, leaking it.
+#[tokio::test]
+async fn test_cleanup_signal_follows_lease_release() {
+    let (_, bus) = make_bus();
+    let request_id = RequestId::nth(5);
+    let mut sub = bus.send_request(request_id, vec![]).await.unwrap();
+    let is_live = || bus.requests.with_route(&request_id, |route| route.lease.is_live());
+    assert_eq!(is_live(), Some(true));
+
+    sub.send_cleanup_signal();
+    assert_eq!(is_live(), Some(false), "signal sent while the handle still held the lease");
+
+    drain_cleanup_signals(&bus).await;
+    assert!(!bus.requests.contains(&request_id), "request channel leaked");
+    drop(sub);
 }
 
 /// Regression test for #778: drop then immediately recreate the order update
@@ -1813,8 +1909,8 @@ async fn test_drop_then_recreate_order_update_stream() {
     // Process s1's stale OrderUpdateStream signal; s2's registration survives.
     drain_cleanup_signals(&bus).await;
     let sender = {
-        let stream = bus.order_update_stream.read().await;
-        stream.as_ref().expect("stale cleanup cleared the replacement stream").clone()
+        let stream = bus.order_update_stream.lock().unwrap();
+        stream.as_ref().expect("stale cleanup cleared the replacement stream").sender.clone()
     };
     sender
         .send(RoutedItem::Error(Error::Cancelled))
@@ -1825,7 +1921,7 @@ async fn test_drop_then_recreate_order_update_stream() {
 
     drop(s2);
     drain_cleanup_signals(&bus).await;
-    assert!(bus.order_update_stream.read().await.is_none(), "order update stream leaked");
+    assert!(bus.order_update_stream.lock().unwrap().is_none(), "order update stream leaked");
 }
 
 /// `reset_channels` after reconnect: every in-flight request and order
@@ -1851,9 +1947,9 @@ async fn test_reset_channels_notifies_in_flight_subscriptions() {
         assert!(matches!(item, RoutedItem::Error(Error::ConnectionReset)), "{name}: {item:?}");
     }
 
-    assert!(bus.request_channels.read().await.is_empty());
-    assert!(bus.order_channels.read().await.is_empty());
-    assert!(bus.execution_channels.read().await.is_empty());
+    assert!(bus.requests.is_empty());
+    assert!(bus.orders.is_empty());
+    assert!(bus.executions.is_empty());
 
     // A shared subscription created after the reset resubscribes at the
     // channel's current tail: it must not read the stale ConnectionReset.
@@ -1880,10 +1976,9 @@ async fn test_reconnect_publishes_reconnect_notice_to_notice_stream() {
     // the #891 short-body path end to end (it used to panic the dispatcher).
     // Then the frames the reconnect handshake consumes.
     stream.push_inbound(b"xx".to_vec());
-    let handshake = format!("{}\020240120 12:00:00 EST\0", server_versions::PROTOBUF_REST_MESSAGES_3);
-    stream.push_inbound(handshake.into_bytes());
-    stream.push_inbound(next_valid_id_frame(5000));
-    stream.push_inbound(managed_accounts_frame("DU1234567"));
+    for frame in handshake_frames(server_versions::PROTOBUF_REST_MESSAGES_3, "EST", 5000) {
+        stream.push_inbound(frame);
+    }
 
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).unwrap());
     let mut notices = bus.connection.notice_broadcaster.subscribe();
@@ -1932,10 +2027,9 @@ async fn test_reconnect_raises_order_ids_from_handshake() {
     // id), which the processing loop classifies as connection lost.
     stream.push_inbound(b"xx".to_vec());
     // Frames the reconnect handshake consumes, in order.
-    let handshake = format!("{}\020240120 12:00:00 EST\0", server_versions::PROTOBUF_REST_MESSAGES_3);
-    stream.push_inbound(handshake.into_bytes());
-    stream.push_inbound(next_valid_id_frame(5000));
-    stream.push_inbound(managed_accounts_frame("DU1234567"));
+    for frame in handshake_frames(server_versions::PROTOBUF_REST_MESSAGES_3, "EST", 5000) {
+        stream.push_inbound(frame);
+    }
 
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).unwrap());
     let order_ids = Arc::new(crate::client::id_generator::ClientIdManager::new(100).unwrap());
@@ -2015,11 +2109,8 @@ async fn test_sends_are_refused_while_disconnected() {
     ));
     assert!(matches!(mb.send_message(b"message-bytes".to_vec()).await, Err(Error::ConnectionReset)));
 
-    assert!(bus.request_channels.read().await.is_empty(), "a refused request must register nothing");
-    assert!(
-        bus.order_channels.read().await.is_empty(),
-        "a refused order request must register nothing"
-    );
+    assert!(bus.requests.is_empty(), "a refused request must register nothing");
+    assert!(bus.orders.is_empty(), "a refused order request must register nothing");
     assert!(stream.captured().is_empty(), "a refused send must not reach the socket");
 
     // The same send goes through once the handshake has put the session back.
@@ -2093,16 +2184,10 @@ async fn test_failed_write_leaves_no_registration() {
     let mb: &dyn AsyncMessageBus = bus.as_ref();
 
     assert!(mb.send_request(RequestId::nth(100), b"req-bytes".to_vec()).await.is_err());
-    assert!(
-        bus.request_channels.read().await.is_empty(),
-        "a failed write must leave no request registered"
-    );
+    assert!(bus.requests.is_empty(), "a failed write must leave no request registered");
 
     assert!(mb.send_order_request(OrderId::from(42), b"order-bytes".to_vec()).await.is_err());
-    assert!(
-        bus.order_channels.read().await.is_empty(),
-        "a failed write must leave no order registered"
-    );
+    assert!(bus.orders.is_empty(), "a failed write must leave no order registered");
 }
 
 #[tokio::test]
@@ -2279,8 +2364,8 @@ async fn test_bounded_request_end_marker_at_limit_still_ends() {
     assert!(try_next_routed(&mut sub).await.is_none(), "frames after the end marker are discarded");
 }
 
-/// Async shutdown closes the request channels without sending an error; the
-/// drain reports it as `Err(Shutdown)`, as the sync drain does.
+/// Shutdown fails the request with `Error::Shutdown`; the drain reports it, as
+/// the sync drain does.
 #[tokio::test]
 async fn test_drain_reports_shutdown() {
     use crate::contracts::ContractDetails;
@@ -2298,7 +2383,7 @@ async fn test_drain_reports_shutdown() {
 
     let drain = tokio::spawn(subscription.cancel_and_drain(tokio::time::Instant::now() + Duration::from_secs(5)));
     tokio::time::sleep(Duration::from_millis(20)).await;
-    bus.request_shutdown().await;
+    bus.request_shutdown();
 
     let outcome: Result<Drained, Error> = drain.await.unwrap();
     assert!(matches!(outcome, Err(Error::Shutdown)), "got {outcome:?}");

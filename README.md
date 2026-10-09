@@ -4,6 +4,23 @@
 [![Documentation](https://img.shields.io/badge/Documentation-green.svg)](https://docs.rs/ibapi/latest/ibapi/)
 [![Coverage Status](https://coveralls.io/repos/github/wboayue/rust-ibapi/badge.png?branch=main)](https://coveralls.io/github/wboayue/rust-ibapi?branch=main)
 
+## Local fork workflow
+
+This is the user's fork. `main` is our development/integration checkout;
+`main-upstream` mirrors the original project's default branch and contains no
+local patches. Read `G:\repos\info\README.md` for the shared branch/worktree rules.
+Numbered branches/worktrees are immutable checkpoints; build outputs and ignored
+local settings remain separate from their tracked source.
+
+The 2026-10-09 reconciliation incorporates upstream
+`3e73f2f1cfac151c10e403a3e7d779272134445f` (ibapi 5.0.0) while retaining
+our strict history snapshots, sender-only cancellation and physical TCP close.
+See [reconciliation evidence](docs/upstream-reconciliation-2026-10-09.md).
+Existing consumers still use frozen native 101 at
+`934aaab4acf6a535eb014216d43efc24f56cffa9` (4.2.0). Moving main does not migrate
+those clients; version-5 adoption needs a deliberate fresh checkpoint and
+consumer dependency update.
+
 ## Introduction
 
 This library provides a comprehensive Rust implementation of the Interactive Brokers [TWS API](https://ibkrcampus.com/campus/ibkr-api-page/twsapi-doc/), offering a robust and user-friendly interface for TWS and IB Gateway. Designed with performance and simplicity in mind, `ibapi` is a good fit for automated trading systems, market analysis, real-time data collection and portfolio management tools.
@@ -23,13 +40,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 # Async only (default features)
-ibapi = "4.0"
+ibapi = "5.0"
 
 # Blocking only
-ibapi = { version = "4.0", default-features = false, features = ["sync"] }
+ibapi = { version = "5.0", default-features = false, features = ["sync"] }
 
 # Async + blocking together
-ibapi = { version = "4.0", default-features = false, features = ["sync", "async"] }
+ibapi = { version = "5.0", default-features = false, features = ["sync", "async"] }
 ```
 
 ```bash

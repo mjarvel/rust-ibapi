@@ -3,13 +3,14 @@ use crate::client::blocking::Client;
 use crate::client::ids::RequestId;
 use crate::common::test_utils::helpers::{
     assert_decimal_parse_error, assert_proto_msg_id, assert_request, assert_request_msg_id, assert_tws_error_message, count_proto_msgs,
-    create_blocking_test_client_with_ordered_proto_responses, proto_error_response, proto_response, request_message_count, TEST_REQ_ID_FIRST,
+    create_blocking_test_client_with_ordered_proto_responses, proto_error_response, proto_response, request_message_count, test_notice,
+    TEST_REQ_ID_FIRST,
 };
 use crate::contracts::Contract;
 use crate::market_data::historical::BarTimestamp;
 use crate::market_data::historical::{TickBidAsk, TickLast, TickMidpoint, ToDuration};
 use crate::market_data::{IgnoreSize, TradingHours};
-use crate::messages::{IncomingMessages, Notice, OutgoingMessages};
+use crate::messages::{IncomingMessages, OutgoingMessages};
 use crate::protocol::{Features, ProtocolFeature};
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
@@ -20,23 +21,13 @@ use crate::testdata::builders::market_data::{
     historical_ticks_last_response, historical_ticks_request, historical_ticks_response,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
+use crate::transport::common::Lease;
 use crate::transport::{Signal, SubscriptionBuilder};
 use crossbeam::channel;
 use std::sync::Arc;
 use time::macros::{date, datetime};
 use time::OffsetDateTime;
 use time_tz::{self, PrimitiveDateTimeExt, Tz};
-
-// A request-scoped IB notice for tests (no error_time / advanced-reject payload).
-fn test_notice(code: i32, message: &str) -> Notice {
-    Notice {
-        request_id: None,
-        code,
-        message: message.into(),
-        error_time: None,
-        advanced_order_reject_json: String::new(),
-    }
-}
 
 // Build a `TickSubscription<T>` fed by `items`, with the inbound channel closed
 // after the last item. Returns the signal-channel receiver too; keep it bound
@@ -51,6 +42,7 @@ fn tick_sub_from_routed<T: TickDecoder<T>>(items: Vec<RoutedItem>) -> (TickSubsc
     let internal = SubscriptionBuilder::new()
         .receiver(receiver)
         .signaler(signaler)
+        .lease(Lease::new())
         .request_id(RequestId::nth(300))
         .build();
     let subscription = TickSubscription::new(internal, RequestId::nth(300).raw(), Arc::new(MessageBusStub::default()));

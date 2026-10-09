@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::ids::{OrderId, REQUEST_ID_FLOOR};
+use crate::client::ids::{OrderId, RequestId, REQUEST_ID_FLOOR};
 use crate::common::test_utils::helpers::{
     assert_request, assert_tws_error_message, create_test_client, create_test_client_with_ordered_proto_responses, decode_request_proto,
     proto_error_response, proto_response, request_message_count, TEST_REQ_ID_FIRST,
@@ -7,6 +7,7 @@ use crate::common::test_utils::helpers::{
 use crate::contracts::{Contract, SecurityIdType, SecurityType};
 use crate::contracts::{Currency, Exchange, OptionRight, Symbol};
 use crate::messages::IncomingMessages;
+use crate::orders::builder::{BracketPrices, TrailBy};
 use crate::orders::{OcaType, OrderStatusKind, TimeInForce};
 use crate::proto;
 use crate::stubs::MessageBusStub;
@@ -360,6 +361,11 @@ async fn test_executions() {
 
     let filter = ExecutionFilter::default();
     let mut subscription = client.executions(filter).await.expect("failed to get executions");
+    assert_eq!(
+        *message_bus.executions_requests.read().unwrap(),
+        vec![RequestId::nth(0)],
+        "executions opens an order-class channel"
+    );
 
     let exec_data = subscription.next().await;
     assert!(
@@ -440,7 +446,9 @@ async fn test_exercise_options() {
     };
 
     let mut subscription = client
-        .exercise_options(&contract, ExerciseAction::Exercise, 1, "", false, None)
+        .exercise_options(&contract)
+        .exercise(1)
+        .submit()
         .await
         .expect("failed to exercise options");
 
@@ -971,7 +979,7 @@ async fn build_order_does_not_reach_the_wire() {
     let order = client
         .order(&contract)
         .sell(100)
-        .trailing_stop(5.0, 95.0)
+        .trailing_stop(TrailBy::Percent(5.0), 95.0)
         .build_order()
         .expect("order should build");
 
@@ -1131,10 +1139,7 @@ async fn order_entry_points_reject_request_range_ids() {
 
     client.raise_next_order_id(OrderId::from(floor));
     rejected(
-        client
-            .exercise_options(&contract, ExerciseAction::Exercise, 1, "", false, None)
-            .await
-            .map(|_| ()),
+        client.exercise_options(&contract).exercise(1).submit().await.map(|_| ()),
         "exercise_options",
     );
 
@@ -1179,7 +1184,17 @@ async fn order_methods_accept_typed_order_ids() {
     assert_eq!(placed_id(2), Some(43), "place_order");
 
     assert_eq!(order_builder::market_f_hedge(ids.parent, Action::Sell).parent_id, 41);
-    let bracket = order_builder::bracket_order(ids.parent, Action::Buy, 100.0, 50.0, 55.0, 45.0);
+    let bracket = order_builder::bracket_order(
+        ids.parent,
+        Action::Buy,
+        100.0,
+        BracketPrices {
+            entry: 50.0,
+            take_profit: 55.0,
+            stop_loss: 45.0,
+        },
+    )
+    .unwrap();
     assert_eq!(bracket[1].parent_id, 41, "bracket_order");
 }
 

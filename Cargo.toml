@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "ibapi"
-version = "4.2.0"
+version = "5.0.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Wil Boayue <wil@wsblabs.com>"]
@@ -337,6 +337,11 @@ required-features = ["async"]
 [[example]]
 name = "async_option_chain"
 path = "examples/async/option_chain.rs"
+required-features = ["async"]
+
+[[example]]
+name = "async_options_exercise"
+path = "examples/async/options_exercise.rs"
 required-features = ["async"]
 
 [[example]]

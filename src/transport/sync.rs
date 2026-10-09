@@ -2,10 +2,10 @@
 //! It provides functionality for routing requests from the Client to TWS,
 //! and responses from TWS back to the Client.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map, HashMap, HashSet};
 use std::io::prelude::*;
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use crate::client::id_generator::ClientIdManager;
 use crate::client::ids::{OrderId, RequestId, WireId};
 use crate::connection::sync::Connection;
 
-use super::common::{log_orphan, report_unroutable_frame, validate_frame_length};
+use super::common::{log_orphan, report_unroutable_frame, validate_frame_length, Lease, LeaseRef};
 use super::raw_capture::RawFrameTap;
 use super::routing::{
     classify_error, determine_routing, order_routing_strategy, order_update_notice, DecodedError, ErrorDisposition, OrderRoutingStrategy,
@@ -82,6 +82,7 @@ struct SharedSubscriber {
     request: OutgoingMessages,
     responses: &'static [IncomingMessages],
     sender: Sender<RoutedItem>,
+    lease: LeaseRef,
 }
 
 impl SharedSubscriber {
@@ -121,30 +122,29 @@ impl SharedChannels {
         }
     }
 
-    fn subscribers(&self) -> std::sync::MutexGuard<'_, Vec<SharedSubscriber>> {
+    fn subscribers(&self) -> MutexGuard<'_, Vec<SharedSubscriber>> {
         self.subscribers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     // Registers `sender` for every response type of `request`. Panics if
     // `request` has no mapping.
-    fn add(&self, request: OutgoingMessages, sender: Sender<RoutedItem>) {
+    fn add(&self, request: OutgoingMessages, sender: Sender<RoutedItem>, lease: LeaseRef) {
         let responses = shared_channel_configuration::response_types(request)
             .unwrap_or_else(|| panic!("unsupported request message {request:?}. check mapping in messages::shared_channel_configuration"));
-        self.subscribers().push(SharedSubscriber { request, responses, sender });
+        self.subscribers().push(SharedSubscriber {
+            request,
+            responses,
+            sender,
+            lease,
+        });
     }
 
-    // Removes the subscription whose queue `sender` feeds, if still registered.
-    fn remove(&self, sender: &Sender<RoutedItem>) {
+    // Removes the subscription holding `lease`, if still registered.
+    fn remove(&self, lease: &LeaseRef) {
         let mut subscribers = self.subscribers();
         let before = subscribers.len();
-        subscribers.retain(|subscriber| !subscriber.sender.same_channel(sender));
+        subscribers.retain(|subscriber| !subscriber.lease.is(lease));
         debug!("cleanup shared subscription: removed={}", before != subscribers.len());
-    }
-
-    // Removes every registration. Every subscription has just been failed,
-    // and a failed handle's queue must not keep filling until it is dropped.
-    fn clear(&self) {
-        self.subscribers().clear();
     }
 
     fn is_shared_response(&self, message_type: IncomingMessages) -> bool {
@@ -221,12 +221,19 @@ impl SharedChannels {
         }
     }
 
-    // Deliver `message_fn()` once to every live subscription.
-    fn notify_all<F>(&self, message_fn: F)
+    // Deliver `message_fn()` once to every live subscription, then remove
+    // every registration under the same lock, so one made meanwhile can't be
+    // dropped unnotified. A failed handle's queue must not keep filling until
+    // it is dropped.
+    fn fail_all<F>(&self, message_fn: F)
     where
         F: Fn() -> RoutedItem,
     {
-        self.send_to(|_| true, message_fn);
+        let mut subscribers = self.subscribers();
+        for subscriber in subscribers.iter() {
+            let _ = subscriber.sender.send(message_fn());
+        }
+        subscribers.clear();
     }
 
     // Fail in-flight one-shot requests fast by delivering an error to the
@@ -242,9 +249,10 @@ impl SharedChannels {
     }
 }
 
-/// Fan-out for unrouted notices. Each subscriber gets its own crossbeam
-/// channel; `broadcast` lazily prunes subscribers whose receivers have
-/// been dropped (`Sender::send` returns `Err` once the receiver is gone).
+/// Fan-out for unrouted notices. Each subscriber gets its own unbounded
+/// crossbeam channel, watermarked like the subscription queues; `broadcast`
+/// lazily prunes subscribers whose receivers have been dropped
+/// (`Sender::send` returns `Err` once the receiver is gone).
 #[derive(Debug)]
 pub(crate) struct NoticeBroadcaster {
     /// `None` once closed.
@@ -276,7 +284,13 @@ impl NoticeBroadcaster {
 
     pub(crate) fn broadcast(&self, notice: Notice) {
         if let Some(senders) = self.senders.lock().unwrap().as_mut() {
-            senders.retain(|s| s.send(notice.clone()).is_ok());
+            senders.retain(|s| {
+                let sent = s.send(notice.clone()).is_ok();
+                if sent {
+                    warn_if_backlogged(format_args!("notice stream"), s.len());
+                }
+                sent
+            });
         }
     }
 
@@ -285,6 +299,12 @@ impl NoticeBroadcaster {
     pub(crate) fn close(&self) {
         *self.senders.lock().unwrap() = None;
     }
+}
+
+/// Lock the order-update slot, recovering from poisoning: the slot holds no
+/// invariant a panic could break.
+fn lock_slot(slot: &Mutex<Option<Entry<RoutedItem>>>) -> MutexGuard<'_, Option<Entry<RoutedItem>>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Debug)]
@@ -306,7 +326,7 @@ pub struct TcpMessageBus<S: Stream> {
     /// [`Self::set_order_ids`] before the dispatcher thread starts; absent in
     /// bus-only test fixtures, which never reconnect a client.
     order_ids: OnceLock<Arc<ClientIdManager>>,
-    order_update_stream: Mutex<Option<Sender<RoutedItem>>>,
+    order_update_stream: Mutex<Option<Entry<RoutedItem>>>,
     /// Session state, and what `wait_connected` blocks on.
     connection_state: ConnectionSignal,
 }
@@ -349,14 +369,11 @@ impl<S: Stream> TcpMessageBus<S> {
     fn request_shutdown(&self) {
         debug!("shutdown requested");
 
-        self.requests.notify_all(|| Error::Shutdown.into());
-        self.orders.notify_all(|| Error::Shutdown.into());
-        self.shared_channels.notify_all(|| Error::Shutdown.into());
-
-        self.requests.clear();
-        self.orders.clear();
+        self.requests.fail_all(|| Error::Shutdown.into());
+        self.orders.fail_all(|| Error::Shutdown.into());
+        self.shared_channels.fail_all(|| Error::Shutdown.into());
+        // Aliases of the routes just failed.
         self.executions.clear();
-        self.shared_channels.clear();
         self.connection.notice_broadcaster.close();
 
         // Both latch: the connection signal releases every `wait_connected`
@@ -368,8 +385,8 @@ impl<S: Stream> TcpMessageBus<S> {
         // After the flag: `create_order_update_subscription` checks it under
         // the same lock, so no stream can register once this slot is emptied.
         // The subscription holds a sender clone, so only a sent item ends it.
-        if let Some(sender) = self.order_update_stream.lock().unwrap().take() {
-            let _ = sender.send(Error::Shutdown.into());
+        if let Some(entry) = lock_slot(&self.order_update_stream).take() {
+            let _ = entry.sender.send(Error::Shutdown.into());
         }
 
         // bounded(1) + try_send: if a shutdown is already pending,
@@ -417,55 +434,48 @@ impl<S: Stream> TcpMessageBus<S> {
     fn reset(&self) {
         debug!("reset message bus");
 
-        self.requests.notify_all(|| Error::ConnectionReset.into());
-        self.orders.notify_all(|| Error::ConnectionReset.into());
-        self.shared_channels.notify_all(|| Error::ConnectionReset.into());
+        self.requests.fail_all(|| Error::ConnectionReset.into());
+        self.orders.fail_all(|| Error::ConnectionReset.into());
+        self.shared_channels.fail_all(|| Error::ConnectionReset.into());
         self.shared_channels.reset_counts();
-        self.requests.clear();
-        self.orders.clear();
+        // Aliases of the routes just failed.
         self.executions.clear();
-        self.shared_channels.clear();
     }
 
-    // The three cleanup handlers below remove a registration only when it is
-    // `same_channel` with the cancelled or dropped subscription's sender: a
-    // signal can be processed arbitrarily late, and unconditional removal
-    // would take out a newer registration under the same key (place then
-    // cancel on one order id, or an order update stream recreated after a
-    // reconnect reset).
+    // The three cleanup handlers below remove a registration only when it
+    // holds the cancelled or dropped subscription's lease: a signal can be
+    // processed arbitrarily late, and unconditional removal would take out a
+    // newer registration under the same key (place then cancel on one order
+    // id, or an order update stream recreated after a reconnect reset).
+    // Identity alone, not liveness: a sync subscription has one holder, and
+    // its lease is released before its signal is sent, at cancel or drop.
     //
     // `clean_request` and `clean_order` also drop the subscription's
-    // execution-id aliases, matched by channel rather than key, so a stale
+    // execution-id aliases, matched by lease rather than key, so a stale
     // signal still releases its own aliases and never a newer registration's.
     // Not gated on `removed`: a stale signal still owns aliases to release.
 
-    fn clean_request(&self, request_id: RequestId, sender: &Sender<RoutedItem>) {
-        let removed = self.requests.remove_if_same(&request_id, sender);
-        let aliases = self.executions.remove_all_same(sender);
+    fn clean_request(&self, request_id: RequestId, lease: &LeaseRef) {
+        let removed = self.requests.remove_if_same(request_id, lease);
+        let aliases = self.executions.remove_all_same(lease);
         debug!(
             "cleanup request_id {request_id}: removed={removed}, aliases={aliases}, requests.len()={}",
             self.requests.len()
         );
     }
 
-    fn clean_order(&self, order_id: OrderId, sender: &Sender<RoutedItem>) {
-        let removed = self.orders.remove_if_same(&order_id, sender);
-        let aliases = self.executions.remove_all_same(sender);
+    fn clean_order(&self, order_id: OrderId, lease: &LeaseRef) {
+        let removed = self.orders.remove_if_same(order_id, lease);
+        let aliases = self.executions.remove_all_same(lease);
         debug!(
             "cleanup order_id {order_id}: removed={removed}, aliases={aliases}, orders.len()={}",
             self.orders.len()
         );
     }
 
-    fn clear_order_update_stream(&self, sender: &Sender<RoutedItem>) {
-        let mut stream = if let Ok(stream) = self.order_update_stream.lock() {
-            stream
-        } else {
-            warn!("failed to lock order_update_stream");
-            return;
-        };
-
-        let removed = stream.as_ref().is_some_and(|registered| registered.same_channel(sender));
+    fn clear_order_update_stream(&self, lease: &LeaseRef) {
+        let mut stream = lock_slot(&self.order_update_stream);
+        let removed = stream.as_ref().is_some_and(|registered| registered.lease.is(lease));
         if removed {
             *stream = None;
         }
@@ -626,11 +636,11 @@ impl<S: Stream> TcpMessageBus<S> {
     fn process_response_with_id(&self, id: Option<WireId>, message: ResponseMessage, routed: bool) {
         match id {
             Some(WireId::Request(request_id)) if self.requests.contains(&request_id) => {
-                self.requests.send(&request_id, message.into()).unwrap();
+                let _ = self.requests.deliver(&request_id, message.into());
                 return;
             }
             Some(WireId::Order(order_id)) if self.orders.contains(&order_id) => {
-                self.orders.send(&order_id, message.into()).unwrap();
+                let _ = self.orders.deliver(&order_id, message.into());
                 return;
             }
             _ => {}
@@ -645,20 +655,21 @@ impl<S: Stream> TcpMessageBus<S> {
     /// Deliver a pre-classified Notice or Error to the request or order
     /// subscription its id names.
     fn deliver(&self, id: WireId, item: RoutedItem, sent_to_update_stream: bool) {
-        match id {
-            WireId::Request(request_id) if self.requests.contains(&request_id) => {
-                let _ = self.requests.send(&request_id, item);
+        let unrouted = match id {
+            WireId::Request(request_id) => self.requests.deliver(&request_id, item),
+            WireId::Order(order_id) => self.orders.deliver(&order_id, item),
+        };
+        if let Err(item) = unrouted {
+            if !sent_to_update_stream {
+                log_orphan(id, &item);
             }
-            WireId::Order(order_id) if self.orders.contains(&order_id) => {
-                let _ = self.orders.send(&order_id, item);
-            }
-            _ if sent_to_update_stream => {}
-            _ => log_orphan(id, &item),
         }
     }
 
     fn process_orders(&self, message: ResponseMessage) {
         let strategy = order_routing_strategy(message.message_type());
+        let message_order_id = message.order_id().map(OrderId::from);
+        let message_request_id = message.request_id().and_then(RequestId::from_raw);
 
         match strategy {
             OrderRoutingStrategy::OrderUpdateOnly => {
@@ -666,63 +677,28 @@ impl<S: Stream> TcpMessageBus<S> {
             }
             OrderRoutingStrategy::ExecutionData => {
                 let sent_to_update_stream = self.send_order_update(&message);
-
-                // Try order_id channel first, then request_id, storing execution_id mapping
-                if let Some(order_id) = message.order_id().map(OrderId::from) {
-                    if self.orders.contains(&order_id) {
-                        self.store_execution_mapping(&message, &self.orders, order_id);
-                        if let Err(e) = self.orders.send(&order_id, message.into()) {
-                            warn!("error routing message for order_id({order_id}): {e}");
-                        }
-                        return;
+                let execution_id = message.execution_id();
+                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), execution_id.as_ref()) {
+                    if !sent_to_update_stream {
+                        warn!("could not route message {item:?}");
                     }
-                }
-                if let Some(request_id) = message.request_id().and_then(RequestId::from_raw) {
-                    if self.requests.contains(&request_id) {
-                        self.store_execution_mapping(&message, &self.requests, request_id);
-                        if let Err(e) = self.requests.send(&request_id, message.into()) {
-                            warn!("error routing message for request_id({request_id}): {e}");
-                        }
-                        return;
-                    }
-                }
-                if !sent_to_update_stream {
-                    warn!("could not route message {message:?}");
                 }
             }
             OrderRoutingStrategy::ExecutionDataEnd => {
-                if let Some(order_id) = message.order_id().map(OrderId::from) {
-                    if self.orders.contains(&order_id) {
-                        if let Err(e) = self.orders.send(&order_id, message.into()) {
-                            warn!("error routing message for order_id({order_id}): {e}");
-                        }
-                        return;
-                    }
+                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), None) {
+                    warn!("could not route message {item:?}");
                 }
-                if let Some(request_id) = message.request_id().and_then(RequestId::from_raw) {
-                    if self.requests.contains(&request_id) {
-                        if let Err(e) = self.requests.send(&request_id, message.into()) {
-                            warn!("error routing message for request_id({request_id}): {e}");
-                        }
-                        return;
-                    }
-                }
-                warn!("could not route message {message:?}");
             }
             OrderRoutingStrategy::OrderOrShared => {
                 let sent_to_update_stream = self.send_order_update(&message);
 
-                if let Some(order_id) = message.order_id().map(OrderId::from) {
+                if let Some(order_id) = message_order_id {
                     if self.orders.contains(&order_id) {
-                        if let Err(e) = self.orders.send(&order_id, message.into()) {
-                            warn!("error routing message for order_id({order_id}): {e}");
-                        }
-                        return;
-                    }
-                    if self.shared_channels.is_shared_response(IncomingMessages::OpenOrder) {
+                        let _ = self.orders.deliver(&order_id, message.into());
+                    } else {
                         self.shared_channels.send_message(message.message_type(), &message);
-                        return;
                     }
+                    return;
                 }
                 if !sent_to_update_stream {
                     warn!("could not route message {message:?}");
@@ -731,12 +707,14 @@ impl<S: Stream> TcpMessageBus<S> {
             OrderRoutingStrategy::ByExecutionId => {
                 let sent_to_update_stream = self.send_order_update(&message);
 
-                if let Some(execution_id) = message.execution_id() {
-                    if let Err(e) = self.executions.send(&execution_id, message.into()) {
-                        warn!("error sending commission report for execution {execution_id}: {e}");
+                let unrouted = match message.execution_id() {
+                    Some(execution_id) => self.executions.deliver(&execution_id, message.into()),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
+                    if !sent_to_update_stream {
+                        warn!("could not route commission report {item:?}");
                     }
-                } else if !sent_to_update_stream {
-                    warn!("could not route commission report {message:?}");
                 }
             }
             OrderRoutingStrategy::SharedOnly => {
@@ -754,11 +732,12 @@ impl<S: Stream> TcpMessageBus<S> {
         self.ensure_connected()?;
 
         let (sender, receiver) = channel::unbounded();
-        let sender_copy = sender.clone();
+        let lease = Lease::new();
+        let lease_ref = lease.downgrade();
 
         match bound {
-            Some(bound) => self.requests.insert_bounded(request_id, sender, bound),
-            None => self.requests.insert(request_id, sender),
+            Some(bound) => self.requests.insert_bounded(request_id, sender.clone(), lease_ref.clone(), bound),
+            None => self.requests.insert(request_id, sender.clone(), lease_ref.clone()),
         };
 
         // The gate can close between `ensure_connected` and the write, so take
@@ -766,32 +745,39 @@ impl<S: Stream> TcpMessageBus<S> {
         // reset will clear. `remove_if_same` so a newer registration under the
         // same id survives.
         if let Err(e) = self.write_message(message) {
-            self.requests.remove_if_same(&request_id, &sender_copy);
+            self.requests.remove_if_same(request_id, &lease_ref);
             return Err(e);
         }
 
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
-            .sender(sender_copy)
+            .sender(sender)
             .signaler(self.signals_send.clone())
+            .lease(lease)
             .request_id(request_id)
             .build();
 
         Ok(subscription)
     }
 
-    /// Alias the execution id to `id`'s channel in `channels`. The insert runs
-    /// under `channels`' read lock, so a concurrent cleanup either removes the
-    /// registration first (no alias is stored) or prunes the alias after it.
-    fn store_execution_mapping<K: std::hash::Hash + Eq + std::fmt::Debug>(
+    /// Deliver to `order_id`'s route, else `request_id`'s, aliasing the route
+    /// under `execution_id` for the commission report that follows. Hands
+    /// the item back when neither is registered.
+    fn deliver_to_order_or_request(
         &self,
-        message: &ResponseMessage,
-        channels: &SenderHash<K, RoutedItem>,
-        id: K,
-    ) {
-        if let Some(execution_id) = message.execution_id() {
-            channels.with_sender(&id, |sender| self.executions.insert(execution_id, sender.clone()));
+        order_id: Option<OrderId>,
+        request_id: Option<RequestId>,
+        item: RoutedItem,
+        execution_id: Option<&String>,
+    ) -> Result<(), RoutedItem> {
+        match order_id {
+            Some(id) => self.orders.deliver_aliased(&id, item, execution_id, &self.executions),
+            None => Err(item),
         }
+        .or_else(|item| match request_id {
+            Some(id) => self.requests.deliver_aliased(&id, item, execution_id, &self.executions),
+            None => Err(item),
+        })
     }
 
     // Sends an order update message to the order update stream if it exists.
@@ -801,17 +787,16 @@ impl<S: Stream> TcpMessageBus<S> {
     }
 
     fn send_order_update_item(&self, item: RoutedItem) -> bool {
-        if let Ok(order_update_stream) = self.order_update_stream.lock() {
-            if let Some(sender) = order_update_stream.as_ref() {
-                if let Err(e) = sender.send(item) {
-                    warn!("error sending to order update stream: {e}");
-                    return false;
-                }
-                warn_if_backlogged(format_args!("order update stream"), sender.len());
-                return true;
-            }
+        let order_update_stream = lock_slot(&self.order_update_stream);
+        let Some(entry) = order_update_stream.as_ref() else {
+            return false;
+        };
+        if let Err(e) = entry.sender.send(item) {
+            warn!("error sending to order update stream: {e}");
+            return false;
         }
-        false
+        warn_if_backlogged(format_args!("order update stream"), entry.sender.len());
+        true
     }
 
     // The cleanup thread receives signals as subscribers are cancelled or
@@ -828,10 +813,10 @@ impl<S: Stream> TcpMessageBus<S> {
             loop {
                 crossbeam::select! {
                     recv(signal_recv) -> signal => match signal {
-                        Ok(Signal::Request(request_id, sender)) => message_bus.clean_request(request_id, &sender),
-                        Ok(Signal::Order(order_id, sender)) => message_bus.clean_order(order_id, &sender),
-                        Ok(Signal::OrderUpdateStream(sender)) => message_bus.clear_order_update_stream(&sender),
-                        Ok(Signal::Shared(sender)) => message_bus.shared_channels.remove(&sender),
+                        Ok(Signal::Request(request_id, lease)) => message_bus.clean_request(request_id, &lease),
+                        Ok(Signal::Order(order_id, lease)) => message_bus.clean_order(order_id, &lease),
+                        Ok(Signal::OrderUpdateStream(lease)) => message_bus.clear_order_update_stream(&lease),
+                        Ok(Signal::Shared(lease)) => message_bus.shared_channels.remove(&lease),
                         Err(_) => {
                             debug!("cleanup signal channel closed");
                             return;
@@ -880,21 +865,24 @@ impl<S: Stream> TcpMessageBus<S> {
         // arrive ahead of it. A failed write or a refused account takes the
         // registration with it.
         let (sender, receiver) = channel::unbounded();
-        self.shared_channels.add(message_type, sender.clone());
+        let lease = Lease::new();
+        let lease_ref = lease.downgrade();
+        self.shared_channels.add(message_type, sender.clone(), lease_ref.clone());
         let ticket = match self.shared_channels.subscribe(message_type, account, || self.write_message(message)) {
             Ok(ticket) => ticket,
             Err(e) => {
-                self.shared_channels.remove(&sender);
+                self.shared_channels.remove(&lease_ref);
                 return Err(e);
             }
         };
 
-        // The sender is the drop signal's identity: `Signal::Shared` removes
+        // The lease is the drop signal's identity: `Signal::Shared` removes
         // exactly this registration.
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender)
             .signaler(self.signals_send.clone())
+            .lease(lease)
             .shared(ticket)
             .build();
 
@@ -915,21 +903,23 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
         self.ensure_connected()?;
 
         let (sender, receiver) = channel::unbounded();
-        let sender_copy = sender.clone();
+        let lease = Lease::new();
+        let lease_ref = lease.downgrade();
 
-        self.orders.insert(order_id, sender);
+        self.orders.insert(order_id, sender.clone(), lease_ref.clone());
         debug!("Registered order subscription for order_id={}", order_id);
 
         // See `send_request`: a failed write takes its registration with it.
         if let Err(e) = self.write_message(message) {
-            self.orders.remove_if_same(&order_id, &sender_copy);
+            self.orders.remove_if_same(order_id, &lease_ref);
             return Err(e);
         }
 
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
-            .sender(sender_copy)
+            .sender(sender)
             .signaler(self.signals_send.clone())
+            .lease(lease)
             .order_id(order_id)
             .build();
 
@@ -942,7 +932,7 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     }
 
     fn create_order_update_subscription(&self) -> Result<InternalSubscription, Error> {
-        let mut order_update_stream = self.order_update_stream.lock().unwrap();
+        let mut order_update_stream = lock_slot(&self.order_update_stream);
 
         // Not `ensure_connected`: nothing is written, and the stream may be
         // created while a reconnect is in progress.
@@ -950,20 +940,27 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             return Err(Error::Shutdown);
         }
 
-        if order_update_stream.is_some() {
+        // A registration with a dead lease is a cancelled or dropped stream
+        // whose cleanup signal has not been processed yet; replace it rather
+        // than refusing, so cancel- or drop-then-recreate never races the
+        // cleanup thread. Its stale signal then finds another lease and leaves
+        // the replacement alone.
+        if order_update_stream.as_ref().is_some_and(|registered| registered.lease.is_live()) {
             return Err(Error::AlreadySubscribed);
         }
 
         let (sender, receiver) = channel::unbounded();
+        let lease = Lease::new();
 
-        *order_update_stream = Some(sender.clone());
+        *order_update_stream = Some(Entry::new(sender.clone(), lease.downgrade()));
 
-        // The sender gives the subscription's drop signal its identity — see
+        // The lease gives the subscription's drop signal its identity — see
         // `clear_order_update_stream`.
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender)
             .signaler(self.signals_send.clone())
+            .lease(lease)
             .build();
 
         Ok(subscription)
@@ -1003,13 +1000,47 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
 #[derive(Debug)]
 struct Entry<V> {
     sender: Sender<V>,
+    /// The subscription's lease: which subscription this is, and whether it lives.
+    lease: LeaseRef,
     /// The unread-item cap of a route opened with `send_request_bounded`.
     bound: Option<BoundState>,
 }
 
 impl<V> Entry<V> {
+    fn new(sender: Sender<V>, lease: LeaseRef) -> Self {
+        Self { sender, lease, bound: None }
+    }
+
     fn closed(&self) -> bool {
         self.bound.as_ref().is_some_and(BoundState::closed)
+    }
+
+    /// An unbounded registration sharing this one's channel and lease.
+    fn alias(&self) -> Self {
+        Self::new(self.sender.clone(), self.lease.clone())
+    }
+}
+
+impl Entry<RoutedItem> {
+    /// Send `item`, subject to a bounded route's cap ([`BoundState::admit`]).
+    /// Never blocks.
+    fn deliver(&self, id: &impl std::fmt::Debug, item: RoutedItem) {
+        let item = match &self.bound {
+            Some(bound) => match bound.admit(&item, self.sender.len()) {
+                Admit::Deliver => item,
+                Admit::Overflow => bound.overflow_error(),
+                Admit::Discard => {
+                    trace!("discarding item for closed route {id:?}");
+                    return;
+                }
+            },
+            None => item,
+        };
+        if let Err(err) = self.sender.send(item) {
+            warn!("error sending: {id:?}, {err}")
+        } else {
+            warn_if_backlogged(format_args!("subscription queue for {id:?}"), self.sender.len());
+        }
     }
 }
 
@@ -1025,113 +1056,142 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         }
     }
 
+    // A panic while holding the lock leaves the map consistent (every
+    // operation is a single map call), so recover rather than cascade the
+    // panic into every later route and teardown.
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Entry<V>>> {
+        self.senders.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Entry<V>>> {
+        self.senders.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     #[cfg(test)]
     pub fn copy_sender(&self, id: K) -> Option<Sender<V>> {
-        let senders = self.senders.read().unwrap();
-        senders.get(&id).map(|entry| entry.sender.clone())
+        self.with_entry(&id, |entry| entry.sender.clone())
     }
 
-    /// Run `f` on `id`'s sender while holding the read lock, so no removal can
+    #[cfg(test)]
+    pub fn lease(&self, id: K) -> Option<LeaseRef> {
+        self.with_entry(&id, |entry| entry.lease.clone())
+    }
+
+    /// Run `f` on `id`'s entry while holding the read lock, so no removal can
     /// land between the lookup and `f`.
-    pub fn with_sender<R>(&self, id: &K, f: impl FnOnce(&Sender<V>) -> R) -> Option<R> {
-        let senders = self.senders.read().unwrap();
-        senders.get(id).map(|entry| f(&entry.sender))
+    #[cfg(test)]
+    fn with_entry<R>(&self, id: &K, f: impl FnOnce(&Entry<V>) -> R) -> Option<R> {
+        let senders = self.read();
+        senders.get(id).map(f)
     }
 
-    pub fn insert(&self, id: K, sender: Sender<V>) -> Option<Sender<V>> {
-        let mut senders = self.senders.write().unwrap();
-        senders.insert(id, Entry { sender, bound: None }).map(|entry| entry.sender)
+    pub fn insert(&self, id: K, sender: Sender<V>, lease: LeaseRef) {
+        self.insert_entry(id, Entry::new(sender, lease));
     }
 
     /// Like [`insert`](Self::insert), with an unread-item cap: see [`BoundState::admit`].
-    pub fn insert_bounded(&self, id: K, sender: Sender<V>, bound: BufferBound) -> Option<Sender<V>> {
+    pub fn insert_bounded(&self, id: K, sender: Sender<V>, lease: LeaseRef, bound: BufferBound) {
         let entry = Entry {
-            sender,
             bound: Some(BoundState::new(bound)),
+            ..Entry::new(sender, lease)
         };
-        let mut senders = self.senders.write().unwrap();
-        senders.insert(id, entry).map(|entry| entry.sender)
+        self.insert_entry(id, entry);
     }
 
-    /// Remove the entry for `id` only if it is the same channel as `sender`.
-    /// Returns whether an entry was removed. Used by drop-signal cleanup so a
-    /// stale signal cannot remove a newer registration under the same key.
-    pub fn remove_if_same(&self, id: &K, sender: &Sender<V>) -> bool {
-        let mut senders = self.senders.write().unwrap();
-        if senders.get(id).is_some_and(|registered| registered.sender.same_channel(sender)) {
-            senders.remove(id);
-            true
-        } else {
-            false
+    fn insert_entry(&self, id: K, entry: Entry<V>) {
+        self.write().insert(id, entry);
+    }
+
+    /// Remove the entry for `id` only if it holds `lease`. Returns whether an
+    /// entry was removed. Used by signal cleanup so a stale signal cannot
+    /// remove a newer registration under the same key.
+    pub fn remove_if_same(&self, id: K, lease: &LeaseRef) -> bool {
+        match self.write().entry(id) {
+            hash_map::Entry::Occupied(registered) if registered.get().lease.is(lease) => {
+                registered.remove();
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Remove every entry on the same channel as `sender`. Returns how many
-    /// were removed.
-    pub fn remove_all_same(&self, sender: &Sender<V>) -> usize {
-        let mut senders = self.senders.write().unwrap();
+    /// Remove every entry holding `lease`. Returns how many were removed.
+    pub fn remove_all_same(&self, lease: &LeaseRef) -> usize {
+        let mut senders = self.write();
         let before = senders.len();
-        senders.retain(|_, registered| !registered.sender.same_channel(sender));
+        senders.retain(|_, registered| !registered.lease.is(lease));
         before - senders.len()
     }
 
     pub fn contains(&self, id: &K) -> bool {
-        let senders = self.senders.read().unwrap();
+        let senders = self.read();
         senders.contains_key(id)
     }
 
     pub fn len(&self) -> usize {
-        let senders = self.senders.read().unwrap();
+        let senders = self.read();
         senders.len()
     }
 
     pub fn clear(&self) {
-        let mut senders = self.senders.write().unwrap();
+        let mut senders = self.write();
         senders.clear();
     }
 }
 
 impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
-    /// Deliver `message` to `id`'s channel, subject to a bounded route's cap
-    /// ([`BoundState::admit`]). Never blocks.
-    pub fn send(&self, id: &K, message: RoutedItem) -> Result<(), Error> {
-        let senders = self.senders.read().unwrap();
-        debug!("senders: {senders:?}");
+    /// Deliver `item` to `id`'s route; hands it back when nothing is
+    /// registered under `id`.
+    pub fn deliver(&self, id: &K, item: RoutedItem) -> Result<(), RoutedItem> {
+        self.deliver_then(id, item, |_| {})
+    }
+
+    /// Deliver `item` to `id`'s route, then alias that route under `alias`
+    /// in `aliases` while still holding `id`'s read lock, so a concurrent
+    /// cleanup either removes the registration first (no alias is stored) or
+    /// prunes the alias after it. Lock order: `self` (read), then `aliases`
+    /// (write); nothing takes them the other way round. Hands the item back
+    /// when nothing is registered under `id`.
+    pub fn deliver_aliased<A: std::hash::Hash + Eq + Clone + std::fmt::Debug>(
+        &self,
+        id: &K,
+        item: RoutedItem,
+        alias: Option<&A>,
+        aliases: &SenderHash<A, RoutedItem>,
+    ) -> Result<(), RoutedItem> {
+        self.deliver_then(id, item, |entry| {
+            if let Some(alias) = alias {
+                aliases.insert_entry(alias.clone(), entry.alias());
+            }
+        })
+    }
+
+    /// Deliver `item` to `id`'s route and run `then` on it, both under the
+    /// read lock.
+    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl FnOnce(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
+        let senders = self.read();
         let Some(entry) = senders.get(id) else {
-            warn!("no recipient found for: {id:?}, {message:?}");
-            return Ok(());
+            return Err(item);
         };
-        let message = match &entry.bound {
-            Some(bound) => match bound.admit(&message, entry.sender.len()) {
-                Admit::Deliver => message,
-                Admit::Overflow => bound.overflow_error(),
-                Admit::Discard => {
-                    trace!("discarding item for closed route {id:?}");
-                    return Ok(());
-                }
-            },
-            None => message,
-        };
-        if let Err(err) = entry.sender.send(message) {
-            warn!("error sending: {id:?}, {err}")
-        } else {
-            warn_if_backlogged(format_args!("subscription queue for {id:?}"), entry.sender.len());
-        }
+        entry.deliver(id, item);
+        then(entry);
         Ok(())
     }
 
-    /// Send `message_fn()` to every route, skipping closed bounded ones: their
-    /// stream already ended.
-    pub fn notify_all<F>(&self, message_fn: F)
+    /// Send `message_fn()` to every route, skipping closed bounded ones (their
+    /// stream already ended), then clear them all under the same write lock,
+    /// so a route registered meanwhile can't be cleared unnotified.
+    pub fn fail_all<F>(&self, message_fn: F)
     where
         F: Fn() -> RoutedItem,
     {
-        let senders = self.senders.read().unwrap();
+        let mut senders = self.write();
         for entry in senders.values().filter(|entry| !entry.closed()) {
             if let Err(e) = entry.sender.send(message_fn()) {
                 warn!("error sending notification: {e}");
             }
         }
+        senders.clear();
     }
 }
 

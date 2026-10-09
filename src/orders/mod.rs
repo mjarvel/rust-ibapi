@@ -39,6 +39,7 @@ pub mod builder;
 
 /// Order condition types for conditional orders.
 pub mod conditions;
+mod exercise_options_builder;
 
 /// Convenience re-export for low-level order builder helpers.
 pub use common::order_builder;
@@ -46,8 +47,9 @@ pub use common::order_builder;
 // Builder types: `order_builder` and `types` are `pub(crate)` so `orders::*`
 // is the only public spelling.
 pub use crate::client::ids::OrderId;
-pub use builder::order_builder::{AttachedOrdersBuilder, BracketOrderBuilder, OrderBuilder};
+pub use builder::order_builder::{AttachedOrdersBuilder, BracketOrderBuilder, ClientBound, Detached, OrderBuilder};
 pub use builder::types::{AttachedOrderIds, BracketOrderIds};
+pub use exercise_options_builder::ExerciseOptionsBuilder;
 
 // Re-export condition types and builders
 pub use conditions::{
@@ -448,8 +450,9 @@ pub struct Order {
     /// Defines the minimum size to compete. For IBKRATS orders.
     pub min_compete_size: Option<i32>,
     /// Specifies the offset off the midpoint that will be applied to the order. For IBKRATS orders.
+    /// `f64::INFINITY` means compete up to the midpoint, using `mid_offset_at_whole` / `mid_offset_at_half`.
     pub compete_against_best_offset: Option<f64>,
-    /// his offset is applied when the spread is an even number of cents wide. This offset must be in whole-penny increments or zero. For IBKRATS orders.
+    /// This offset is applied when the spread is an even number of cents wide. This offset must be in whole-penny increments or zero. For IBKRATS orders.
     pub mid_offset_at_whole: Option<f64>,
     /// This offset is applied when the spread is an odd number of cents wide. This offset must be in half-penny increments. For IBKRATS orders.
     pub mid_offset_at_half: Option<f64>,
@@ -536,7 +539,7 @@ impl Default for Order {
             preset_profit_taker_order_id: None,
             block_order: false,
             sweep_to_fill: false,
-            display_size: Some(0), // TODO - default to None?
+            display_size: Some(0),
             trigger_method: conditions::TriggerMethod::Default,
             outside_rth: false,
             hidden: false,

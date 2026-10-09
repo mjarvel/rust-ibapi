@@ -6,7 +6,7 @@ use crate::common::test_utils::helpers::{
 };
 use crate::contracts::{ComboLeg, Contract, Currency, Exchange, LegAction, OptionRight, SecurityIdType, SecurityType, Symbol};
 use crate::messages::IncomingMessages;
-use crate::orders::{Action, ExecutionFilterSide, ExecutionSide, OcaType, OrderCondition, OrderStatusKind, TimeInForce};
+use crate::orders::{Action, ExecutionFilterSide, ExecutionSide, ExerciseOptions, OcaType, OrderCondition, OrderStatusKind, TimeInForce};
 use crate::proto;
 use crate::stubs::MessageBusStub;
 use crate::testdata::builders::orders::{
@@ -18,6 +18,7 @@ use crate::testdata::builders::{ResponseEncoder, ResponseProtoEncoder};
 
 use super::*;
 use crate::client::ids::{OrderId, REQUEST_ID_FLOOR};
+use crate::orders::builder::{BracketPrices, TrailBy};
 use crate::orders::common::order_builder;
 
 #[test]
@@ -500,7 +501,7 @@ fn encode_combo_market_order() {
             ..Contract::default()
         }
     };
-    let order = order_builder::combo_market_order(Action::Sell, 150.0, true);
+    let order = order_builder::non_guaranteed(order_builder::combo_market_order(Action::Sell, 150.0));
 
     let results = client.place_order(order_id, &contract, &order);
 
@@ -545,7 +546,9 @@ fn exercise_options() {
     };
 
     let subscription = client
-        .exercise_options(&contract, ExerciseAction::Exercise, 1, "", false, None)
+        .exercise_options(&contract)
+        .exercise(1)
+        .submit()
         .expect("failed to exercise options");
 
     let exercise_response = subscription.next_data();
@@ -1033,7 +1036,7 @@ fn build_order_does_not_reach_the_wire() {
     let order = client
         .order(&contract)
         .sell(100)
-        .trailing_stop(5.0, 95.0)
+        .trailing_stop(TrailBy::Percent(5.0), 95.0)
         .build_order()
         .expect("order should build");
 
@@ -1184,12 +1187,7 @@ fn order_entry_points_reject_request_range_ids() {
     rejected(client.cancel_order(floor, "").map(|_| ()), "cancel_order");
 
     client.raise_next_order_id(OrderId::from(floor));
-    rejected(
-        client
-            .exercise_options(&contract, ExerciseAction::Exercise, 1, "", false, None)
-            .map(|_| ()),
-        "exercise_options",
-    );
+    rejected(client.exercise_options(&contract).exercise(1).submit().map(|_| ()), "exercise_options");
 
     assert_eq!(request_message_count(&message_bus), 0, "nothing reaches the wire");
 }
@@ -1232,7 +1230,17 @@ fn order_methods_accept_typed_order_ids() {
     assert_eq!(placed_id(2), Some(43), "place_order");
 
     assert_eq!(order_builder::market_f_hedge(ids.parent, Action::Sell).parent_id, 41);
-    let bracket = order_builder::bracket_order(ids.parent, Action::Buy, 100.0, 50.0, 55.0, 45.0);
+    let bracket = order_builder::bracket_order(
+        ids.parent,
+        Action::Buy,
+        100.0,
+        BracketPrices {
+            entry: 50.0,
+            take_profit: 55.0,
+            stop_loss: 45.0,
+        },
+    )
+    .unwrap();
     assert_eq!(bracket[1].parent_id, 41, "bracket_order");
 }
 
