@@ -846,3 +846,9 @@ We welcome contributions of all kinds. Feel free to propose new ideas, share bug
 If you encounter a bug or require a missing feature, please review the [issues list](https://github.com/wboayue/rust-ibapi/issues) before submitting a new one.
 
 For questions or discussions about contributions, feel free to open an issue or reach out via our [GitHub discussions page](https://github.com/wboayue/rust-ibapi/discussions).
+
+Async physical shutdown (local correction, 2026-10-09): `Client::disconnect().await`
+closes both TCP halves and joins message processing even when client/subscription
+handles are retained. Shutdown also wakes blocked readers and writers; a closed
+stream cannot reconnect. Best-effort client drop completes the same close through
+the dispatcher. Explicit disconnect remains the confirmed cleanup boundary.

@@ -828,6 +828,8 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         }
 
         self.connection.notice_broadcaster.close();
+        // Task/channel shutdown alone leaves a retained bus's TCP socket open.
+        self.connection.socket.close().await;
     }
 
     /// Route error message using routing decision

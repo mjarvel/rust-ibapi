@@ -215,3 +215,12 @@ if client.is_connected() {
 3. **Rate Limiting**: TWS has rate limits. The library doesn't enforce these - applications must manage their request rates.
 
 4. **Error Recovery**: Connection errors trigger automatic reconnection. Application errors must be handled by the caller.
+
+## Async physical teardown
+
+Message-bus shutdown ends channels, wakes pending socket reads and writes, and
+explicitly takes/drops both owned TCP halves. Retaining an async client, bus or
+subscription after shutdown therefore cannot retain the physical API connection.
+The stream close is idempotent and terminal; reconnect cannot revive it. Explicit
+`disconnect().await` also joins the dispatcher. Runtime-free client drop signals
+the dispatcher, whose terminal cleanup performs the same physical close.

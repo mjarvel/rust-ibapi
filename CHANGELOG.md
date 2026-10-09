@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Async disconnect now explicitly closes both TCP halves even while clients or
+  subscriptions are retained. Shutdown wakes pending socket I/O and permanently
+  prevents that stream from reconnecting; dispatcher exit performs the same
+  physical cleanup for client drop.
+
 ### Added
 
 - Historical `snapshot_once` (sync/async) yields finite envelopes with request
