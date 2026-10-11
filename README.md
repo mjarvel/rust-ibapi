@@ -12,14 +12,21 @@ local patches. Read `G:\repos\info\README.md` for the shared branch/worktree rul
 Numbered branches/worktrees are immutable checkpoints; build outputs and ignored
 local settings remain separate from their tracked source.
 
-The 2026-10-09 reconciliation incorporates upstream
-`3e73f2f1cfac151c10e403a3e7d779272134445f` (ibapi 5.0.0) while retaining
-our strict history snapshots, sender-only cancellation and physical TCP close.
-See [reconciliation evidence](docs/upstream-reconciliation-2026-10-09.md).
-Existing consumers still use frozen native 101 at
-`934aaab4acf6a535eb014216d43efc24f56cffa9` (4.2.0). Moving main does not migrate
-those clients; version-5 adoption needs a deliberate fresh checkpoint and
-consumer dependency update.
+The 2026-10-12 reconciliation incorporates upstream
+`73fbbc2c350a299d032988b107ae399094a1f3f2` (ibapi 5.0.0), including merged
+PRs #966/#967 and the maintainer's transport follow-ups. Upstream now supplies
+physical closure and ordinary historical completion checks. Our fork retains
+sender-only cancellation and strict, notice-preserving single-attempt history.
+See [reconciliation and validation](docs/upstream-reconciliation-2026-10-12.md).
+
+Native checkpoint `102` is frozen from the validated integration at
+`G:\repos\rust-ibapi-worktree-102`; its final hash and adoption are recorded in
+`G:\repos\rust-library1\docs\rust-ibapi-changelog.md`. The library main adoption
+is deliberate; earlier consumers/checkpoints retain native 100/101. Windows
+validation still has five async backpressure fixture failures and one blocking
+read-wakeup timing failure, also reproduced on pristine upstream. Numbered draft
+003/004 records in that library repository consolidate the evidence for a later
+fix/PR decision. No broker acceptance is implied by offline validation.
 
 ## Introduction
 
@@ -312,7 +319,7 @@ Explore the [Subscription documentation](https://docs.rs/ibapi/latest/ibapi/subs
 
 #### One-Shot Snapshot
 
-For a single snapshot rather than a streaming subscription, `snapshot_once(timeout)` requests snapshot mode, collects the ticks until the snapshot completes (or the timeout elapses), and returns them as a `Vec<TickTypes>` — no hand-written collect loop. The same `collect_for` / `collect_until` terminals are available on any `Subscription<T>`.
+For a single snapshot rather than a streaming subscription, `snapshot_once(timeout)` requests snapshot mode, collects the ticks until the snapshot completes (or the timeout elapses), and returns them as a `Vec<TickTypes>` — no hand-written collect loop. The same `collect_for` / `collect_until` terminals are available on any `Subscription<T>`. For requests that end, such as contract details, `collect_to_end_within(timeout)` collects the whole result or fails with `Error::Timeout`; `collect_for` returns whatever arrived in time instead.
 
 ```rust
 use ibapi::client::blocking::Client;
@@ -863,9 +870,3 @@ We welcome contributions of all kinds. Feel free to propose new ideas, share bug
 If you encounter a bug or require a missing feature, please review the [issues list](https://github.com/wboayue/rust-ibapi/issues) before submitting a new one.
 
 For questions or discussions about contributions, feel free to open an issue or reach out via our [GitHub discussions page](https://github.com/wboayue/rust-ibapi/discussions).
-
-Async physical shutdown (local correction, 2026-10-09): `Client::disconnect().await`
-closes both TCP halves and joins message processing even when client/subscription
-handles are retained. Shutdown also wakes blocked readers and writers; a closed
-stream cannot reconnect. Best-effort client drop completes the same close through
-the dispatcher. Explicit disconnect remains the confirmed cleanup boundary.

@@ -1,7 +1,10 @@
+use super::{AccountSummarySnapshot, AccountSummarySnapshots, SnapshotBuilder, Subscription};
 use crate::accounts::types::{AccountGroup, AccountId, ContractId, ModelCode};
 use crate::accounts::{AccountSummaryTags, AccountUpdateMulti};
+use crate::client::ids::RequestId;
 use crate::common::test_utils::helpers::*;
 use crate::messages::IncomingMessages;
+use crate::subscriptions::common::{DecoderContext, RoutedItem};
 use crate::testdata::builders::accounts::{
     account_download_end, account_summary, account_summary_end, account_update_multi, account_update_multi_end, account_value,
     cancel_account_summary, cancel_account_updates, cancel_account_updates_multi, cancel_pnl, cancel_pnl_single, current_time,
@@ -14,8 +17,11 @@ use crate::testdata::builders::positions::{
     cancel_positions, cancel_positions_multi, position, position_end, position_multi, position_multi_end, request_positions, request_positions_multi,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
+use crate::transport::common::Lease;
+use crate::transport::SubscriptionBuilder;
 use crate::{client::blocking::Client, server_versions, stubs::MessageBusStub, Error};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn test_pnl() {
@@ -394,39 +400,6 @@ fn test_account_updates_multi() {
 // Additional comprehensive tests for sync module
 
 #[test]
-fn test_server_version_errors() {
-    use super::common::test_tables::VERSION_TEST_CASES;
-
-    let account = AccountId(TEST_ACCOUNT.to_string());
-    let group = AccountGroup("All".to_string());
-
-    for test_case in VERSION_TEST_CASES {
-        let (client, _) = create_blocking_test_client_with_version(test_case.required_version - 1);
-
-        let result = match test_case.function_name {
-            "PnL" => client.pnl(&account, None).map(|_| ()),
-            "PnL Single" => client.pnl_single(&account, ContractId(1001), None).map(|_| ()),
-            "Account Summary" => client.account_summary(&group, &[AccountSummaryTags::ACCOUNT_TYPE]).map(|_| ()),
-            "Positions Multi" => client.positions_multi(Some(&account), None).map(|_| ()),
-            "Account Updates Multi" => client.account_updates_multi(Some(&account), None).map(|_| ()),
-            "Family Codes" => client.family_codes().map(|_| ()),
-            "Positions" => client.positions().map(|_| ()),
-            _ => panic!("Unknown function: {}", test_case.function_name),
-        };
-
-        assert!(result.is_err(), "Expected version error for {}", test_case.function_name);
-        if let Err(error) = result {
-            assert!(
-                matches!(error, Error::ServerVersion(_, _, _)),
-                "Expected ServerVersion error for {}, got: {:?}",
-                test_case.function_name,
-                error
-            );
-        }
-    }
-}
-
-#[test]
 fn test_account_summary_comprehensive() {
     use super::common::test_tables::account_summary_tag_test_cases;
     use crate::accounts::AccountSummaryResult;
@@ -682,25 +655,6 @@ fn test_account_updates_stream_handling() {
 }
 
 #[test]
-fn test_error_propagation() {
-    // Test that encoding errors are properly propagated
-    let (_client, _) = create_blocking_test_client();
-
-    // These tests verify that version checks catch incompatible requests
-    // The actual encoding shouldn't fail in normal circumstances since
-    // we're using well-formed domain types, but version checks will prevent
-    // sending requests to incompatible servers
-
-    let account = AccountId(TEST_ACCOUNT.to_string());
-    let old_version_client = create_blocking_test_client_with_version(50).0; // Very old version
-
-    // All modern features should fail on old servers
-    assert!(old_version_client.pnl(&account, None).is_err());
-    assert!(old_version_client.positions().is_err());
-    assert!(old_version_client.account_summary(&AccountGroup("All".to_string()), &[]).is_err());
-}
-
-#[test]
 fn test_server_time_millis() {
     use time::macros::datetime;
 
@@ -714,18 +668,6 @@ fn test_server_time_millis() {
     assert_eq!(result, datetime!(2023-03-15 14:20:00.123 UTC));
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(&message_bus, 0, &request_current_time_in_millis());
-}
-
-#[test]
-fn test_server_time_millis_version_error() {
-    let (client, message_bus) = create_blocking_test_client_with_version(server_versions::CURRENT_TIME_IN_MILLIS - 1);
-
-    let result = client.server_time_millis();
-    assert!(
-        matches!(result, Err(Error::ServerVersion(_, _, _))),
-        "expected ServerVersion error, got {result:?}"
-    );
-    assert_eq!(request_message_count(&message_bus), 0);
 }
 
 #[test]
@@ -762,14 +704,6 @@ fn test_soft_dollar_tiers() {
 }
 
 #[test]
-fn test_soft_dollar_tiers_version_error() {
-    let (client, message_bus) = create_blocking_test_client_with_version(server_versions::SOFT_DOLLAR_TIER - 1);
-    let result = client.soft_dollar_tiers();
-    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
-    assert_eq!(request_message_count(&message_bus), 0);
-}
-
-#[test]
 fn test_user_info() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::UserInfo,
@@ -781,14 +715,6 @@ fn test_user_info() {
     assert_eq!(info.white_branding_id, "brand-xyz");
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(&message_bus, 0, &user_info_request().request_id(TEST_REQ_ID_FIRST));
-}
-
-#[test]
-fn test_user_info_version_error() {
-    let (client, message_bus) = create_blocking_test_client_with_version(server_versions::USER_INFO - 1);
-    let result = client.user_info();
-    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
-    assert_eq!(request_message_count(&message_bus), 0);
 }
 
 #[test]
@@ -830,16 +756,6 @@ fn test_replace_fa() {
 }
 
 #[test]
-fn test_replace_fa_version_error() {
-    use crate::accounts::FaDataType;
-
-    let (client, message_bus) = create_blocking_test_client_with_version(server_versions::REPLACE_FA_END - 1);
-    let result = client.replace_fa(FaDataType::Groups, "<x/>");
-    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
-    assert_eq!(request_message_count(&message_bus), 0);
-}
-
-#[test]
 fn test_set_server_log_level() {
     use crate::accounts::ServerLogLevel;
 
@@ -863,14 +779,6 @@ fn test_verify_request() {
 }
 
 #[test]
-fn test_verify_request_version_error() {
-    let (client, message_bus) = create_blocking_test_client_with_version(server_versions::LINKING - 1);
-    let result = client.verify_request("MyApp", "1.0");
-    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
-    assert_eq!(request_message_count(&message_bus), 0);
-}
-
-#[test]
 fn test_verify_message() {
     let (client, message_bus) = create_blocking_test_client_with_ordered_proto_responses(vec![proto_response(
         IncomingMessages::VerifyCompleted,
@@ -884,10 +792,154 @@ fn test_verify_message() {
     assert_request(&message_bus, 0, &verify_message_request().api_data("signed"));
 }
 
+fn summary_frame(tag: &str, value: &str, currency: &str) -> RoutedItem {
+    RoutedItem::Response(proto_response(
+        IncomingMessages::AccountSummary,
+        account_summary().tag(tag).value(value).currency(currency).encode_proto(),
+    ))
+}
+
+fn end_frame() -> RoutedItem {
+    RoutedItem::Response(proto_response(IncomingMessages::AccountSummaryEnd, account_summary_end().encode_proto()))
+}
+
+fn snapshots_over_channel(quiet: Duration) -> (AccountSummarySnapshots, crossbeam::channel::Sender<RoutedItem>) {
+    let (sender, receiver) = crossbeam::channel::unbounded::<RoutedItem>();
+    let (signaler, _signaler_rx) = crossbeam::channel::unbounded();
+    let internal = SubscriptionBuilder::new()
+        .receiver(receiver)
+        .signaler(signaler)
+        .lease(Lease::new())
+        .request_id(RequestId::nth(1))
+        .build();
+    let subscription = Subscription::new(Arc::new(MessageBusStub::default()), internal, DecoderContext::default());
+
+    let snapshots = AccountSummarySnapshots {
+        subscription,
+        builder: SnapshotBuilder::default(),
+        quiet,
+    };
+
+    (snapshots, sender)
+}
+
+fn values(snapshot: &AccountSummarySnapshot) -> Vec<(&str, &str, &str)> {
+    snapshot
+        .iter()
+        .map(|row| (row.tag.as_str(), row.currency.as_str(), row.value.as_str()))
+        .collect()
+}
+
 #[test]
-fn test_verify_message_version_error() {
-    let (client, message_bus) = create_blocking_test_client_with_version(server_versions::LINKING - 1);
-    let result = client.verify_message("data");
-    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
-    assert_eq!(request_message_count(&message_bus), 0);
+fn test_account_summary_snapshots_emit_at_end_then_after_quiet_period() {
+    let (mut snapshots, tx) = snapshots_over_channel(Duration::from_millis(50));
+
+    tx.send(summary_frame("NetLiquidation", "100.0", "USD")).unwrap();
+    tx.send(summary_frame("BuyingPower", "400.0", "USD")).unwrap();
+    tx.send(end_frame()).unwrap();
+    let initial = snapshots.next().unwrap().unwrap();
+
+    tx.send(summary_frame("NetLiquidation", "101.5", "USD")).unwrap();
+    let refreshed = snapshots.next().unwrap().unwrap();
+
+    assert_eq!(
+        values(&initial),
+        vec![("BuyingPower", "USD", "400.0"), ("NetLiquidation", "USD", "100.0")]
+    );
+    assert_eq!(
+        values(&refreshed),
+        vec![("BuyingPower", "USD", "400.0"), ("NetLiquidation", "USD", "101.5")]
+    );
+}
+
+#[test]
+fn test_account_summary_snapshots_end_when_subscription_closes() {
+    let (mut snapshots, tx) = snapshots_over_channel(Duration::from_millis(50));
+
+    tx.send(summary_frame("NetLiquidation", "100.0", "USD")).unwrap();
+    drop(tx);
+    let last = snapshots.next().unwrap().unwrap();
+    let after = snapshots.next();
+
+    assert_eq!(values(&last), vec![("NetLiquidation", "USD", "100.0")]);
+    assert!(after.is_none());
+}
+
+#[test]
+fn test_account_summary_snapshots_wait_for_end_on_slow_initial_rows_and_skip_end_without_changes() {
+    let (mut snapshots, tx) = snapshots_over_channel(Duration::from_millis(50));
+
+    tx.send(summary_frame("NetLiquidation", "100.0", "USD")).unwrap();
+    let sender = {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            tx.send(summary_frame("BuyingPower", "400.0", "USD")).unwrap();
+            tx.send(end_frame()).unwrap();
+        })
+    };
+    let first = snapshots.next().unwrap().unwrap();
+    sender.join().unwrap();
+
+    tx.send(end_frame()).unwrap();
+    tx.send(summary_frame("NetLiquidation", "101.0", "USD")).unwrap();
+    let second = snapshots.next().unwrap().unwrap();
+
+    assert_eq!(values(&first), vec![("BuyingPower", "USD", "400.0"), ("NetLiquidation", "USD", "100.0")]);
+    assert_eq!(values(&second), vec![("BuyingPower", "USD", "400.0"), ("NetLiquidation", "USD", "101.0")]);
+}
+
+#[test]
+fn test_client_account_summary_snapshots_sends_request_and_yields_snapshot_at_end() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::AccountSummary,
+            account_summary().tag("NetLiquidation").value("100.0").currency("USD").encode_proto(),
+        ),
+        proto_response(IncomingMessages::AccountSummaryEnd, account_summary_end().encode_proto()),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+    let group = AccountGroup("All".to_string());
+    let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+
+    let mut snapshots = client
+        .account_summary_snapshots(&group, tags, Duration::from_secs(1))
+        .expect("request account_summary_snapshots failed");
+    let snapshot = snapshots.next().unwrap().unwrap();
+    drop(snapshots);
+
+    assert_eq!(values(&snapshot), vec![("NetLiquidation", "USD", "100.0")]);
+    assert_eq!(request_message_count(&message_bus), 2);
+    assert_request(
+        &message_bus,
+        0,
+        &request_account_summary()
+            .request_id(TEST_REQ_ID_FIRST)
+            .group("All")
+            .tags([AccountSummaryTags::NET_LIQUIDATION]),
+    );
+    assert_request(&message_bus, 1, &cancel_account_summary().request_id(TEST_REQ_ID_FIRST));
+}
+
+#[test]
+fn test_account_summary_snapshots_cancel_sends_cancel_and_ends() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::AccountSummary,
+            account_summary().tag("NetLiquidation").value("100.0").currency("USD").encode_proto(),
+        ),
+        proto_response(IncomingMessages::AccountSummaryEnd, account_summary_end().encode_proto()),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+    let group = AccountGroup("All".to_string());
+
+    let mut snapshots = client
+        .account_summary_snapshots(&group, &[AccountSummaryTags::NET_LIQUIDATION], Duration::from_secs(1))
+        .expect("request account_summary_snapshots failed");
+    snapshots.next().unwrap().unwrap();
+    snapshots.cancel();
+
+    assert!(snapshots.all(|item| item.is_err()), "no snapshot after cancel");
+    assert_eq!(request_message_count(&message_bus), 2);
+    assert_request(&message_bus, 1, &cancel_account_summary().request_id(TEST_REQ_ID_FIRST));
 }

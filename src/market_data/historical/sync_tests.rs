@@ -253,7 +253,7 @@ fn test_historical_data() {
             .end_date(Some(end_date))
             .duration(duration)
             .bar_size(bar_size)
-            .what_to_show(Some(what_to_show))
+            .what_to_show(what_to_show)
             .use_rth(trading_hours.use_rth()),
     );
 }
@@ -316,7 +316,7 @@ fn test_historical_schedules() {
             .end_date(Some(end_date))
             .duration(duration)
             .bar_size(BarSize::Day)
-            .what_to_show(Some(WhatToShow::Schedule))
+            .what_to_show(WhatToShow::Schedule)
             .use_rth(true),
     );
 }
@@ -426,33 +426,6 @@ fn test_historical_ticks_trade() {
             .what_to_show(WhatToShow::Trades)
             .use_rth(trading_hours.use_rth()),
     );
-}
-
-#[test]
-fn test_historical_data_version_check() {
-    // Test with a server version that doesn't support trading class
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
-
-    // Use an older server version
-    let client = Client::stubbed(message_bus, server_versions::TRADING_CLASS - 1);
-
-    // Create a contract with trading_class set
-    let mut contract = Contract::stock("MSFT").build();
-    contract.trading_class = "CLASS".to_string();
-
-    let end_date = datetime!(2023-04-15 16:31:22 UTC);
-    let duration = 2.days();
-    let bar_size = BarSize::Hour;
-    let trading_hours = TradingHours::Regular;
-
-    // This should return an error due to server version
-    let result = client
-        .historical_data(&contract, bar_size)
-        .duration(duration)
-        .ending(end_date)
-        .trading_hours(trading_hours)
-        .fetch();
-    assert!(result.is_err(), "Expected error due to server version incompatibility");
 }
 
 #[test]
@@ -893,7 +866,7 @@ fn test_historical_data_streaming_with_updates() {
             .contract(&contract)
             .duration(Duration::days(1))
             .bar_size(BarSize::Hour)
-            .what_to_show(Some(WhatToShow::Trades))
+            .what_to_show(WhatToShow::Trades)
             .use_rth(true)
             .keep_up_to_date(true),
     );
@@ -1047,13 +1020,6 @@ fn test_streaming_subscription_cancel_prevents_duplicate_on_drop() {
 }
 
 #[test]
-fn test_head_timestamp_version_check() {
-    assert_version_check_fails(Features::HEAD_TIMESTAMP, |c| {
-        c.head_timestamp(&Contract::stock("MSFT").build(), WhatToShow::Trades, TradingHours::Regular)
-    });
-}
-
-#[test]
 fn test_head_timestamp_unexpected_response() {
     // 17 = HistoricalData — wrong type for head_timestamp (expects 88).
     assert_unexpected_response(server_versions::SIZE_RULES, "17|9000|20230315  09:30:00|20230315  10:30:00|0|", |c| {
@@ -1202,27 +1168,9 @@ fn test_historical_schedules_ending_now() {
             .contract(&contract)
             .duration(duration)
             .bar_size(BarSize::Day)
-            .what_to_show(Some(WhatToShow::Schedule))
+            .what_to_show(WhatToShow::Schedule)
             .use_rth(true),
     );
-}
-
-#[test]
-fn test_historical_schedule_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_SCHEDULE, |c| {
-        c.historical_schedules(&Contract::stock("MSFT").build(), Duration::days(1)).fetch()
-    });
-}
-
-#[test]
-fn test_historical_schedule_trading_class_version_check() {
-    // contract.trading_class triggers the earlier TRADING_CLASS gate ahead of the
-    // HISTORICAL_SCHEDULE gate — pin below TRADING_CLASS so the former fires first.
-    let mut contract = Contract::stock("MSFT").build();
-    contract.trading_class = "ES".to_owned();
-    assert_version_check_fails(Features::TRADING_CLASS, move |c| {
-        c.historical_schedules(&contract, Duration::days(1)).fetch()
-    });
 }
 
 #[test]
@@ -1262,13 +1210,6 @@ fn test_cancel_historical_ticks_version_check() {
 }
 
 #[test]
-fn test_histogram_data_version_check() {
-    assert_version_check_fails(Features::HISTOGRAM, |c| {
-        c.histogram_data(&Contract::stock("MSFT").build(), TradingHours::Regular, BarSize::Day)
-    });
-}
-
-#[test]
 fn test_histogram_data_empty_response_returns_empty_vec() {
     // None on the first subscription.next() → returns an empty Vec.
     let message_bus = Arc::new(MessageBusStub::default());
@@ -1279,36 +1220,6 @@ fn test_histogram_data_empty_response_returns_empty_vec() {
         .expect("histogram_data should succeed with empty result");
 
     assert!(histogram.is_empty(), "expected empty histogram, got {histogram:?}");
-}
-
-#[test]
-fn test_historical_data_streaming_trading_class_version_check() {
-    let mut contract = Contract::stock("MSFT").build();
-    contract.trading_class = "ES".to_owned();
-    assert_version_check_fails(Features::TRADING_CLASS, move |c| {
-        c.historical_data(&contract, BarSize::Hour).duration(Duration::days(1)).stream()
-    });
-}
-
-#[test]
-fn test_historical_ticks_bid_ask_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_TICKS, |c| {
-        c.historical_ticks(&Contract::stock("MSFT").build(), 1).bid_ask(IgnoreSize::No)
-    });
-}
-
-#[test]
-fn test_historical_ticks_mid_point_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_TICKS, |c| {
-        c.historical_ticks(&Contract::stock("MSFT").build(), 1).mid_point()
-    });
-}
-
-#[test]
-fn test_historical_ticks_trade_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_TICKS, |c| {
-        c.historical_ticks(&Contract::stock("MSFT").build(), 1).trade()
-    });
 }
 
 #[test]
@@ -1512,6 +1423,103 @@ fn test_tick_subscription_skips_unexpected_message_then_yields() {
     assert_eq!(tick.price, 14.00, "wrong price");
     assert!(subscription.next().is_none(), "should be done");
 }
+
+/// Fetch one day of daily bars against `responses`.
+fn fetch_daily(responses: Vec<crate::messages::ResponseMessage>) -> (Result<HistoricalData, Error>, Arc<MessageBusStub>) {
+    let (client, bus) = create_blocking_test_client_with_ordered_proto_responses(responses);
+    let result = client
+        .historical_data(&Contract::stock("MSFT").build(), BarSize::Day)
+        .duration(Duration::seconds(86_400))
+        .fetch();
+    (result, bus)
+}
+
+/// A decoded batch alone cannot prove a finite request completed.
+#[test]
+fn test_historical_data_requires_end_after_a_batch() {
+    for populated in [false, true] {
+        let response = historical_data_response();
+        let response = if populated {
+            response.bar(historical_data_daily_bar("20230315").ohlc(1.0, 2.0, 0.5, 1.5))
+        } else {
+            response
+        };
+        let (result, bus) = fetch_daily(vec![proto_response(IncomingMessages::HistoricalData, response.encode_proto())]);
+        assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "populated={populated}: {result:?}");
+        assert_eq!(request_message_count(&bus), 1, "bare closure must not replay the request");
+    }
+}
+
+/// A second data frame is not the completion marker.
+#[test]
+fn test_historical_data_requires_end_message_type() {
+    let response = proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto());
+    let (result, bus) = fetch_daily(vec![response.clone(), response]);
+    assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "{result:?}");
+    assert_eq!(request_message_count(&bus), 1);
+}
+
+/// An empty result is valid when the broker explicitly completes the request.
+#[test]
+fn test_historical_data_requires_end_accepts_completed_empty_batch() {
+    let (result, bus) = fetch_daily(vec![
+        proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto()),
+        proto_response(
+            IncomingMessages::HistoricalDataEnd,
+            historical_data_end_response()
+                .start_date_str("20230315 09:30:00 UTC")
+                .end_date_str("20230315 10:30:00 UTC")
+                .encode_proto(),
+        ),
+    ]);
+    let result = result.unwrap();
+    assert!(result.bars.is_empty());
+    assert_eq!(result.start, datetime!(2023-03-15 09:30:00 UTC));
+    assert_eq!(result.end, datetime!(2023-03-15 10:30:00 UTC));
+    assert_eq!(request_message_count(&bus), 1);
+}
+
+// ---- buffer_limit ----------------------------------------------------------
+
+#[test]
+fn historical_data_stream_buffer_limit_reaches_the_bus() {
+    let (client, message_bus) = crate::common::test_utils::helpers::create_blocking_test_client();
+    let contract = Contract::stock("SPY").build();
+
+    let _bounded = client
+        .historical_data(&contract, BarSize::Hour)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .stream()
+        .expect("bounded stream failed");
+    let _unbounded = client
+        .historical_data(&contract, BarSize::Hour)
+        .duration(Duration::days(1))
+        .stream()
+        .expect("unbounded stream failed");
+
+    assert_eq!(
+        *message_bus.buffer_limits.read().unwrap(),
+        vec![16],
+        "only the bounded request carries a limit"
+    );
+}
+
+#[test]
+fn historical_data_fetch_rejects_buffer_limit() {
+    let (client, message_bus) = crate::common::test_utils::helpers::create_blocking_test_client();
+    let contract = Contract::stock("SPY").build();
+
+    let result = client
+        .historical_data(&contract, BarSize::Hour)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .fetch();
+
+    assert!(matches!(result, Err(Error::InvalidArgument(_))), "got {result:?}");
+    assert!(message_bus.request_messages.read().unwrap().is_empty(), "nothing is sent");
+}
+
 #[test]
 fn strict_history_requires_second_end_and_never_replays() {
     for reset in [false, true] {
@@ -1688,7 +1696,7 @@ fn snapshot_once_preserves_optional_fields_notice_date_and_ended_cleanup() {
                 .end_date(None)
                 .duration(Duration::days(1))
                 .bar_size(BarSize::Day)
-                .what_to_show(Some(WhatToShow::Trades))
+                .what_to_show(WhatToShow::Trades)
                 .use_rth(true)
                 .keep_up_to_date(false),
         );
@@ -1738,4 +1746,23 @@ fn snapshot_once_channel_closure_is_not_an_end() {
         response.cancel_and_drain(std::time::Instant::now()).unwrap(),
         crate::subscriptions::Drained::Unconfirmed
     ));
+}
+
+#[test]
+fn finite_local_history_rejects_stream_buffer_limit_without_writing() {
+    let (client, bus) = create_blocking_test_client_with_ordered_proto_responses(vec![]);
+    let contract = Contract::stock("MSFT").build();
+    let fetched = client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .fetch_once();
+    assert!(matches!(fetched, Err(Error::InvalidArgument(_))));
+    let snapshot = client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .snapshot_once();
+    assert!(matches!(snapshot, Err(Error::InvalidArgument(_))));
+    assert_eq!(request_message_count(&bus), 0);
 }

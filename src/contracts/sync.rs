@@ -1,4 +1,4 @@
-use super::common::{decoders, encoders, verify};
+use super::common::{decoders, encoders};
 use super::*;
 use crate::client::blocking::{ClientRequestBuilders, Subscription};
 use crate::client::ids::RequestId;
@@ -15,6 +15,10 @@ impl Client {
     ///
     /// Collects every row before returning. To read rows as they arrive, stop reading early, or know the
     /// request id up front, use [Client::contract_details_stream].
+    ///
+    /// Waits for TWS's end marker with no time bound. For a bound, use
+    /// [`contract_details_stream`](Self::contract_details_stream) and
+    /// [`collect_to_end_within`](crate::subscriptions::Subscription::collect_to_end_within).
     ///
     /// # Arguments
     /// * `contract` - The [Contract] used as sample to query the available contracts. Typically, it will contain the [Contract]'s symbol, currency, security_type, and exchange.
@@ -44,6 +48,8 @@ impl Client {
     /// stop reading early, or know the request id before anything is sent.
     /// Dropping the subscription before the end sends TWS's native cancel
     /// (server 215+); rows TWS sends after that are discarded.
+    /// [`collect_to_end_within`](crate::subscriptions::Subscription::collect_to_end_within)
+    /// collects the whole result within a time bound.
     /// Terminal: [`ContractDetailsBuilder::subscribe`].
     ///
     /// # Arguments
@@ -132,8 +138,6 @@ impl Client {
     /// }
     /// ```
     pub fn market_rule(&self, market_rule_id: i32) -> Result<MarketRule, Error> {
-        check_version(self.server_version, Features::MARKET_RULES)?;
-
         request_helpers::blocking::one_shot_shared(
             self,
             OutgoingMessages::RequestMarketRule,
@@ -167,8 +171,6 @@ impl Client {
     /// }
     /// ```
     pub fn smart_components(&self, bbo_exchange: &str) -> Result<Vec<SmartComponent>, Error> {
-        check_version(self.server_version, Features::SMART_COMPONENTS)?;
-
         request_helpers::blocking::one_shot_by_request_id(
             self,
             |request_id| encoders::encode_request_smart_components(request_id, bbo_exchange),
@@ -202,8 +204,6 @@ impl Client {
     /// }
     /// ```
     pub fn matching_symbols(&self, pattern: &str) -> Result<Vec<ContractDescription>, Error> {
-        check_version(self.server_version, Features::REQ_MATCHING_SYMBOLS)?;
-
         request_helpers::blocking::one_shot_by_request_id(
             self,
             |request_id| encoders::encode_request_matching_symbols(request_id, pattern),
@@ -232,8 +232,6 @@ impl Client {
     /// println!("calculation: {calculation:?}");
     /// ```
     pub fn calculate_option_price(&self, contract: &Contract, volatility: f64, underlying_price: f64) -> Result<OptionComputation, Error> {
-        check_version(self.server_version, Features::REQ_CALC_OPTION_PRICE)?;
-
         request_helpers::blocking::one_shot_by_request_id(
             self,
             |request_id| encoders::encode_calculate_option_price(request_id, contract, volatility, underlying_price),
@@ -261,8 +259,6 @@ impl Client {
     /// println!("calculation: {calculation:?}");
     /// ```
     pub fn calculate_implied_volatility(&self, contract: &Contract, option_price: f64, underlying_price: f64) -> Result<OptionComputation, Error> {
-        check_version(self.server_version, Features::REQ_CALC_IMPLIED_VOLAT)?;
-
         request_helpers::blocking::one_shot_by_request_id(
             self,
             |request_id| encoders::encode_calculate_implied_volatility(request_id, contract, option_price, underlying_price),
@@ -300,7 +296,7 @@ impl Client {
     /// }
     /// ```
     pub fn option_chain<'a>(&'a self, symbol: &'a str, security_type: SecurityType, contract_id: i32) -> OptionChainBuilder<'a, Self> {
-        OptionChainBuilder::new(self, symbol, security_type, contract_id)
+        OptionChainBuilder::new(self, symbol, security_type, contract_id, self.mint_request_id())
     }
 }
 
@@ -313,20 +309,8 @@ pub(in crate::contracts) fn contract_details_stream(
     request_id: RequestId,
     buffer_limit: Option<usize>,
 ) -> Result<Subscription<ContractDetails>, Error> {
-    let buffer_limit = contract_details_builder::validate_buffer_limit(buffer_limit)?;
-    verify::verify_contract(client.server_version, contract)?;
     let packet = encoders::encode_request_contract_data(request_id.raw(), contract)?;
-    let request = client.request_with_id(request_id);
-    match buffer_limit {
-        Some(limit) => {
-            let bound = crate::transport::BufferBound {
-                limit,
-                end: crate::messages::IncomingMessages::ContractDataEnd,
-            };
-            request.send_bounded(packet, bound)
-        }
-        None => request.send(packet),
-    }
+    client.request_with_id(request_id).send_capped(packet, buffer_limit)
 }
 
 /// Request an underlying's option chain. Reached through
@@ -338,10 +322,11 @@ pub(in crate::contracts) fn option_chain(
     exchange: Option<&str>,
     security_type: SecurityType,
     contract_id: i32,
+    request_id: RequestId,
+    buffer_limit: Option<usize>,
 ) -> Result<Subscription<OptionChain>, Error> {
-    request_helpers::blocking::request_with_id(client, Features::SEC_DEF_OPT_PARAMS_REQ, |request_id| {
-        encoders::encode_request_option_chain(request_id, symbol, exchange, security_type, contract_id)
-    })
+    let packet = encoders::encode_request_option_chain(request_id.raw(), symbol, exchange, security_type, contract_id)?;
+    client.request_with_id(request_id).send_capped(packet, buffer_limit)
 }
 
 #[cfg(test)]

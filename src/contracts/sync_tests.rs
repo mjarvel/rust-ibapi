@@ -197,32 +197,6 @@ fn test_option_chain() {
 }
 
 #[test]
-fn test_verify_contract() {
-    for test_case in verify_contract_test_cases() {
-        let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
-
-        let client = Client::stubbed(message_bus, test_case.server_version);
-        let result = verify::verify_contract(client.server_version, &test_case.contract);
-
-        if test_case.should_error {
-            assert!(result.is_err(), "Test '{}' should have failed", test_case.name);
-            if let Some(expected_error) = test_case.error_contains {
-                let error_msg = format!("{:?}", result.err());
-                assert!(
-                    error_msg.contains(expected_error),
-                    "Test '{}' error should contain '{}', got '{}'",
-                    test_case.name,
-                    expected_error,
-                    error_msg
-                );
-            }
-        } else {
-            assert!(result.is_ok(), "Test '{}' failed: {:?}", test_case.name, result.err());
-        }
-    }
-}
-
-#[test]
 fn test_stream_decoders() {
     for test_case in stream_decoder_test_cases() {
         let message = test_case.message.clone();
@@ -469,21 +443,6 @@ fn test_market_rule_returns_eof_on_empty_stream() {
     assert!(matches!(err, crate::Error::UnexpectedEndOfStream), "got {err:?}");
 }
 
-/// The version check used to be a mandatory argument to `one_shot_request`;
-/// #741 moved it inline, so deleting it now compiles. The async twin
-/// (`market_rule_rejects_old_server_version`) was already covered — this is the
-/// side that was not.
-#[test]
-fn test_market_rule_rejects_old_server_version() {
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
-    let client = Client::stubbed(message_bus.clone(), server_versions::MARKET_RULES - 1);
-
-    let result = client.market_rule(26);
-
-    assert!(matches!(result, Err(crate::Error::ServerVersion(..))), "got {result:?}");
-    assert_eq!(request_message_count(&message_bus), 0, "must not send below the version floor");
-}
-
 #[test]
 fn test_calculate_option_price_returns_eof_on_empty_stream() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
@@ -545,19 +504,6 @@ fn contract_details_stream_unsent_builder_sends_nothing() {
     let second = client.contract_details_stream(&contract).request_id();
 
     assert!(second > first, "a dropped builder skips its id");
-    assert_eq!(request_message_count(&message_bus), 0);
-}
-
-#[test]
-fn contract_details_stream_validation_error_sends_nothing() {
-    let (client, message_bus) = stream_client(vec![], server_versions::SIZE_RULES);
-    let contract = Contract {
-        issuer_id: "ISSUER".into(),
-        ..Contract::stock("AAPL").build()
-    };
-
-    let result = client.contract_details_stream(&contract).subscribe();
-    assert!(matches!(result, Err(crate::Error::ServerVersion(..))), "expected a version error");
     assert_eq!(request_message_count(&message_bus), 0);
 }
 
@@ -670,19 +616,47 @@ fn contract_details_stream_buffer_limit_reaches_the_bus() {
     assert_eq!(request_message_count(&message_bus), 2);
 }
 
-#[test]
-fn contract_details_stream_rejects_out_of_range_buffer_limit() {
-    let (client, message_bus) = stream_client(vec![], server_versions::CANCEL_CONTRACT_DATA);
-    let contract = Contract::stock("AAPL").build();
+// ---- option_chain request id + buffer_limit --------------------------------
 
-    for limit in [0, crate::contracts::MAX_BUFFER_LIMIT + 1] {
-        let result = client.contract_details_stream(&contract).buffer_limit(limit).subscribe();
-        assert!(matches!(result, Err(crate::Error::InvalidArgument(_))), "limit {limit} must be rejected");
-    }
-    let _max = client
-        .contract_details_stream(&contract)
-        .buffer_limit(crate::contracts::MAX_BUFFER_LIMIT)
+#[test]
+fn option_chain_request_id_known_before_send() {
+    let (client, message_bus) = stream_client(vec![], server_versions::SEC_DEF_OPT_PARAMS_REQ);
+
+    let request = client.option_chain("AAPL", SecurityType::Stock, 265598);
+    let request_id = request.request_id();
+    assert_eq!(request_message_count(&message_bus), 0, "building the request sends nothing");
+
+    let _subscription = request.subscribe().expect("subscribe failed");
+    assert_eq!(request_message_count(&message_bus), 1);
+    assert_request(
+        &message_bus,
+        0,
+        &option_chain_request()
+            .request_id(request_id)
+            .symbol("AAPL")
+            .exchange(None)
+            .security_type(SecurityType::Stock)
+            .contract_id(265598),
+    );
+}
+
+#[test]
+fn option_chain_buffer_limit_reaches_the_bus() {
+    let (client, message_bus) = stream_client(vec![], server_versions::SEC_DEF_OPT_PARAMS_REQ);
+
+    let _bounded = client
+        .option_chain("AAPL", SecurityType::Stock, 265598)
+        .buffer_limit(8)
         .subscribe()
         .unwrap();
-    assert_eq!(request_message_count(&message_bus), 1, "only the in-range request is sent");
+    let _unbounded = client.option_chain("AAPL", SecurityType::Stock, 265598).subscribe().unwrap();
+    let rejected = client.option_chain("AAPL", SecurityType::Stock, 265598).buffer_limit(0).subscribe();
+
+    assert!(matches!(rejected, Err(crate::Error::InvalidArgument(_))));
+    assert_eq!(
+        *message_bus.buffer_limits.read().unwrap(),
+        vec![8],
+        "only the bounded request carries a limit"
+    );
+    assert_eq!(request_message_count(&message_bus), 2, "the rejected request sends nothing");
 }

@@ -2,11 +2,12 @@
 
 use super::common::{decoders, encoders};
 use super::*;
+use crate::client::ClientRequestBuilders;
 use crate::common::request_helpers::{self, expect_proto};
 use crate::contracts::TagValue;
 use crate::messages::OutgoingMessages;
 use crate::subscriptions::Subscription;
-use crate::{server_versions, Client, Error};
+use crate::{Client, Error};
 
 impl Client {
     /// Requests an XML list of scanner parameters valid in TWS.
@@ -79,24 +80,9 @@ impl Client {
         subscription: &ScannerSubscription,
         filter: &[TagValue],
     ) -> Result<Subscription<Vec<ScannerData>>, Error> {
-        if !filter.is_empty() {
-            self.check_server_version(
-                server_versions::SCANNER_GENERIC_OPTS,
-                "It does not support API scanner subscription generic filter options.",
-            )?
-        }
-
-        let request_id = self.mint_request_id();
-        let request = encoders::encode_scanner_subscription(request_id.raw(), subscription, filter)?;
-        let internal_subscription = self.send_request(request_id, request).await?;
-
-        Ok(Subscription::new_from_internal(
-            internal_subscription,
-            self.message_bus.clone(),
-            Some(request_id.raw()),
-            None,
-            self.decoder_context(),
-        ))
+        let builder = self.request();
+        let request = encoders::encode_scanner_subscription(builder.request_id(), subscription, filter)?;
+        builder.send(request).await
     }
 }
 

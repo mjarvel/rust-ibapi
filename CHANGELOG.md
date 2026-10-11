@@ -9,11 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Local fork additions and corrections
 
-- Async disconnect explicitly closes both TCP halves even while clients or
-  subscriptions are retained. Shutdown wakes pending socket I/O and permanently
-  prevents that stream from reconnecting. Dispatcher exit performs physical
-  cleanup for client drop; this remains separate from upstream's runtime-free
-  subscription shutdown.
 - Historical `snapshot_once` (sync/async) yields finite envelopes preserving
   notices, optional OHLC/volume/WAP/count values and explicit range-end metadata.
   It distinguishes zero from absence, rejects invalid/missing dates, sends once
@@ -22,20 +17,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without installing a per-order subscription. Observe outcomes through
   `order_update_stream`; successful writing does not confirm cancellation.
 - Historical `fetch_once` (sync/async) requires `HistoricalDataEnd` and never
-  retries connection resets. Historical `fetch` likewise rejects a response that
-  ends before that marker, while preserving its existing reset retry policy.
+  retries connection resets. Both fetch entry points share upstream completion
+  validation; the ordinary `fetch` reset-retry policy remains unchanged.
 
 ### Added
 
+- `Client::account_summary_snapshots(&group, tags, quiet)` (async and blocking) wraps `account_summary` and yields `AccountSummarySnapshot`, the latest value of every row by account, tag and currency. TWS sends one `End` after the first snapshot and none after the rows it pushes later, so a snapshot completes at an `End` or once no row has arrived for `quiet`, and only when a row changed a value. The blocking type is at `client::blocking::AccountSummarySnapshots` when both features are enabled (#957).
+- `Subscription::next_batch(quiet)` (async and blocking) returns the items that arrive together, closed by an end marker or by `quiet` without an item; for streams that dump then push without an end marker (account summary, account updates, positions and their multi variants). `account_summary_snapshots` is built on it (#977).
+- `AccountSummarySnapshot::apply` folds rows for callers with their own batching; `AccountSummarySnapshots::cancel` (async and blocking) cancels before resubscribing.
+- `AccountSummary` implements `Clone` and `PartialEq` (#957).
 - `generic_tick::ETF_FROZEN_NAV_LAST` (`"623"`, frozen-data ETF NAV last price, tick 97) (#946).
+- `OptionChainBuilder::request_id()` and `OptionChainBuilder::buffer_limit(n)`, as on `ContractDetailsBuilder`. The id is allocated when the builder is made, so it is known before anything is sent; `subscribe()` sends once (no retry). TWS has no cancel for this request (#902).
+- `HistoricalDataBuilder::buffer_limit(n)` caps unread items on `stream()`, as on `ContractDetailsBuilder`. The stream has no end marker (`HistoricalBarUpdate::End` after the initial bars is an item and counts), so a reader that stops reading always overflows eventually. `fetch()` returns `InvalidArgument` when it is set (#902).
+- `subscriptions::MAX_BUFFER_LIMIT`, the largest `buffer_limit` for every builder (#902).
+- `RateLimiter` and `ClientBuilder::rate_limiter`: opt-in cap on the messages a client sends to TWS. `RateLimiter::per_second(n)` sends at most `n` messages in any one-second window (`Default` is 50); over-budget sends are delayed (sync blocks, async awaits), never rejected. Cancels count but go out at once. Clones share one budget, so clients of one gateway can be capped together. Off by default (#950).
+- Built-in time zone aliases `BRT` and `Brasilia Standard Time` (`America/Sao_Paulo`), sent by pt-BR IB Gateway builds 10.45 and 10.51. `E. South America Standard Time` already resolved. The troubleshooting guide now documents where the gateway time zone is used (#964).
+- `Subscription::collect_to_end_within(timeout)` (sync and async): collects a request's rows until TWS's end marker, or fails with the new `Error::Timeout`. Bounds `contract_details` and other requests that end; `contract_details()` itself still waits with no bound. A stream closed without the end marker is `UnexpectedEndOfStream`, and a terminal error is returned as is (#965).
+- `client::blocking` exports the blocking `TickSubscription`, its four iterator types and `DisplayGroupSubscription`, previously unnameable or hidden when both `sync` and `async` are enabled (#958).
 
 ### Deprecated
 
+- `contracts::MAX_BUFFER_LIMIT`. Use `subscriptions::MAX_BUFFER_LIMIT`; the limit applies to every builder with `buffer_limit`, not only contracts (#902).
 - `generic_tick::ETF_NAV_FROZEN_LAST`. Its value, `"578"`, is the generic tick IB's earlier tick table gives for the ETF NAV close and prior close (ticks 92 and 93), not the frozen NAV last price (tick 97) its name and docs promised, and TWS rejects it (error 321). Use `ETF_FROZEN_NAV_LAST` for tick 97 (#946).
 - `generic_tick::ETF_NAV_BID` (`"576"`). TWS rejects it (error 321), and IB's current tick-type page no longer lists it; there is no replacement.
+- 53 `protocol::Features` constants whose server version is at or below 213, such as `POSITIONS`, `TICK_BY_TICK` and `WSH_EVENT_DATA_FILTERS`. The client refuses servers below 213 at connect, so `check_version` with any of them always passes; the library no longer checks them. They will be removed in 6.0 (#990). `CANCEL_CONTRACT_DATA`, `CONFIG` and `UPDATE_CONFIG` stay (#978).
 
 ### Fixed
 
+- Async client: `disconnect()` and dropping the client now close the TCP connection even while subscriptions or client clones are still held (#966).
+- `place_order` / `submit_order` (sync and async) return `Error::ServerVersion` for `Order::deactivate` below server version 216 and `Order::route_marketable_to_bbo` below 217, as the C# client does. Previously both were sent unchecked (#978).
+- Blocking client: `disconnect()` and dropping the client now close the TCP connection even while subscriptions are still held. Previously only the read side was shut down, so TWS kept the session open (#979).
+- `historical_data(..).fetch()` (sync and async) waits for TWS's end marker. A response that closed after the bars returned them as complete, with `start`/`end` left at the epoch; it is now `UnexpectedEndOfStream`, and a wrong second message is `UnexpectedResponse` (#967).
 - Blocking `order_update_stream()` can be reopened right after `cancel()`, while the old handle is still held; it used to return `AlreadySubscribed` until the cleanup thread caught up (#932).
 - Blocking client: cancelling or dropping a `contract_news` or `broad_tape_news` subscription now sends `cancelMktData`, as the async client already did. Previously no cancel was sent, and TWS kept the news subscription open until disconnect (#947).
 

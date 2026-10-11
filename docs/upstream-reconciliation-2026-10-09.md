@@ -86,3 +86,10 @@ style diagnostic. Its complete test suite passed on 1.95.0 as recorded above.
 This reconciliation is an integration state on main, not a new frozen checkpoint
 or production acceptance. Only the pre-existing 934aaab commit was published to
 origin/main as authorized; the reconciled merge is initially kept local.
+
+
+## 2026-10-12 - later reconciliation
+
+The [new reconciliation record](upstream-reconciliation-2026-10-12.md) supersedes
+current main source/validation and documents native checkpoint 102. The dated
+validation, source hashes and original worktrees above remain historical evidence.

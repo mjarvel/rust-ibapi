@@ -1,14 +1,16 @@
 //! Asynchronous implementation of account management functionality
 
+use std::time::Duration;
+
 use time::OffsetDateTime;
 
-use crate::client::ClientRequestBuilders;
+use crate::client::{ClientRequestBuilders, SubscriptionBuilderExt};
 use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
 use crate::messages::OutgoingMessages;
-use crate::protocol::{check_version, Features};
 use crate::subscriptions::Subscription;
 use crate::{Client, Error};
 
+use super::common::snapshots::SnapshotBuilder;
 use super::common::{decoders, encoders};
 use super::types::{AccountGroup, AccountId, ContractId, ModelCode};
 use super::*;
@@ -42,18 +44,11 @@ impl Client {
     /// }
     /// ```
     pub async fn positions(&self) -> Result<Subscription<PositionUpdate>, Error> {
-        crate::common::request_helpers::shared_subscription(
-            self,
-            Features::POSITIONS,
-            OutgoingMessages::RequestPositions,
-            encoders::encode_request_positions,
-        )
-        .await
+        let request = encoders::encode_request_positions()?;
+        self.subscription().send_shared(OutgoingMessages::RequestPositions, request).await
     }
 
     /// Subscribe to streaming position updates scoped by account and model code.
-    ///
-    /// Requires [Features::MODELS_SUPPORT] to be available on the connected gateway.
     ///
     /// # Arguments
     /// * `account`    - If an account Id is provided, only the account's positions belonging to the specified model will be delivered.
@@ -83,8 +78,6 @@ impl Client {
         account: Option<&AccountId>,
         model_code: Option<&ModelCode>,
     ) -> Result<Subscription<PositionUpdateMulti>, Error> {
-        check_version(self.server_version(), Features::MODELS_SUPPORT)?;
-
         let builder = self.request();
         let request = encoders::encode_request_positions_multi(builder.request_id(), account, model_code)?;
 
@@ -106,8 +99,6 @@ impl Client {
     /// }
     /// ```
     pub async fn family_codes(&self) -> Result<Vec<FamilyCode>, Error> {
-        check_version(self.server_version(), Features::FAMILY_CODES)?;
-
         request_helpers::one_shot_shared(
             self,
             OutgoingMessages::RequestFamilyCodes,
@@ -145,7 +136,9 @@ impl Client {
     /// }
     /// ```
     pub async fn pnl(&self, account: &AccountId, model_code: Option<&ModelCode>) -> Result<Subscription<PnL>, Error> {
-        crate::common::request_helpers::request_with_id(self, Features::PNL, |id| encoders::encode_request_pnl(id, account, model_code)).await
+        let builder = self.request();
+        let request = encoders::encode_request_pnl(builder.request_id(), account, model_code)?;
+        builder.send(request).await
     }
 
     /// Subscribe to real-time daily PnL updates for a single contract.
@@ -184,13 +177,20 @@ impl Client {
         contract_id: ContractId,
         model_code: Option<&ModelCode>,
     ) -> Result<Subscription<PnLSingle>, Error> {
-        crate::common::request_helpers::request_with_id(self, Features::REALIZED_PNL, |id| {
-            encoders::encode_request_pnl_single(id, account, contract_id, model_code)
-        })
-        .await
+        let builder = self.request();
+        let request = encoders::encode_request_pnl_single(builder.request_id(), account, contract_id, model_code)?;
+        builder.send(request).await
     }
 
     /// Subscribe to account summary updates for a group of accounts.
+    ///
+    /// # Subscription lifetime
+    ///
+    /// The subscription stays open until it is dropped or cancelled. TWS first sends the requested
+    /// tags followed by [`AccountSummaryResult::End`], then keeps pushing
+    /// [`AccountSummaryResult::Summary`] rows without another `End`: when values change, and
+    /// periodically, when a push can resend rows whose values did not change. Dropping the subscription cancels
+    /// the request.
     ///
     /// # Arguments
     /// * `group` - Set to "All" to return account summary data for all accounts, or set to a specific Advisor Account Group name.
@@ -218,10 +218,70 @@ impl Client {
     /// }
     /// ```
     pub async fn account_summary(&self, group: &AccountGroup, tags: &[&str]) -> Result<Subscription<AccountSummaryResult>, Error> {
-        crate::common::request_helpers::request_with_id(self, Features::ACCOUNT_SUMMARY, |id| {
-            encoders::encode_request_account_summary(id, group, tags)
+        let builder = self.request();
+        let request = encoders::encode_request_account_summary(builder.request_id(), group, tags)?;
+        builder.send(request).await
+    }
+
+    /// Subscribe to account summary updates as complete snapshots.
+    ///
+    /// Wraps [`account_summary`](Self::account_summary) and keeps the latest value of every row, so
+    /// each [`AccountSummarySnapshot`] holds the whole account rather than only the rows TWS pushed
+    /// last. TWS sends one `End` marker after the initial snapshot and none after the rows it pushes
+    /// later, so the first snapshot is emitted at the first `End`, even when empty, and each later
+    /// one once no row has arrived for `quiet`. Pushes arrive when values change and periodically
+    /// (IB documents every three minutes), and a push can resend unchanged rows. A later snapshot is
+    /// emitted only when a row changed a value since the previous one. Choose `quiet` longer than
+    /// the gap between the rows of one push, which arrive within milliseconds of each other.
+    ///
+    /// To fold the rows with your own batching instead, use [`AccountSummarySnapshot::apply`].
+    ///
+    /// Notices that arrive on the subscription are logged at `warn!`. For other streams that dump
+    /// then push, batch with [`Subscription::next_batch`](crate::subscriptions::Subscription::next_batch).
+    ///
+    /// Dropping the returned stream cancels the subscription in a background task. Call
+    /// [`cancel`](AccountSummarySnapshots::cancel) before resubscribing: TWS allows two account
+    /// summary requests at a time.
+    ///
+    /// # Arguments
+    /// * `group` - Set to "All" to return account summary data for all accounts, or set to a specific Advisor Account Group name.
+    /// * `tags`  - List of the desired tags.
+    /// * `quiet` - How long without a row completes a pushed update.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::Client;
+    /// use ibapi::accounts::AccountSummaryTags;
+    /// use ibapi::accounts::types::AccountGroup;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///
+    ///     let group = AccountGroup("All".to_string());
+    ///     let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    ///
+    ///     let mut snapshots = client
+    ///         .account_summary_snapshots(&group, tags, Duration::from_secs(1))
+    ///         .await
+    ///         .expect("error requesting account summary");
+    ///
+    ///     while let Some(snapshot) = snapshots.next().await {
+    ///         let snapshot = snapshot.expect("account summary error");
+    ///         println!("{} rows", snapshot.len());
+    ///     }
+    /// }
+    /// ```
+    pub async fn account_summary_snapshots(&self, group: &AccountGroup, tags: &[&str], quiet: Duration) -> Result<AccountSummarySnapshots, Error> {
+        let subscription = self.account_summary(group, tags).await?;
+
+        Ok(AccountSummarySnapshots {
+            subscription,
+            builder: SnapshotBuilder::default(),
+            quiet,
         })
-        .await
     }
 
     /// Subscribe to detailed account updates for a specific account.
@@ -289,8 +349,6 @@ impl Client {
     ///
     /// Each subscription is routed by its own request id, so several accounts or models can stream at once.
     ///
-    /// Requires [Features::MODELS_SUPPORT] to be available on the connected gateway.
-    ///
     /// # Arguments
     /// * `account`        - Account values can be requested for a particular account.
     /// * `model_code`     - Account values can also be requested for a model.
@@ -331,8 +389,6 @@ impl Client {
         account: Option<&AccountId>,
         model_code: Option<&ModelCode>,
     ) -> Result<Subscription<AccountUpdateMulti>, Error> {
-        check_version(self.server_version(), Features::MODELS_SUPPORT)?;
-
         let builder = self.request();
         let request = encoders::encode_request_account_updates_multi(builder.request_id(), account, model_code)?;
 
@@ -403,8 +459,6 @@ impl Client {
     /// }
     /// ```
     pub async fn server_time_millis(&self) -> Result<OffsetDateTime, Error> {
-        check_version(self.server_version(), Features::CURRENT_TIME_IN_MILLIS)?;
-
         request_helpers::one_shot_shared(
             self,
             OutgoingMessages::RequestCurrentTimeInMillis,
@@ -432,8 +486,6 @@ impl Client {
     /// }
     /// ```
     pub async fn soft_dollar_tiers(&self) -> Result<Vec<crate::orders::SoftDollarTier>, Error> {
-        check_version(self.server_version(), Features::SOFT_DOLLAR_TIER)?;
-
         request_helpers::one_shot_by_request_id(
             self,
             encoders::encode_request_soft_dollar_tiers,
@@ -457,8 +509,6 @@ impl Client {
     /// }
     /// ```
     pub async fn user_info(&self) -> Result<UserInfo, Error> {
-        check_version(self.server_version(), Features::USER_INFO)?;
-
         request_helpers::one_shot_by_request_id(self, encoders::encode_request_user_info, expect_proto(decoders::decode_user_info_proto)).await
     }
 
@@ -510,8 +560,6 @@ impl Client {
     /// }
     /// ```
     pub async fn replace_fa(&self, fa_data_type: FaDataType, xml: &str) -> Result<ReplaceFaResult, Error> {
-        check_version(self.server_version(), Features::REPLACE_FA_END)?;
-
         request_helpers::one_shot_by_request_id(
             self,
             move |request_id| encoders::encode_replace_fa(request_id, fa_data_type as i32, xml),
@@ -557,8 +605,6 @@ impl Client {
     /// }
     /// ```
     pub async fn verify_request(&self, api_name: &str, api_version: &str) -> Result<VerificationChallenge, Error> {
-        check_version(self.server_version(), Features::LINKING)?;
-
         request_helpers::one_shot_shared(
             self,
             OutgoingMessages::VerifyRequest,
@@ -587,8 +633,6 @@ impl Client {
     /// }
     /// ```
     pub async fn verify_message(&self, api_data: &str) -> Result<VerificationResult, Error> {
-        check_version(self.server_version(), Features::LINKING)?;
-
         request_helpers::one_shot_shared(
             self,
             OutgoingMessages::VerifyMessage,
@@ -596,6 +640,50 @@ impl Client {
             expect_proto(decoders::decode_verify_completed_proto),
         )
         .await
+    }
+}
+
+/// Complete account summary snapshots from [`Client::account_summary_snapshots`].
+pub struct AccountSummarySnapshots {
+    subscription: Subscription<AccountSummaryResult>,
+    builder: SnapshotBuilder,
+    quiet: Duration,
+}
+
+impl std::fmt::Debug for AccountSummarySnapshots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountSummarySnapshots")
+            .field("quiet", &self.quiet)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccountSummarySnapshots {
+    /// Cancels the underlying subscription. The next call to [`next`](Self::next) returns
+    /// `Err(Error::Cancelled)`, then any rows not yet emitted, then `None`.
+    pub async fn cancel(&self) {
+        self.subscription.cancel().await;
+    }
+
+    /// Returns the next snapshot, or `None` once the subscription has ended.
+    ///
+    /// A snapshot completes at an `End` marker or after the `quiet` period without a row. Rows
+    /// received before the subscription ends are returned as a final snapshot.
+    ///
+    /// Not cancel-safe: dropping the future, as `tokio::select!` does with the branches that lose,
+    /// drops the rows of a batch still being read.
+    pub async fn next(&mut self) -> Option<Result<AccountSummarySnapshot, Error>> {
+        loop {
+            match self.subscription.next_batch(self.quiet).await {
+                Some(Ok(batch)) => {
+                    if let Some(snapshot) = self.builder.fold(batch) {
+                        return Some(Ok(snapshot));
+                    }
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return self.builder.flush().map(Ok),
+            }
+        }
     }
 }
 

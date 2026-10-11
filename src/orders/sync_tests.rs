@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use crate::common::test_utils::helpers::{
     assert_request, assert_tws_error_message, create_blocking_test_client, create_blocking_test_client_with_ordered_proto_responses,
-    decode_request_proto, proto_error_response, proto_response, request_message_count,
+    decode_request_proto, order_status_response, proto_error_response, proto_response, request_message_count,
 };
 use crate::contracts::{ComboLeg, Contract, Currency, Exchange, LegAction, OptionRight, SecurityIdType, SecurityType, Symbol};
 use crate::messages::IncomingMessages;
 use crate::orders::{Action, ExecutionFilterSide, ExecutionSide, ExerciseOptions, OcaType, OrderCondition, OrderStatusKind, TimeInForce};
 use crate::proto;
+use crate::server_versions;
 use crate::stubs::MessageBusStub;
 use crate::testdata::builders::orders::{
     all_open_orders_request, auto_open_orders_request, cancel_order_request, commission_report, completed_order, completed_orders_end,
@@ -169,6 +170,35 @@ fn place_order_rejects_hedge_max_size_below_gate() {
         Ok(_) => panic!("expected place_order to be rejected below the hedge_max_size gate"),
     }
     assert_eq!(request_message_count(&message_bus), 0);
+}
+
+// Each flag is rejected below its gate before anything is sent, and sent at it.
+#[test]
+fn place_order_gates_additional_order_params() {
+    use crate::orders::common::test_tables::ADDITIONAL_PARAM_GATES;
+
+    for gate in ADDITIONAL_PARAM_GATES {
+        let name = gate.name;
+        let contract = Contract::stock("TSLA").build();
+        let mut order = order_builder::market_order(Action::Buy, 100.0);
+        (gate.set)(&mut order);
+
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
+        let client = Client::stubbed(message_bus.clone(), gate.version - 1);
+        match client.place_order(20, &contract, &order) {
+            Err(Error::ServerVersion(required, _, _)) => assert_eq!(required, gate.version, "{name}"),
+            Err(other) => panic!("{name}: expected ServerVersion error, got {other:?}"),
+            Ok(_) => panic!("{name}: expected place_order to be rejected below the gate"),
+        }
+        assert_eq!(request_message_count(&message_bus), 0, "{name}: sent below the gate");
+
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
+        let client = Client::stubbed(message_bus.clone(), gate.version);
+        let _subscription = client
+            .place_order(20, &contract, &order)
+            .unwrap_or_else(|e| panic!("{name}: rejected at the gate: {e:?}"));
+        assert_eq!(request_message_count(&message_bus), 1, "{name}: not sent at the gate");
+    }
 }
 
 #[test]
@@ -1149,23 +1179,6 @@ fn preset_legs_rejected_below_attached_orders_gate() {
     }
     assert_eq!(request_message_count(&bus), 0);
 }
-#[test]
-fn sender_only_cancel_encodes_once_without_registration_or_cancel_on_drop() {
-    let bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
-    client.cancel_order_untracked(42, "").unwrap();
-    assert_eq!(request_message_count(&bus), 1);
-    assert_request(&bus, 0, &cancel_order_request().order_id(42));
-}
-
-#[test]
-fn sender_only_cancel_version_gate_sends_nothing() {
-    let bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(bus.clone(), server_versions::MANUAL_ORDER_TIME - 1);
-    let result = client.cancel_order_untracked(42, "20261004-00:00:00");
-    assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
-    assert_eq!(request_message_count(&bus), 0);
-}
 
 /// Order ids in the request range are refused before anything is sent: their
 /// frames would route as a request's (#789).
@@ -1242,6 +1255,86 @@ fn order_methods_accept_typed_order_ids() {
     )
     .unwrap();
     assert_eq!(bracket[1].parent_id, 41, "bracket_order");
+}
+
+#[test]
+fn wait_for_fill_waits_through_partial_fills() {
+    let (client, message_bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        order_status_response(order_status().status(OrderStatusKind::Submitted).filled(0.0).remaining(100.0)),
+        order_status_response(order_status().status(OrderStatusKind::Submitted).filled(40.0).remaining(60.0)),
+        order_status_response(order_status().status(OrderStatusKind::Filled).filled(100.0).remaining(0.0)),
+    ]);
+
+    let outcome = client.wait_for_fill(13, std::time::Duration::from_secs(5)).unwrap();
+
+    assert!(matches!(&outcome, OrderOutcome::Filled(s) if s.filled == 100.0), "{outcome:?}");
+    assert_eq!(request_message_count(&message_bus), 0, "waiting writes nothing");
+}
+
+#[test]
+fn wait_for_fill_times_out_with_last_status() {
+    let (client, _) = create_blocking_test_client_with_ordered_proto_responses(vec![order_status_response(
+        order_status().status(OrderStatusKind::Submitted).filled(40.0).remaining(60.0),
+    )]);
+
+    let outcome = client.wait_for_fill(13, std::time::Duration::from_millis(20)).unwrap();
+
+    assert!(matches!(&outcome, OrderOutcome::TimedOut(Some(s)) if s.filled == 40.0), "{outcome:?}");
+}
+
+#[test]
+fn wait_for_fill_times_out_without_status() {
+    let (client, _) = create_blocking_test_client_with_ordered_proto_responses(vec![]);
+
+    let outcome = client.wait_for_fill(13, std::time::Duration::from_millis(20)).unwrap();
+
+    assert_eq!(outcome, OrderOutcome::TimedOut(None));
+}
+
+#[test]
+fn wait_for_fill_fails_on_connection_reset() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]).with_connection_resets(1));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let result = client.wait_for_fill(13, std::time::Duration::from_secs(5));
+
+    assert!(matches!(result, Err(Error::ConnectionReset)), "{result:?}");
+}
+
+#[test]
+fn order_status_stream_yields_statuses_and_writes_nothing() {
+    let (client, message_bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        order_status_response(order_status().status(OrderStatusKind::Submitted).filled(40.0).remaining(60.0)),
+        order_status_response(order_status().status(OrderStatusKind::Filled).filled(100.0).remaining(0.0)),
+    ]);
+
+    let statuses = client.order_status_stream(13).unwrap();
+    let filled: Vec<f64> = statuses.iter_data().take(2).map(|status| status.unwrap().filled).collect();
+
+    assert_eq!(filled, [40.0, 100.0]);
+    assert_eq!(request_message_count(&message_bus), 0);
+}
+
+#[test]
+fn sender_only_cancel_encodes_once_without_registration_or_cancel_on_drop() {
+    let bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    client.cancel_order_untracked(42, "").unwrap();
+    assert_eq!(request_message_count(&bus), 1);
+    assert_request(&bus, 0, &cancel_order_request().order_id(42));
+}
+
+#[test]
+fn sender_only_cancel_encodes_manual_time_at_the_supported_floor() {
+    let bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    client.cancel_order_untracked(42, "20261004-00:00:00").unwrap();
+    assert_eq!(request_message_count(&bus), 1);
+    assert_request(
+        &bus,
+        0,
+        &cancel_order_request().order_id(42).manual_order_cancel_time("20261004-00:00:00"),
+    );
 }
 
 #[test]

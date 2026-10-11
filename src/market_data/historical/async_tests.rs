@@ -268,19 +268,9 @@ async fn test_historical_data() {
             .end_date(Some(end_date))
             .duration(duration)
             .bar_size(bar_size)
-            .what_to_show(Some(what_to_show))
+            .what_to_show(what_to_show)
             .use_rth(true),
     );
-}
-
-#[tokio::test]
-async fn test_historical_data_version_check() {
-    let mut contract = test_contract();
-    contract.trading_class = "ES".to_owned();
-    assert_version_check_fails(Features::TRADING_CLASS, |c| async move {
-        c.historical_data(&contract, BarSize::Hour).duration(Duration::days(1)).fetch().await
-    })
-    .await;
 }
 
 #[tokio::test]
@@ -422,7 +412,7 @@ async fn test_historical_schedules() {
             .end_date(Some(end_date))
             .duration(duration)
             .bar_size(BarSize::Day)
-            .what_to_show(Some(WhatToShow::Schedule))
+            .what_to_show(WhatToShow::Schedule)
             .use_rth(true),
     );
 }
@@ -749,7 +739,7 @@ async fn test_historical_data_streaming_with_updates() {
             .contract(&contract)
             .duration(Duration::days(1))
             .bar_size(BarSize::Hour)
-            .what_to_show(Some(WhatToShow::Trades))
+            .what_to_show(WhatToShow::Trades)
             .use_rth(true)
             .keep_up_to_date(true),
     );
@@ -975,14 +965,6 @@ async fn test_streaming_subscription_cancel_prevents_duplicate_on_drop() {
 }
 
 #[tokio::test]
-async fn test_head_timestamp_version_check() {
-    assert_version_check_fails(Features::HEAD_TIMESTAMP, |c| async move {
-        c.head_timestamp(&test_contract(), WhatToShow::Trades, TradingHours::Regular).await
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn test_head_timestamp_unexpected_response() {
     // 17 = HistoricalData — wrong type for head_timestamp.
     assert_unexpected_response(
@@ -1084,26 +1066,6 @@ async fn test_historical_data_retries_a_connection_reset() {
 }
 
 #[tokio::test]
-async fn test_historical_schedules_ending_now_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_SCHEDULE, |c| async move {
-        c.historical_schedules(&test_contract(), Duration::days(1)).fetch().await
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn test_historical_schedules_ending_now_trading_class_version_check() {
-    // contract.trading_class triggers the earlier TRADING_CLASS gate ahead of the
-    // HISTORICAL_SCHEDULE gate — pin below TRADING_CLASS so the former fires first.
-    let mut contract = test_contract();
-    contract.trading_class = "ES".to_owned();
-    assert_version_check_fails(Features::TRADING_CLASS, |c| async move {
-        c.historical_schedules(&contract, Duration::days(1)).fetch().await
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn test_historical_schedules_unexpected_response() {
     // 17 = HistoricalData — wrong type for the schedule decoder (expects 106).
     assert_unexpected_response(
@@ -1111,30 +1073,6 @@ async fn test_historical_schedules_unexpected_response() {
         "17|9000|20230315  09:30:00|20230315  10:30:00|0|",
         |c| async move { c.historical_schedules(&test_contract(), Duration::days(3)).fetch().await },
     )
-    .await;
-}
-
-#[tokio::test]
-async fn test_historical_ticks_bid_ask_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_TICKS, |c| async move {
-        c.historical_ticks(&test_contract(), 1).bid_ask(IgnoreSize::No).await
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn test_historical_ticks_mid_point_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_TICKS, |c| async move {
-        c.historical_ticks(&test_contract(), 1).mid_point().await
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn test_historical_ticks_trade_version_check() {
-    assert_version_check_fails(Features::HISTORICAL_TICKS, |c| async move {
-        c.historical_ticks(&test_contract(), 1).trade().await
-    })
     .await;
 }
 
@@ -1152,24 +1090,6 @@ async fn test_cancel_historical_ticks() {
 #[tokio::test]
 async fn test_cancel_historical_ticks_version_check() {
     assert_version_check_fails(Features::CANCEL_CONTRACT_DATA, |c| async move { c.cancel_historical_ticks(9000).await }).await;
-}
-
-#[tokio::test]
-async fn test_histogram_data_version_check() {
-    assert_version_check_fails(Features::HISTOGRAM, |c| async move {
-        c.histogram_data(&test_contract(), TradingHours::Regular, BarSize::Day).await
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn test_historical_data_streaming_trading_class_version_check() {
-    let mut contract = test_contract();
-    contract.trading_class = "ES".to_owned();
-    assert_version_check_fails(Features::TRADING_CLASS, |c| async move {
-        c.historical_data(&contract, BarSize::Hour).duration(Duration::days(1)).stream().await
-    })
-    .await;
 }
 
 #[tokio::test]
@@ -1322,6 +1242,108 @@ async fn test_tick_subscription_returns_none_on_closed_channel() {
 
     assert!(subscription.next().await.is_none(), "closed channel yields None");
 }
+
+/// Fetch one day of daily bars against `responses`.
+async fn fetch_daily(responses: Vec<crate::messages::ResponseMessage>) -> (Result<HistoricalData, Error>, Arc<MessageBusStub>) {
+    let (client, bus) = create_test_client_with_ordered_proto_responses(responses);
+    let result = client
+        .historical_data(&test_contract(), BarSize::Day)
+        .duration(Duration::seconds(86_400))
+        .fetch()
+        .await;
+    (result, bus)
+}
+
+/// A decoded batch alone cannot prove a finite request completed.
+#[tokio::test]
+async fn test_historical_data_requires_end_after_a_batch() {
+    for populated in [false, true] {
+        let response = historical_data_response();
+        let response = if populated {
+            response.bar(historical_data_daily_bar("20230315").ohlc(1.0, 2.0, 0.5, 1.5))
+        } else {
+            response
+        };
+        let (result, bus) = fetch_daily(vec![proto_response(IncomingMessages::HistoricalData, response.encode_proto())]).await;
+        assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "populated={populated}: {result:?}");
+        assert_eq!(request_message_count(&bus), 1, "bare closure must not replay the request");
+    }
+}
+
+/// A second data frame is not the completion marker.
+#[tokio::test]
+async fn test_historical_data_requires_end_message_type() {
+    let response = proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto());
+    let (result, bus) = fetch_daily(vec![response.clone(), response]).await;
+    assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "{result:?}");
+    assert_eq!(request_message_count(&bus), 1);
+}
+
+/// An empty result is valid when the broker explicitly completes the request.
+#[tokio::test]
+async fn test_historical_data_requires_end_accepts_completed_empty_batch() {
+    let (result, bus) = fetch_daily(vec![
+        proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto()),
+        proto_response(
+            IncomingMessages::HistoricalDataEnd,
+            historical_data_end_response()
+                .start_date_str("20230315 09:30:00 UTC")
+                .end_date_str("20230315 10:30:00 UTC")
+                .encode_proto(),
+        ),
+    ])
+    .await;
+    let result = result.unwrap();
+    assert!(result.bars.is_empty());
+    assert_eq!(result.start, datetime!(2023-03-15 09:30:00 UTC));
+    assert_eq!(result.end, datetime!(2023-03-15 10:30:00 UTC));
+    assert_eq!(request_message_count(&bus), 1);
+}
+
+// ---- buffer_limit ----------------------------------------------------------
+
+#[tokio::test]
+async fn historical_data_stream_buffer_limit_reaches_the_bus() {
+    let (client, message_bus) = crate::common::test_utils::helpers::create_test_client();
+    let contract = Contract::stock("SPY").build();
+
+    let _bounded = client
+        .historical_data(&contract, BarSize::Hour)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .stream()
+        .await
+        .expect("bounded stream failed");
+    let _unbounded = client
+        .historical_data(&contract, BarSize::Hour)
+        .duration(Duration::days(1))
+        .stream()
+        .await
+        .expect("unbounded stream failed");
+
+    assert_eq!(
+        *message_bus.buffer_limits.read().unwrap(),
+        vec![16],
+        "only the bounded request carries a limit"
+    );
+}
+
+#[tokio::test]
+async fn historical_data_fetch_rejects_buffer_limit() {
+    let (client, message_bus) = crate::common::test_utils::helpers::create_test_client();
+    let contract = Contract::stock("SPY").build();
+
+    let result = client
+        .historical_data(&contract, BarSize::Hour)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .fetch()
+        .await;
+
+    assert!(matches!(result, Err(Error::InvalidArgument(_))), "got {result:?}");
+    assert!(message_bus.request_messages.read().unwrap().is_empty(), "nothing is sent");
+}
+
 #[tokio::test]
 async fn strict_history_requires_second_end_and_never_replays() {
     for reset in [false, true] {
@@ -1496,7 +1518,7 @@ async fn snapshot_once_preserves_optional_fields_notice_date_and_ended_cleanup()
                 .end_date(None)
                 .duration(Duration::days(1))
                 .bar_size(BarSize::Day)
-                .what_to_show(Some(WhatToShow::Trades))
+                .what_to_show(WhatToShow::Trades)
                 .use_rth(true)
                 .keep_up_to_date(false),
         );
@@ -1549,4 +1571,25 @@ async fn snapshot_once_channel_closure_is_not_an_end() {
         response.cancel_and_drain(tokio::time::Instant::now()).await.unwrap(),
         crate::subscriptions::Drained::Unconfirmed
     ));
+}
+
+#[tokio::test]
+async fn finite_local_history_rejects_stream_buffer_limit_without_writing() {
+    let (client, bus) = create_test_client_with_ordered_proto_responses(vec![]);
+    let contract = Contract::stock("MSFT").build();
+    let fetched = client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .fetch_once()
+        .await;
+    assert!(matches!(fetched, Err(Error::InvalidArgument(_))));
+    let snapshot = client
+        .historical_data(&contract, BarSize::Day)
+        .duration(Duration::days(1))
+        .buffer_limit(16)
+        .snapshot_once()
+        .await;
+    assert!(matches!(snapshot, Err(Error::InvalidArgument(_))));
+    assert_eq!(request_message_count(&bus), 0);
 }

@@ -1,15 +1,13 @@
 //! Synchronous implementation of scanner functionality
 
-use std::sync::Arc;
-
 use super::common::{decoders, encoders};
 use super::*;
-use crate::client::blocking::Subscription;
+use crate::client::blocking::{ClientRequestBuilders, Subscription};
 use crate::client::sync::Client;
 use crate::common::request_helpers::{self, expect_proto};
 use crate::contracts::TagValue;
 use crate::messages::OutgoingMessages;
-use crate::{server_versions, Error};
+use crate::Error;
 
 impl Client {
     /// Requests an XML list of scanner parameters valid in TWS.
@@ -84,18 +82,9 @@ impl Client {
     /// };
     /// ```
     pub fn scanner_subscription(&self, subscription: &ScannerSubscription, filter: &[TagValue]) -> Result<Subscription<Vec<ScannerData>>, Error> {
-        if !filter.is_empty() {
-            self.check_server_version(
-                server_versions::SCANNER_GENERIC_OPTS,
-                "It does not support API scanner subscription generic filter options.",
-            )?
-        }
-
-        let request_id = self.mint_request_id();
-        let request = encoders::encode_scanner_subscription(request_id.raw(), subscription, filter)?;
-        let subscription = self.send_request(request_id, request)?;
-
-        Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))
+        let builder = self.request();
+        let request = encoders::encode_scanner_subscription(builder.request_id(), subscription, filter)?;
+        builder.send(request)
     }
 }
 

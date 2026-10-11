@@ -14,7 +14,7 @@ sync and async builders expose it; applications still supply timeout/cancellatio
 policy around the async future. See the [README](../README.md#available-apis).
 
 `Client::cancel_order_untracked(order_id, manual_order_cancel_time)` uses the same
-encoder/version check as `cancel_order` and returns a local write result without
+encoder and ID check as `cancel_order` and returns a local write result without
 creating an order channel. Use it with a previously installed `order_update_stream`
 to observe status/errors, preserving manual execution-download routing. Neither
 writing nor dropping an observer proves cancellation. Existing `cancel_order`

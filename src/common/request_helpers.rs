@@ -101,42 +101,10 @@ mod tests;
 // Sync implementations
 #[cfg(feature = "sync")]
 mod sync_helpers {
-    use crate::client::blocking::{ClientRequestBuilders, Subscription, SubscriptionBuilderExt};
+    use crate::client::blocking::ClientRequestBuilders;
     use crate::client::sync::Client;
-    use crate::client::StreamDecoder;
     use crate::messages::{OutgoingMessages, ResponseMessage};
-    use crate::protocol::{check_version, ProtocolFeature};
     use crate::Error;
-
-    /// Helper for requests that need a request ID and return a subscription
-    pub fn request_with_id<T>(
-        client: &Client,
-        feature: ProtocolFeature,
-        encoder: impl FnOnce(i32) -> Result<Vec<u8>, Error>,
-    ) -> Result<Subscription<T>, Error>
-    where
-        T: StreamDecoder<T>,
-    {
-        check_version(client.server_version(), feature)?;
-        let builder = client.request();
-        let request = encoder(builder.request_id())?;
-        builder.send(request)
-    }
-
-    /// Helper for shared requests (no request ID) that return a subscription
-    pub fn shared_subscription<T>(
-        client: &Client,
-        feature: ProtocolFeature,
-        message_type: OutgoingMessages,
-        encoder: impl FnOnce() -> Result<Vec<u8>, Error>,
-    ) -> Result<Subscription<T>, Error>
-    where
-        T: StreamDecoder<T>,
-    {
-        check_version(client.server_version(), feature)?;
-        let request = encoder()?;
-        client.subscription::<T>().send_shared(message_type, request)
-    }
 
     /// One-shot request answered on the shared channel for its message type.
     pub fn one_shot_shared<R>(
@@ -172,41 +140,9 @@ mod sync_helpers {
 // Async implementations
 #[cfg(feature = "async")]
 mod async_helpers {
-    use crate::client::{Client, ClientRequestBuilders, SubscriptionBuilderExt};
+    use crate::client::{Client, ClientRequestBuilders};
     use crate::messages::{OutgoingMessages, ResponseMessage};
-    use crate::protocol::{check_version, ProtocolFeature};
-    use crate::subscriptions::{StreamDecoder, Subscription};
     use crate::Error;
-
-    /// Async helper for requests that need a request ID and return a subscription
-    pub async fn request_with_id<T>(
-        client: &Client,
-        feature: ProtocolFeature,
-        encoder: impl FnOnce(i32) -> Result<Vec<u8>, Error>,
-    ) -> Result<Subscription<T>, Error>
-    where
-        T: StreamDecoder<T> + Send + 'static,
-    {
-        check_version(client.server_version(), feature)?;
-        let builder = client.request();
-        let request = encoder(builder.request_id())?;
-        builder.send::<T>(request).await
-    }
-
-    /// Async helper for shared requests (no request ID) that return a subscription
-    pub async fn shared_subscription<T>(
-        client: &Client,
-        feature: ProtocolFeature,
-        message_type: OutgoingMessages,
-        encoder: impl FnOnce() -> Result<Vec<u8>, Error>,
-    ) -> Result<Subscription<T>, Error>
-    where
-        T: StreamDecoder<T> + Send + 'static,
-    {
-        check_version(client.server_version(), feature)?;
-        let request = encoder()?;
-        client.subscription::<T>().send_shared(message_type, request).await
-    }
 
     /// One-shot request answered on the shared channel for its message type.
     pub async fn one_shot_shared<R>(

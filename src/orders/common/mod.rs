@@ -1,9 +1,13 @@
 pub(super) mod decoders;
 pub(crate) mod encoders;
+pub(crate) mod fill;
 /// Helpers for constructing commonly used order templates.
 pub mod order_builder;
 pub(crate) mod stream_decoders;
 pub(super) mod verify;
+
+#[cfg(test)]
+pub(super) mod test_tables;
 
 // Narrow re-exports: only the handshake-time decoders escape the
 // `orders::common` boundary. The rest of `decoders` stays internal.

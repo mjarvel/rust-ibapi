@@ -53,58 +53,57 @@ that's the canonical home for builder usage. This section is just the pointer.
 
 ### Request-ID Requests
 
-For a streaming request routed by request id, use `request_helpers::request_with_id`:
-it checks the feature's server version, mints the request id, and hands the
-raw id to your encoder:
+For a streaming request routed by request id, build on `client.request()`: the
+`RequestBuilder` holds the minted id (`builder.request_id()` for the encoder).
+Gate a feature newer than the connection floor with `check_version` (see
+[Protocol Version Checking](#protocol-version-checking)) first:
 
 ```rust
 // Sync mode (in domain/sync.rs as impl Client block)
 impl Client {
     pub fn pnl(&self, account: &AccountId, model_code: Option<&ModelCode>) -> Result<Subscription<PnL>, Error> {
-        request_helpers::blocking::request_with_id(self, Features::PNL, |id| encoders::encode_request_pnl(id, account, model_code))
+        let builder = self.request();
+        let request = encoders::encode_request_pnl(builder.request_id(), account, model_code)?;
+        builder.send(request)
     }
 }
 
 // Async mode (in domain/async.rs as impl Client block)
 impl Client {
     pub async fn pnl(&self, account: &AccountId, model_code: Option<&ModelCode>) -> Result<Subscription<PnL>, Error> {
-        request_helpers::request_with_id(self, Features::PNL, |id| encoders::encode_request_pnl(id, account, model_code)).await
+        let builder = self.request();
+        let request = encoders::encode_request_pnl(builder.request_id(), account, model_code)?;
+        builder.send(request).await
     }
 }
 ```
 
-When the helper doesn't fit, build on `client.request()` directly: the
-`RequestBuilder` holds the minted id (`builder.request_id()` for the encoder)
-and sends with `send`, `send_bounded` or `send_with_context`.
+Besides `send`, the builder sends with `send_capped` or `send_with_context`.
+`send_capped` takes a builder's `buffer_limit` and reads the cap's end markers
+from the decoder's `StreamDecoder::END_MESSAGES` (a test checks the list
+matches the `decode` arms that end the stream). With none, only an error ends
+a capped stream. A builder that exposes `request_id()` before sending mints
+the id in its constructor and sends with `client.request_with_id(id)` instead.
 
 ### Shared-Channel Requests
 
-For requests routed by message type (no request id), use
-`request_helpers::shared_subscription`:
+For requests routed by message type (no request id), send through
+`client.subscription()`:
 
 ```rust
 // Sync mode (in domain/sync.rs)
 impl Client {
     pub fn positions(&self) -> Result<Subscription<PositionUpdate>, Error> {
-        request_helpers::blocking::shared_subscription(
-            self,
-            Features::POSITIONS,
-            OutgoingMessages::RequestPositions,
-            encoders::encode_request_positions,
-        )
+        let request = encoders::encode_request_positions()?;
+        self.subscription().send_shared(OutgoingMessages::RequestPositions, request)
     }
 }
 
 // Async mode (in domain/async.rs)
 impl Client {
     pub async fn positions(&self) -> Result<Subscription<PositionUpdate>, Error> {
-        request_helpers::shared_subscription(
-            self,
-            Features::POSITIONS,
-            OutgoingMessages::RequestPositions,
-            encoders::encode_request_positions,
-        )
-        .await
+        let request = encoders::encode_request_positions()?;
+        self.subscription().send_shared(OutgoingMessages::RequestPositions, request).await
     }
 }
 ```
@@ -362,36 +361,28 @@ For comprehensive conditional order documentation, see [Order Types - Conditiona
 
 ## Protocol Version Checking
 
-Use the protocol module for version-specific features:
+The handshake refuses servers below version 213 (`PROTOBUF_REST_MESSAGES_3`), so
+a feature at or below it needs no check; those `Features` constants are
+deprecated. Check only a feature above the floor, on the line before the request:
 
 ```rust
-use crate::messages::{encode_protobuf_message, OutgoingMessages};
-use crate::protocol::{check_version, Features, is_supported};
-use prost::Message;
+use crate::protocol::{check_version, is_supported, Features};
 
-// Check if feature is supported
-pub fn tick_by_tick_trades(&self, contract: &Contract) 
-    -> Result<Subscription<Trade>, Error> 
-{
-    check_version(self.server_version, Features::TICK_BY_TICK)?;
+// Gate a request (from `config/sync.rs`)
+pub fn config(&self) -> Result<Config, Error> {
+    check_version(self.server_version, Features::CONFIG)?;
     // ... implementation
 }
 
-// Conditional field encoding: encoders build a prost message and return the
-// framed bytes; a version-gated field stays `None` when unsupported
-pub fn encode_my_request(request: &MyRequest, server_version: i32) -> Result<Vec<u8>, Error> {
-    let mut proto = crate::proto::MyRequest {
-        req_id: Some(request.id),
-        ..Default::default()
-    };
-
-    if is_supported(server_version, Features::DECISION_MAKER) {
-        proto.decision_maker = Some(request.decision_maker.clone());
-    }
-
-    Ok(encode_protobuf_message(OutgoingMessages::MyRequest as i32, &proto.encode_to_vec()))
+// Conditional field encoding: a field gated above the floor stays `None`
+// when the server is too old
+if is_supported(server_version, Features::MY_FEATURE) {
+    proto.my_field = Some(request.my_field.clone());
 }
 ```
+
+Order fields gated above the floor are checked in `verify_order`
+(`orders/common/verify.rs`), mirroring C# `ValidateOrderParameters`.
 
 ## Subscription Patterns
 
@@ -602,24 +593,21 @@ let handles: Vec<_> = contracts
 ```
 
 ### Rate Limiting
+Install a `RateLimiter` on the client instead of pacing requests by hand. Pass
+clones of one limiter to every client on the same gateway; see the
+`RateLimiter` docs for what is counted, how cancels are treated and the
+default.
 ```rust
-use std::time::{Duration, Instant};
+use ibapi::{Client, RateLimiter};
 
-struct RateLimiter {
-    last_request: Instant,
-    min_interval: Duration,
-}
-
-impl RateLimiter {
-    fn wait_if_needed(&mut self) {
-        let elapsed = self.last_request.elapsed();
-        if elapsed < self.min_interval {
-            thread::sleep(self.min_interval - elapsed);
-        }
-        self.last_request = Instant::now();
-    }
-}
+let client = Client::builder()
+    .address("127.0.0.1:4002")
+    .client_id(100)
+    .rate_limiter(RateLimiter::default())
+    .connect()
+    .await?;
 ```
+Historical-data pacing (error 162) is a separate limit the library does not enforce.
 
 ### Reconnection Handling
 ```rust
