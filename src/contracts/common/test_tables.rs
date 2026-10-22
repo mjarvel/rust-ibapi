@@ -2,7 +2,7 @@
 
 #[cfg(feature = "sync")]
 use crate::common::test_utils::helpers::proto_error_response;
-use crate::common::test_utils::helpers::{proto_response, text_response};
+use crate::common::test_utils::helpers::{proto_response, text_response, TEST_REQ_ID_FIRST};
 use crate::contracts::{Contract, ContractDetails, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use crate::messages::{IncomingMessages, OutgoingMessages, ResponseMessage};
 use crate::testdata::builders::contracts::{contract_data, market_rule, option_chain, smart_components, symbol_samples, symbol_samples_entry};
@@ -156,6 +156,7 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                 assert_eq!(contracts[0].industry, "Consumer, Cyclical");
                 assert_eq!(contracts[0].category, "Auto Manufacturers");
                 assert_eq!(contracts[0].stock_type, "COMMON");
+                assert_eq!(contracts[0].settlement_method, "");
                 assert_eq!(contracts[0].min_size, Some(1.0));
                 assert_eq!(contracts[0].size_increment, Some(1.0));
                 assert_eq!(contracts[0].suggested_size_increment, Some(100.0));
@@ -194,6 +195,7 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                         .category("Indices")
                         .subcategory("Broad Market Equity Index")
                         .time_zone_id("US/Central")
+                        .settlement_method("Cash")
                         .encode_proto(),
                 ),
                 contract_data_end(9001),
@@ -209,6 +211,7 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                 assert_eq!(contracts[0].contract.last_trade_date_or_contract_month, "20240621");
                 assert_eq!(contracts[0].long_name, "E-mini S&P 500");
                 assert_eq!(contracts[0].category, "Indices");
+                assert_eq!(contracts[0].settlement_method, "Cash");
             }),
         },
         ContractDetailsTestCase {
@@ -401,6 +404,20 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                 assert_eq!(contracts[0].order_types[0], "ACTIVETIM");
                 assert_eq!(contracts[1].order_types.len(), 42);
             }),
+        },
+        ContractDetailsTestCase {
+            name: "empty response",
+            contract: Contract {
+                symbol: Symbol::from("TSLA"),
+                security_type: SecurityType::Stock,
+                exchange: Exchange::from("SMART"),
+                currency: Currency::from("USD"),
+                ..Default::default()
+            },
+            ordered_responses: vec![contract_data_end(TEST_REQ_ID_FIRST)],
+            expected_request: "",
+            expected_count: 0,
+            validations: Box::new(|_| {}),
         },
     ]
 }
@@ -744,6 +761,20 @@ pub fn cancel_message_test_cases() -> Vec<CancelMessageTestCase> {
             expected_msg_id: Ok(OutgoingMessages::CancelOptionPrice as i32 + 200),
         },
         CancelMessageTestCase {
+            name: "cancel option computation without request id",
+            decoder_type: "OptionComputation",
+            request_id: None,
+            request_type: Some(OutgoingMessages::ReqCalcOptionPrice),
+            expected_msg_id: Err("Request ID required to cancel option calculations"),
+        },
+        CancelMessageTestCase {
+            name: "cancel option computation without request type",
+            decoder_type: "OptionComputation",
+            request_id: Some(9002),
+            request_type: None,
+            expected_msg_id: Err("Unsupported request message type option computation cancel: None"),
+        },
+        CancelMessageTestCase {
             name: "cancel option chain - not supported",
             decoder_type: "OptionChain",
             request_id: Some(9003),
@@ -875,7 +906,7 @@ pub fn contract_details_error_test_cases() -> Vec<ContractDetailsErrorTestCase> 
         ContractDetailsErrorTestCase {
             name: "empty response (no contracts found)",
             contract: Contract::stock("NOEXIST").build(),
-            ordered_responses: vec![contract_data_end(9000)],
+            ordered_responses: vec![contract_data_end(TEST_REQ_ID_FIRST)],
             should_error: false,
             error_contains: None,
             expected_count: 0,

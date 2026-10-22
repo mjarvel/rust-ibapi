@@ -7,8 +7,8 @@ use log::{debug, info};
 use tokio::sync::{broadcast, Mutex};
 
 use super::common::{
-    parse_handshake_ack, parse_raw_message, require_protobuf_support, AccountInfo, ConnectionHandler, ConnectionProtocol, StartupHandshakeContext,
-    StartupMessage, MAX_ACCOUNT_INFO_ATTEMPTS,
+    parse_handshake_ack, parse_raw_message, require_protobuf_support, AccountInfo, ConnectionConfig, ConnectionHandler, ConnectionProtocol,
+    StartupCallback, StartupHandshakeContext, MAX_ACCOUNT_INFO_ATTEMPTS,
 };
 use super::ConnectionMetadata;
 use crate::errors::Error;
@@ -31,7 +31,7 @@ pub struct AsyncConnection<S: AsyncStream = AsyncTcpSocket> {
     pub(crate) connection_handler: ConnectionHandler,
     /// Optional typed-message callback supplied via [`ClientBuilder::startup_callback`].
     /// Fires on initial handshake *and* every auto-reconnect handshake.
-    startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+    startup_callback: Option<StartupCallback>,
     /// Fan-out for unrouted notices. Shared with the bus (the bus reads via
     /// `self.connection.notice_broadcaster`) and any pre-bound `NoticeStream` the
     /// user obtained from `ClientBuilder::connect_with_notice_stream`.
@@ -42,6 +42,10 @@ pub struct AsyncConnection<S: AsyncStream = AsyncTcpSocket> {
     /// Shared with the bus so `reconnect` can abandon its backoff as soon as
     /// shutdown is requested. See [`AsyncConnection::shutdown_signal`].
     shutdown: Arc<ShutdownSignal>,
+    /// The last `RequestMarketDataType` packet requested. TWS does not keep
+    /// the market data type across reconnects, so `establish_connection`
+    /// re-sends it after every reconnect handshake.
+    market_data_type_request: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl<S: AsyncStream> std::fmt::Debug for AsyncConnection<S> {
@@ -55,22 +59,16 @@ impl<S: AsyncStream> std::fmt::Debug for AsyncConnection<S> {
 }
 
 impl AsyncConnection<AsyncTcpSocket> {
-    /// Create a connection from explicit pieces handed in by the builder.
+    /// Open the socket and run the TWS handshake. Settings come from the
+    /// builder's validated `ConnectionConfig`.
     ///
     /// `notice_sender` is shared with any pre-bound `NoticeStream`; the builder
     /// allocates the broadcast channel before calling here. Persists across
     /// reconnects.
-    pub(crate) async fn with_pieces(
-        address: &str,
-        client_id: i32,
-        tcp_no_delay: bool,
-        startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
-        notice_sender: broadcast::Sender<Notice>,
-        max_reconnect_attempts: Option<u32>,
-    ) -> Result<Self, Error> {
-        let socket = AsyncTcpSocket::connect(address, tcp_no_delay).await?;
-        let mut connection = Self::with_socket(socket, client_id, startup_callback, notice_sender);
-        connection.max_reconnect_attempts = max_reconnect_attempts;
+    pub(crate) async fn connect(config: ConnectionConfig, notice_sender: broadcast::Sender<Notice>) -> Result<Self, Error> {
+        let socket = AsyncTcpSocket::connect(&config.address, config.tcp_no_delay).await?;
+        let mut connection = Self::with_socket(socket, config.client_id, config.startup_callback, notice_sender);
+        connection.max_reconnect_attempts = config.max_reconnect_attempts;
         connection.establish_connection().await?;
         Ok(connection)
     }
@@ -80,7 +78,7 @@ impl<S: AsyncStream> AsyncConnection<S> {
     pub(crate) fn with_socket(
         socket: S,
         client_id: i32,
-        startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+        startup_callback: Option<StartupCallback>,
         notice_sender: broadcast::Sender<Notice>,
     ) -> Self {
         Self {
@@ -97,6 +95,7 @@ impl<S: AsyncStream> AsyncConnection<S> {
             notice_broadcaster: NoticeBroadcaster::new(notice_sender),
             max_reconnect_attempts: Some(MAX_RECONNECT_ATTEMPTS),
             shutdown: Arc::new(ShutdownSignal::default()),
+            market_data_type_request: std::sync::Mutex::new(None),
         }
     }
 
@@ -107,7 +106,7 @@ impl<S: AsyncStream> AsyncConnection<S> {
     }
 
     /// Build a connection over an arbitrary `AsyncStream` without performing
-    /// the handshake. For tests; the production path uses `with_pieces` which
+    /// the handshake. For tests; the production path uses `connect` which
     /// runs `establish_connection` immediately after construction.
     #[cfg(test)]
     pub(crate) fn stubbed(socket: S, client_id: i32) -> Self {
@@ -142,10 +141,11 @@ impl<S: AsyncStream> AsyncConnection<S> {
         self.server_version_cache.load(Ordering::Acquire)
     }
 
-    /// Reconnect to TWS with fibonacci backoff. Replays the handshake and
-    /// re-fires the persisted startup / notice callbacks. When every attempt
-    /// fails, returns the last attempt's error — a permanent cause (say, an
-    /// incompatible server version) must not exit as a generic failure.
+    /// Reconnect to TWS with fibonacci backoff. Replays the handshake,
+    /// re-fires the persisted startup / notice callbacks and re-sends the
+    /// remembered market data type. When every attempt fails, returns the
+    /// last attempt's error — a permanent cause (say, an incompatible server
+    /// version) must not exit as a generic failure.
     ///
     /// Returns [`Error::Shutdown`] once shutdown is requested. The backoff
     /// wait ends immediately on the request; a connect already in flight is
@@ -214,7 +214,23 @@ impl<S: AsyncStream> AsyncConnection<S> {
         require_protobuf_support(self.server_version())?;
         self.start_api().await?;
         self.receive_account_info().await?;
+        self.replay_market_data_type().await?;
         Ok(())
+    }
+
+    /// Keep `packet`, a `RequestMarketDataType`, for replay on reconnect.
+    pub(crate) fn remember_market_data_type(&self, packet: Vec<u8>) {
+        *self.market_data_type_request.lock().unwrap() = Some(packet);
+    }
+
+    /// Re-send the remembered market data type to the new session. No-op
+    /// until `remember_market_data_type` has been called.
+    async fn replay_market_data_type(&self) -> Result<(), Error> {
+        let packet = self.market_data_type_request.lock().unwrap().clone();
+        match packet {
+            Some(packet) => self.write_message(&packet).await,
+            None => Ok(()),
+        }
     }
 
     /// Write a protobuf message to the connection
@@ -260,8 +276,7 @@ impl<S: AsyncStream> AsyncConnection<S> {
 
     // asks server to start processing messages
     pub(crate) async fn start_api(&self) -> Result<(), Error> {
-        let server_version = self.server_version();
-        let data = self.connection_handler.format_start_api(self.client_id, server_version);
+        let data = self.connection_handler.format_start_api(self.client_id);
         self.write_raw(&data).await?;
         Ok(())
     }
@@ -272,10 +287,9 @@ impl<S: AsyncStream> AsyncConnection<S> {
 
         let mut attempts = 0;
         let ctx = self.handshake_context();
-        let server_version = self.server_version();
         loop {
             let mut message = self.read_message().await?;
-            let info = self.connection_handler.parse_account_info(server_version, &mut message, &ctx)?;
+            let info = self.connection_handler.parse_account_info(&mut message, &ctx)?;
 
             attempts += 1;
             if account_info.merge(info) || attempts > MAX_ACCOUNT_INFO_ATTEMPTS {

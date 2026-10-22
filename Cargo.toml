@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "ibapi"
-version = "5.0.0"
+version = "5.2.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Wil Boayue <wil@wsblabs.com>"]
@@ -211,6 +211,11 @@ path = "examples/async/wait_for_fill.rs"
 required-features = ["async"]
 
 [[example]]
+name = "async_wait_for_bracket"
+path = "examples/async/wait_for_bracket.rs"
+required-features = ["async"]
+
+[[example]]
 name = "async_realtime_bars"
 path = "examples/async/realtime_bars.rs"
 required-features = ["async"]
@@ -251,8 +256,8 @@ path = "examples/async/tick_by_tick_last.rs"
 required-features = ["async"]
 
 [[example]]
-name = "async_historical_ticks_midpoint"
-path = "examples/async/historical_ticks_midpoint.rs"
+name = "async_historical_ticks_mid_point"
+path = "examples/async/historical_ticks_mid_point.rs"
 required-features = ["async"]
 
 [[example]]
@@ -263,11 +268,6 @@ required-features = ["async"]
 [[example]]
 name = "async_histogram_data"
 path = "examples/async/histogram_data.rs"
-required-features = ["async"]
-
-[[example]]
-name = "async_test_multiple_calls"
-path = "examples/async/test_multiple_calls.rs"
 required-features = ["async"]
 
 # Additional async examples
@@ -367,8 +367,8 @@ path = "examples/async/scanner_subscription_complex.rs"
 required-features = ["async"]
 
 [[example]]
-name = "async_test_clone_subscription"
-path = "examples/async/test_clone_subscription.rs"
+name = "async_subscription_fan_out"
+path = "examples/async/subscription_fan_out.rs"
 required-features = ["async"]
 
 # Sync-only examples
@@ -470,6 +470,11 @@ required-features = ["sync"]
 [[example]]
 name = "wait_for_fill"
 path = "examples/sync/wait_for_fill.rs"
+required-features = ["sync"]
+
+[[example]]
+name = "wait_for_bracket"
+path = "examples/sync/wait_for_bracket.rs"
 required-features = ["sync"]
 
 [[example]]
@@ -653,8 +658,8 @@ path = "examples/sync/tick_by_tick_last.rs"
 required-features = ["sync"]
 
 [[example]]
-name = "tick_by_tick_midpoint"
-path = "examples/sync/tick_by_tick_midpoint.rs"
+name = "tick_by_tick_mid_point"
+path = "examples/sync/tick_by_tick_mid_point.rs"
 required-features = ["sync"]
 
 [[example]]

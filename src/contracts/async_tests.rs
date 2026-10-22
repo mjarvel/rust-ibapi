@@ -423,7 +423,7 @@ async fn request_future_contract_details() {
 
 #[tokio::test]
 async fn test_cancel_contract_details() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::CANCEL_CONTRACT_DATA);
 
     let result = client.cancel_contract_details(42).await;
@@ -508,6 +508,25 @@ async fn market_rule_returns_eof_on_empty_stream() {
 
     let err = client.market_rule(26).await.unwrap_err();
     assert!(matches!(err, crate::Error::UnexpectedEndOfStream), "got {err:?}");
+}
+
+#[tokio::test]
+async fn market_rule_skips_another_rule_ids_frame() {
+    use crate::testdata::builders::contracts::market_rule;
+
+    // A concurrent market_rule(239) was answered first; every live
+    // market_rule receives that frame too.
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(IncomingMessages::MarketRule, market_rule(239).increment(0.0, 0.05).encode_proto()),
+        proto_response(IncomingMessages::MarketRule, market_rule(26).increment(0.0, 0.01).encode_proto()),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::MARKET_RULES);
+
+    let rule = client.market_rule(26).await.expect("market_rule failed");
+    assert_eq!(rule.market_rule_id, 26);
+    assert_eq!(rule.price_increments.len(), 1);
+    assert_eq!(rule.price_increments[0].increment, 0.01);
+    assert_eq!(request_message_count(&message_bus), 1);
 }
 
 #[tokio::test]

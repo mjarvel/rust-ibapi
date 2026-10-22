@@ -314,7 +314,6 @@ pub(crate) async fn historical_snapshot_subscription_once(
         what_to_show,
         trading_hours.use_rth(),
         false,
-        &Vec::<crate::contracts::TagValue>::default(),
     )?;
 
     builder.send::<HistoricalSnapshotUpdate>(request).await
@@ -342,7 +341,6 @@ pub(crate) async fn historical_data_once(
         what_to_show,
         trading_hours.use_rth(),
         false,
-        &Vec::<crate::contracts::TagValue>::default(),
     )?;
 
     let mut subscription = builder.send_raw(request).await?;
@@ -377,7 +375,6 @@ pub(crate) async fn historical_data_stream(
         what_to_show,
         trading_hours.use_rth(),
         true, // keep_up_to_date — the whole point of .stream()
-        &Vec::<crate::contracts::TagValue>::default(),
     )?;
 
     builder.send_capped::<HistoricalBarUpdate>(request, buffer_limit).await
@@ -424,17 +421,7 @@ pub(crate) async fn historical_schedule(
     request_helpers::one_shot_by_request_id(
         client,
         |request_id| {
-            encoders::encode_request_historical_data(
-                request_id,
-                contract,
-                end_date,
-                duration,
-                BarSize::Day,
-                WhatToShow::Schedule,
-                true,
-                false,
-                &Vec::<crate::contracts::TagValue>::default(),
-            )
+            encoders::encode_request_historical_data(request_id, contract, end_date, duration, BarSize::Day, WhatToShow::Schedule, true, false)
         },
         expect_proto(decoders::decode_historical_schedule_proto),
     )

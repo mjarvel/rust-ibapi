@@ -638,3 +638,74 @@ fn test_unknown_message_type_routes_by_message_type() {
     assert_eq!(message.message_type(), IncomingMessages::NotValid);
     assert_eq!(determine_routing(&message), RoutingDecision::ByMessageType(IncomingMessages::NotValid));
 }
+
+/// Every order-scoped type must route by order id, ahead of the request-id
+/// arm. The async bus has no fallback that would forward one of these to the
+/// order-update stream from shared routing. Each frame carries an int32 at
+/// proto tag 1, which `request_id()` reads for `OpenOrder`, `ExecutionData`
+/// and `ExecutionDataEnd`, so the request-id arm would claim them if it ran
+/// first.
+#[test]
+fn test_order_message_types_route_by_order_id() {
+    let id_at_tag_1 = crate::proto::ExecutionDetailsEnd { req_id: Some(7) }.encode_to_vec();
+    let order_types = [
+        IncomingMessages::OrderStatus,
+        IncomingMessages::OrderBound,
+        IncomingMessages::OpenOrder,
+        IncomingMessages::OpenOrderEnd,
+        IncomingMessages::CompletedOrder,
+        IncomingMessages::CompletedOrdersEnd,
+        IncomingMessages::ExecutionData,
+        IncomingMessages::ExecutionDataEnd,
+        IncomingMessages::CommissionsReport,
+    ];
+    for message_type in order_types {
+        let message = proto_response(message_type, id_at_tag_1.clone());
+        let routing = determine_routing(&message);
+        assert!(
+            matches!(routing, RoutingDecision::ByOrderId(_)),
+            "{message_type:?}: expected ByOrderId, got {routing:?}"
+        );
+    }
+}
+
+#[test]
+fn test_order_routing_strategy_for_own_and_foreign_frames() {
+    use IncomingMessages as M;
+    use OrderRoutingStrategy as S;
+    let cases = [
+        (M::OpenOrder, S::OrderAndShared, S::SharedOnly),
+        (M::OrderStatus, S::OrderAndShared, S::SharedOnly),
+        (M::ExecutionData, S::ExecutionData, S::ByRequestId),
+        (M::OrderBound, S::OrderUpdateOnly, S::Ignore),
+        // No client id on the wire: never foreign, listed for completeness.
+        (M::CommissionsReport, S::ByExecutionId, S::ByExecutionId),
+        (M::ExecutionDataEnd, S::ExecutionDataEnd, S::ExecutionDataEnd),
+        (M::CompletedOrder, S::SharedOnly, S::SharedOnly),
+        (M::OpenOrderEnd, S::SharedOnly, S::SharedOnly),
+    ];
+    for (message_type, own, foreign) in cases {
+        assert_eq!(order_routing_strategy(message_type, false), own, "{message_type:?} own");
+        assert_eq!(order_routing_strategy(message_type, true), foreign, "{message_type:?} foreign");
+    }
+}
+
+#[test]
+fn test_is_foreign_compares_client_ids() {
+    let status = |client_id: Option<i32>| {
+        let body = crate::proto::OrderStatus {
+            order_id: Some(7),
+            client_id,
+            ..Default::default()
+        };
+        proto_response(IncomingMessages::OrderStatus, body.encode_to_vec())
+    };
+    let cases = [
+        ("same client", Some(28), false),
+        ("other client", Some(29), true),
+        ("no client id", None, false),
+    ];
+    for (name, client_id, expected) in cases {
+        assert_eq!(is_foreign(&status(client_id), 28), expected, "{name}");
+    }
+}

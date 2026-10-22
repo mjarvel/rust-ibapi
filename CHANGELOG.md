@@ -19,9 +19,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Historical `fetch_once` (sync/async) requires `HistoricalDataEnd` and never
   retries connection resets. Both fetch entry points share upstream completion
   validation; the ordinary `fetch` reset-retry policy remains unchanged.
+## [5.2.0] - 2026-10-20
 
 ### Added
 
+- `examples/{sync,async}/wait_for_bracket.rs`: wait for every leg of a bracket order with three `wait_for_fill` calls sharing one deadline (#993).
+- `ContractDetails::settlement_method`: how the product settles on expiry (`"Physical"` or `"Cash"`).
+- `Order::conditions_include_overnight`: evaluate order conditions during the OVERNIGHT session (with `include_overnight`). Needs server version 226 (`server_versions::CONDITIONS_INCLUDE_OVERNIGHT`); older servers reject the order with `Error::ServerVersion`. The client now advertises max server version 226.
+
+### Changed
+
+- Dropping a clone of an async `Subscription` no longer cancels the request for the other clones: the request is cancelled when the last clone is dropped, and a shared stream's clones release their count then. Previously the first clone dropped wrote TWS's cancel, and the remaining clones waited forever for frames that no longer came. `cancel()` on any clone still ends the request for every clone (#1049).
+- Examples renamed: `v2_contract_builder` → `contract_builders`, `async_historical_ticks_midpoint` → `async_historical_ticks_mid_point`, `tick_by_tick_midpoint` → `tick_by_tick_mid_point` (matching `.mid_point()`), `async_test_clone_subscription` → `async_subscription_fan_out` (rewritten as a fan-out example). `async_test_multiple_calls` removed (#1041). `async_historical_ticks_mid_point` no longer fails with TWS error 10187: its second request now has an end time, and its first starts three days back instead of at a 2024 date older than IBKR's tick history.
+- `wait_for_fill` on an order this client has no status for asks TWS for this client's open orders (`open_orders`) before waiting, so an order placed on an earlier connection and still working is found instead of timing out. It reads that reply to its end before returning, so a later `open_orders` cannot end on it; this can add a round trip to the timeout. With client id 0, that request also binds manual TWS orders to the client (#993).
+- `wait_for_fill` on an order missing from that open-orders reply looks it up in `completed_orders` and, if found, ends at once with `Filled` or `Ended`, so an order that finished before this connection no longer waits out the timeout. The status is built from the completed order: its fill prices (`average_fill_price`, `last_fill_price`) are `None` (#1020).
+
+### Fixed
+
+- Async `Subscription::cancel()` wakes clones already waiting in `next()`, which then yield `Err(Error::Cancelled)`. Previously a waiting clone of an id-routed subscription (market data, for example) waited until the next frame, which after the cancel never came, so a task reading it could hang forever (#1047).
+- One-shot requests answered on a shared channel (`managed_accounts`, `server_time`, `family_codes`, `request_fa`, `next_valid_order_id` and the other request-id-less calls) fail with `Error::Timeout` after 30 seconds instead of blocking forever when TWS never answers (#1029).
+- `request_fa` returns the dataset it asked for. Previously, with a `request_fa` for another dataset in flight, it could return that dataset's `FaConfig`. Likewise `market_rule` returns the rule it asked for, not a concurrent `market_rule`'s (#1029).
+- Another client's order frames no longer reach this client's order routes, `order_update_stream`, `wait_for_fill` or `order_status_stream`. Order ids are unique per client only, so with `all_open_orders` (or a master client id) another client's `OpenOrder`/`OrderStatus` for an id this client also used went to this client's `place_order` subscription and could end a wait with that order's fill or cancel, and `all_open_orders` came back without it. Those frames now go only to `all_open_orders`; another client's executions still answer an `executions()` request. With a master client id, `order_update_stream` no longer reports other clients' orders: use `all_open_orders` and `executions` for those (#993, #1021).
+- `open_orders`, `all_open_orders` and `auto_open_orders` include this client's orders that have a live `place_order` subscription. Previously that subscription took their `OpenOrder`/`OrderStatus` frames and the open-orders reply came back without them, so `wait_for_fill` on such an order also sent a needless `completed_orders` request. Those frames now reach both; the `place_order` subscription receives the same frames as before. `auto_open_orders` now also sees updates for those orders (#1033).
+- After a reconnect, `wait_for_fill` no longer trusts a working order's cached status: TWS does not replay what happened while disconnected, so the cache keeps only statuses of orders that ended (and rejections), and the wait looks other orders up again. Previously an order cached as `Submitted` that filled during the outage waited out the timeout. A new `order_status_stream` on such an order starts empty until its next status (#1031).
+- The market data type set with `switch_market_data_type` now survives an automatic reconnect: TWS does not keep it across reconnects, and the client re-sends it before the `TRANSPORT_RECONNECT_CODE` notice. Previously a subscription on the new session without a realtime entitlement got error 354 or the 10089 advisory instead of delayed ticks (#1016).
+- The blocking client no longer logs `error sending notification` at shutdown, or on an item arriving, for a subscription dropped just before (#999).
+
+## [5.1.0] - 2026-10-11
+
+### Added
+
+- `Client::wait_for_fill(order_id, timeout)` (async and blocking) waits until an order fills or ends and returns `orders::OrderOutcome`: `Filled`, `Ended` (cancelled or inactive first), `Rejected` with TWS's error when TWS refuses the order without a status (e.g. 110, a price off the minimum tick), or `TimedOut` with the last status seen; a timeout leaves the order working. It answers from the statuses this client has seen since connecting, so an order placed by another client, or one that finished before this connection, waits out the timeout. See `examples/{sync,async}/wait_for_fill.rs` (#951).
+- `Client::order_status_stream(order_id)` (async and blocking): the `OrderStatus` updates for one order, starting with the latest status this client has seen. A rejection without a status is yielded as `Err(Error::Notice)`, ending the stream. Nothing is sent to TWS (#951).
+- `OrderStatus::outcome()`, the rule `wait_for_fill` uses: `Filled` for status `Filled` or nothing remaining after a fill, `Ended` for a terminal status, otherwise `None`. `OrderOutcome` is in the prelude (#951).
 - `Client::account_summary_snapshots(&group, tags, quiet)` (async and blocking) wraps `account_summary` and yields `AccountSummarySnapshot`, the latest value of every row by account, tag and currency. TWS sends one `End` after the first snapshot and none after the rows it pushes later, so a snapshot completes at an `End` or once no row has arrived for `quiet`, and only when a row changed a value. The blocking type is at `client::blocking::AccountSummarySnapshots` when both features are enabled (#957).
 - `Subscription::next_batch(quiet)` (async and blocking) returns the items that arrive together, closed by an end marker or by `quiet` without an item; for streams that dump then push without an end marker (account summary, account updates, positions and their multi variants). `account_summary_snapshots` is built on it (#977).
 - `AccountSummarySnapshot::apply` folds rows for callers with their own batching; `AccountSummarySnapshots::cancel` (async and blocking) cancels before resubscribing.
@@ -393,7 +423,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions up to and including [3.0.1] predate this changelog; see the
 [GitHub Releases page](https://github.com/wboayue/rust-ibapi/releases) for their notes.
 
-[Unreleased]: https://github.com/wboayue/rust-ibapi/compare/v5.0.0...HEAD
+[Unreleased]: https://github.com/wboayue/rust-ibapi/compare/v5.2.0...HEAD
+[5.2.0]: https://github.com/wboayue/rust-ibapi/compare/v5.1.0...v5.2.0
+[5.1.0]: https://github.com/wboayue/rust-ibapi/compare/v5.0.0...v5.1.0
 [5.0.0]: https://github.com/wboayue/rust-ibapi/compare/v4.2.0...v5.0.0
 [4.2.0]: https://github.com/wboayue/rust-ibapi/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/wboayue/rust-ibapi/compare/v4.0.1...v4.1.0

@@ -18,6 +18,9 @@ use super::*;
 impl Client {
     /// TWS's current time. TWS is synchronized with the server (not local computer) using NTP and this function will receive the current time in TWS.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -37,6 +40,10 @@ impl Client {
     }
 
     /// Requests the current server time with millisecond precision.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -345,6 +352,9 @@ impl Client {
 
     /// Requests the accounts to which the logged user has access to.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -366,6 +376,10 @@ impl Client {
     }
 
     /// Get current [FamilyCode]s for all accessible accounts.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -428,6 +442,9 @@ impl Client {
     /// # Arguments
     /// * `fa_data_type` - which FA dataset to fetch.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -440,11 +457,11 @@ impl Client {
     /// println!("{}", cfg.xml);
     /// ```
     pub fn request_fa(&self, fa_data_type: FaDataType) -> Result<FaConfig, Error> {
-        request_helpers::blocking::one_shot_shared(
+        request_helpers::blocking::one_shot_shared_matching(
             self,
             OutgoingMessages::RequestFA,
-            || encoders::encode_request_fa(fa_data_type as i32),
-            expect_proto(decoders::decode_receive_fa_proto),
+            || encoders::encode_request_fa(fa_data_type),
+            decoders::receive_fa_for(fa_data_type),
         )
     }
 
@@ -468,7 +485,7 @@ impl Client {
     pub fn replace_fa(&self, fa_data_type: FaDataType, xml: &str) -> Result<ReplaceFaResult, Error> {
         request_helpers::blocking::one_shot_by_request_id(
             self,
-            |request_id| encoders::encode_replace_fa(request_id, fa_data_type as i32, xml),
+            |request_id| encoders::encode_replace_fa(request_id, fa_data_type, xml),
             expect_proto(decoders::decode_replace_fa_end_proto),
         )
     }
@@ -486,7 +503,7 @@ impl Client {
     /// client.set_server_log_level(ServerLogLevel::Detail).expect("request failed");
     /// ```
     pub fn set_server_log_level(&self, log_level: ServerLogLevel) -> Result<(), Error> {
-        let message = encoders::encode_set_server_log_level(log_level as i32)?;
+        let message = encoders::encode_set_server_log_level(log_level)?;
         self.send_message(message)?;
         Ok(())
     }
@@ -494,6 +511,9 @@ impl Client {
     /// Initiate a TWS extension verification handshake.
     ///
     /// Most users will not call this directly; it is part of the IB Linking flow.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
     ///
     /// # Examples
     ///
@@ -515,6 +535,9 @@ impl Client {
     }
 
     /// Continue a TWS extension verification handshake by sending the API response data.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
     ///
     /// # Examples
     ///

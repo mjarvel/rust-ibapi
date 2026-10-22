@@ -35,9 +35,7 @@
 //! shape exactly — no `.await`, [`crate::client::blocking::NoticeStream`]
 //! instead of the async one.
 
-use std::sync::Arc;
-
-use crate::connection::common::StartupMessage;
+use crate::connection::common::{ConnectionConfig, StartupCallback};
 use crate::errors::Error;
 use crate::transport::common::MAX_RECONNECT_ATTEMPTS;
 use crate::transport::rate_limiter::RateLimiter;
@@ -46,12 +44,12 @@ use crate::transport::rate_limiter::RateLimiter;
 /// [`async_impl::ClientBuilder`]. Centralizes the field set and the
 /// `InvalidArgument` validation messages so future configurators only need
 /// to be added in one place. Terminals call [`BuilderState::validate`] to
-/// extract the checked pieces.
+/// extract the checked [`ClientConfig`].
 pub(super) struct BuilderState {
     pub(super) address: Option<String>,
     pub(super) client_id: Option<i32>,
     pub(super) tcp_no_delay: bool,
-    pub(super) startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+    pub(super) startup_callback: Option<StartupCallback>,
     /// `None` means retry forever; the default is `Some(MAX_RECONNECT_ATTEMPTS)`.
     pub(super) max_reconnect_attempts: Option<u32>,
     /// `None` (the default) sends without limit.
@@ -71,36 +69,32 @@ impl Default for BuilderState {
     }
 }
 
-/// Output of [`BuilderState::validate`]: same fields with `address` and
-/// `client_id` unwrapped. A struct (rather than a tuple) because the wide
-/// `Fn` trait object trips `clippy::type_complexity` in tuple form.
-pub(crate) struct ValidatedPieces {
-    pub(crate) address: String,
-    pub(crate) client_id: i32,
-    pub(crate) tcp_no_delay: bool,
-    pub(crate) startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
-    /// `None` means retry forever.
-    pub(crate) max_reconnect_attempts: Option<u32>,
+/// Output of [`BuilderState::validate`]: the connection settings with
+/// `address` and `client_id` unwrapped, plus the client-side rate limiter.
+pub(crate) struct ClientConfig {
+    pub(crate) connection: ConnectionConfig,
     pub(crate) rate_limiter: Option<RateLimiter>,
 }
 
 impl BuilderState {
-    pub(super) fn validate(self) -> Result<ValidatedPieces, Error> {
+    pub(super) fn validate(self) -> Result<ClientConfig, Error> {
         if self.rate_limiter.as_ref().is_some_and(|limiter| limiter.messages_per_second() == 0) {
             return Err(Error::InvalidArgument(
                 "ClientBuilder: rate_limiter must allow at least 1 message per second".into(),
             ));
         }
-        Ok(ValidatedPieces {
-            address: self
-                .address
-                .ok_or_else(|| Error::InvalidArgument("ClientBuilder: address is required".into()))?,
-            client_id: self
-                .client_id
-                .ok_or_else(|| Error::InvalidArgument("ClientBuilder: client_id is required".into()))?,
-            tcp_no_delay: self.tcp_no_delay,
-            startup_callback: self.startup_callback,
-            max_reconnect_attempts: self.max_reconnect_attempts,
+        Ok(ClientConfig {
+            connection: ConnectionConfig {
+                address: self
+                    .address
+                    .ok_or_else(|| Error::InvalidArgument("ClientBuilder: address is required".into()))?,
+                client_id: self
+                    .client_id
+                    .ok_or_else(|| Error::InvalidArgument("ClientBuilder: client_id is required".into()))?,
+                tcp_no_delay: self.tcp_no_delay,
+                startup_callback: self.startup_callback,
+                max_reconnect_attempts: self.max_reconnect_attempts,
+            },
             rate_limiter: self.rate_limiter,
         })
     }
@@ -306,7 +300,7 @@ pub mod sync_impl {
         }
 
         fn connect_with_broadcaster(self, broadcaster: Arc<NoticeBroadcaster>) -> Result<Client, Error> {
-            Client::connect_with_pieces(self.state.validate()?, broadcaster)
+            Client::connect_with_config(self.state.validate()?, broadcaster)
         }
     }
 }
@@ -573,7 +567,7 @@ pub mod async_impl {
                 return Err(Error::InvalidArgument("ClientBuilder: channel_capacity must be at least 1".into()));
             }
             let channel_capacity = self.channel_capacity.unwrap_or(BROADCAST_CHANNEL_CAPACITY);
-            Client::connect_with_pieces(self.state.validate()?, sender, channel_capacity).await
+            Client::connect_with_config(self.state.validate()?, sender, channel_capacity).await
         }
     }
 }

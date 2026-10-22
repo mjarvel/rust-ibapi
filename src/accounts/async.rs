@@ -86,6 +86,9 @@ impl Client {
 
     /// Fetch the account family codes registered with the broker.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -397,6 +400,9 @@ impl Client {
 
     /// Fetch the list of accounts accessible to the current user.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -423,6 +429,9 @@ impl Client {
 
     /// Query the current server time reported by TWS or IB Gateway.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -446,6 +455,10 @@ impl Client {
     }
 
     /// Query the current server time in milliseconds reported by TWS or IB Gateway.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -517,6 +530,9 @@ impl Client {
     /// # Arguments
     /// * `fa_data_type` - which FA dataset to fetch.
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -531,11 +547,11 @@ impl Client {
     /// }
     /// ```
     pub async fn request_fa(&self, fa_data_type: FaDataType) -> Result<FaConfig, Error> {
-        request_helpers::one_shot_shared(
+        request_helpers::one_shot_shared_matching(
             self,
             OutgoingMessages::RequestFA,
-            move || encoders::encode_request_fa(fa_data_type as i32),
-            expect_proto(decoders::decode_receive_fa_proto),
+            move || encoders::encode_request_fa(fa_data_type),
+            decoders::receive_fa_for(fa_data_type),
         )
         .await
     }
@@ -562,7 +578,7 @@ impl Client {
     pub async fn replace_fa(&self, fa_data_type: FaDataType, xml: &str) -> Result<ReplaceFaResult, Error> {
         request_helpers::one_shot_by_request_id(
             self,
-            move |request_id| encoders::encode_replace_fa(request_id, fa_data_type as i32, xml),
+            move |request_id| encoders::encode_replace_fa(request_id, fa_data_type, xml),
             expect_proto(decoders::decode_replace_fa_end_proto),
         )
         .await
@@ -583,7 +599,7 @@ impl Client {
     /// }
     /// ```
     pub async fn set_server_log_level(&self, log_level: ServerLogLevel) -> Result<(), Error> {
-        let message = encoders::encode_set_server_log_level(log_level as i32)?;
+        let message = encoders::encode_set_server_log_level(log_level)?;
         self.send_message(message).await?;
         Ok(())
     }
@@ -591,6 +607,9 @@ impl Client {
     /// Initiate a TWS extension verification handshake.
     ///
     /// Most users will not call this directly; it is part of the IB Linking flow.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
     ///
     /// # Examples
     ///
@@ -615,6 +634,9 @@ impl Client {
     }
 
     /// Continue a TWS extension verification handshake by sending the API response data.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
     ///
     /// # Examples
     ///

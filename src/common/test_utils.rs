@@ -14,21 +14,7 @@ pub mod helpers {
 
     /// Creates a test client with a specific server version
     pub fn create_test_client_with_version(server_version: i32) -> (Client, Arc<MessageBusStub>) {
-        let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
-        let client = Client::stubbed(message_bus.clone(), server_version);
-        (client, message_bus)
-    }
-
-    /// Creates a test client with specified response messages
-    pub fn create_test_client_with_responses(responses: Vec<String>) -> (Client, Arc<MessageBusStub>) {
-        let message_bus = Arc::new(MessageBusStub::with_responses(responses));
-        let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
-        (client, message_bus)
-    }
-
-    /// Creates a test client with specified response messages and server version
-    pub fn create_test_client_with_responses_and_version(responses: Vec<String>, server_version: i32) -> (Client, Arc<MessageBusStub>) {
-        let message_bus = Arc::new(MessageBusStub::with_responses(responses));
+        let message_bus = Arc::new(MessageBusStub::default());
         let client = Client::stubbed(message_bus.clone(), server_version);
         (client, message_bus)
     }
@@ -48,20 +34,7 @@ pub mod helpers {
 
     #[cfg(feature = "sync")]
     pub fn create_blocking_test_client_with_version(server_version: i32) -> (crate::client::blocking::Client, Arc<MessageBusStub>) {
-        create_blocking_test_client_with_responses_and_version(vec![], server_version)
-    }
-
-    #[cfg(feature = "sync")]
-    pub fn create_blocking_test_client_with_responses(responses: Vec<String>) -> (crate::client::blocking::Client, Arc<MessageBusStub>) {
-        create_blocking_test_client_with_responses_and_version(responses, server_versions::SIZE_RULES)
-    }
-
-    #[cfg(feature = "sync")]
-    pub fn create_blocking_test_client_with_responses_and_version(
-        responses: Vec<String>,
-        server_version: i32,
-    ) -> (crate::client::blocking::Client, Arc<MessageBusStub>) {
-        let message_bus = Arc::new(MessageBusStub::with_responses(responses));
+        let message_bus = Arc::new(MessageBusStub::default());
         let client = crate::client::blocking::Client::stubbed(message_bus.clone(), server_version);
         (client, message_bus)
     }
@@ -117,8 +90,8 @@ pub mod helpers {
     }
 
     /// Build a text-format `ResponseMessage` for use with
-    /// [`MessageBusStub::with_ordered_responses`]. Accepts pipe-delimited
-    /// builder output (`encode_pipe()`) or raw NUL-delimited literals.
+    /// [`MessageBusStub::with_ordered_responses`]. Accepts pipe-delimited or
+    /// raw NUL-delimited literals.
     pub fn text_response(s: impl Into<String>) -> crate::messages::ResponseMessage {
         crate::messages::ResponseMessage::from(&s.into().replace('|', "\0"))
     }
@@ -262,19 +235,23 @@ pub mod helpers {
     /// Proto-framed ExecutionData frame. `request_id` is at proto tag 1; the
     /// dispatcher's `order_id` / `execution_id` accessors read the nested
     /// `execution.{order_id, exec_id}` sub-message via `ExecutionDetailsMinimal`.
-    pub fn execution_data_frame(request_id: i32, order_id: i32, execution_id: &str) -> Vec<u8> {
+    pub fn execution_data_frame(client_id: i32, request_id: i32, order_id: i32, execution_id: &str) -> Vec<u8> {
         use crate::testdata::builders::ResponseProtoEncoder;
         let response = crate::testdata::builders::orders::execution_data()
+            .client_id(client_id)
             .request_id(request_id)
             .order_id(order_id)
             .execution_id(execution_id);
         binary_proto(crate::messages::IncomingMessages::ExecutionData as i32, &response.to_proto())
     }
 
-    /// Proto-framed OrderStatus frame; `order_id` is at proto tag 1.
-    pub fn order_status_frame(order_id: i32, status: crate::orders::OrderStatusKind) -> Vec<u8> {
+    /// Proto-framed OrderStatus frame for `client_id`'s order; `order_id` is at proto tag 1.
+    pub fn order_status_frame(client_id: i32, order_id: i32, status: crate::orders::OrderStatusKind) -> Vec<u8> {
         use crate::testdata::builders::ResponseProtoEncoder;
-        let response = crate::testdata::builders::orders::order_status().order_id(order_id).status(status);
+        let response = crate::testdata::builders::orders::order_status()
+            .client_id(client_id)
+            .order_id(order_id)
+            .status(status);
         binary_proto(crate::messages::IncomingMessages::OrderStatus as i32, &response.to_proto())
     }
 
@@ -514,8 +491,8 @@ pub mod wire_enum {
     /// negative end guards a `From<i32>` that reaches for `.abs()` or `as u32`.
     const PROBE_CODES: std::ops::RangeInclusive<i32> = -8..=64;
 
-    /// Assert `From<i32>`, `From<T> for i32`, and `ToField` agree on a
-    /// hand-written `(variant, code)` table for an integer-coded wire enum,
+    /// Assert `From<i32>` and `From<T> for i32` agree on a hand-written
+    /// `(variant, code)` table for an integer-coded wire enum,
     /// **and that the table lists every code the enum models**.
     ///
     /// The completeness half is what the `_every_wire_code` in the callers'
@@ -526,16 +503,15 @@ pub mod wire_enum {
     /// (docs/rules/wire/enum-typing.md).
     ///
     /// Listing `Unknown(code)` rows in the table is still useful — only those
-    /// exercise `Into<i32>` and `ToField` on the payload variant — and costs
+    /// exercise `Into<i32>` on the payload variant — and costs
     /// nothing: a listed code is skipped by the probe that would re-derive it.
     pub fn check_wire_code_round_trip<T>(table: &[(T, i32)], unknown: fn(i32) -> T)
     where
-        T: From<i32> + Into<i32> + Copy + PartialEq + std::fmt::Debug + crate::ToField,
+        T: From<i32> + Into<i32> + Copy + PartialEq + std::fmt::Debug,
     {
         for &(variant, code) in table {
             assert_eq!(T::from(code), variant, "From({code})");
             assert_eq!(variant.into(), code, "i32::from({variant:?})");
-            assert_eq!(variant.to_field(), code.to_string(), "ToField for {variant:?}");
         }
 
         for code in PROBE_CODES {

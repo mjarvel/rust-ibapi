@@ -284,7 +284,7 @@ fn test_bus_send_order_request() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let order = order_builder::market_order(Action::Buy, 100.0);
     let contract = &Contract::stock("AAPL").build();
     let request = encode_place_order(5, contract, &order)?;
@@ -367,7 +367,7 @@ fn test_connection_establish_connection() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let events = vec![
         Exchange::simple(&handshake_request(&handler), &[&format!("{sv}|20250323 22:21:01 Greenwich Mean Time|")]),
         Exchange::new(
@@ -391,7 +391,7 @@ fn test_reconnect_failed() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let events = vec![
         Exchange::simple(&handshake_request(&handler), &[&format!("{sv}|20250323 22:21:01 Greenwich Mean Time|")]),
         Exchange::new(
@@ -405,7 +405,7 @@ fn test_reconnect_failed() -> Result<(), Error> {
     ];
     let socket = MockSocket::new(events, MAX_RECONNECT_ATTEMPTS as usize + 1);
 
-    let connection = Connection::stubbed(socket, 28);
+    let connection = Connection::stubbed(socket, CLIENT_ID);
     connection.establish_connection()?;
 
     let _ = connection.read_message();
@@ -423,7 +423,7 @@ fn test_reconnect_success() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let events = vec![
         Exchange::simple(&handshake_request(&handler), &[&format!("{sv}|20250323 22:21:01 Greenwich Mean Time|")]),
         Exchange::new(
@@ -439,7 +439,7 @@ fn test_reconnect_success() -> Result<(), Error> {
     ];
     let socket = MockSocket::new(events, MAX_RECONNECT_ATTEMPTS as usize - 1);
 
-    let connection = Connection::stubbed(socket, 28);
+    let connection = Connection::stubbed(socket, CLIENT_ID);
     connection.establish_connection()?;
 
     let _ = connection.read_message();
@@ -452,7 +452,7 @@ fn test_client_reconnect() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let managed_req = crate::accounts::common::encoders::encode_request_managed_accounts().unwrap();
     let events = vec![
         Exchange::simple(&handshake_request(&handler), &[&format!("{sv}|20250323 22:21:01 Greenwich Mean Time|")]),
@@ -470,7 +470,7 @@ fn test_client_reconnect() -> Result<(), Error> {
     connection.establish_connection()?;
     let server_version = connection.server_version();
     let bus = Arc::new(TcpMessageBus::new(connection)?);
-    bus.process_messages(server_version)?;
+    bus.process_messages()?;
     let client = Client::stubbed(bus.clone(), server_version);
 
     client.managed_accounts()?;
@@ -486,7 +486,7 @@ fn test_is_connected_stays_true_after_reconnect() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let events = vec![
         Exchange::simple(&handshake_request(&handler), &[&format!("{sv}|20250323 22:21:01 Greenwich Mean Time|")]),
         Exchange::new(
@@ -524,7 +524,7 @@ fn test_reconnect_raises_order_ids_from_handshake() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let events = vec![
         Exchange::simple(&handshake_request(&handler), &[&format!("{sv}|20250323 22:21:01 Greenwich Mean Time|")]),
         Exchange::new(
@@ -567,7 +567,7 @@ fn test_send_request_after_disconnect() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let request_id = RequestId::nth(0);
     let packet = encode_request_contract_data(sv, request_id.raw(), &Contract::stock("AAPL").build())?;
 
@@ -614,7 +614,7 @@ fn test_request_before_disconnect_raises_error() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let request_id = RequestId::nth(0);
     let packet = encode_request_contract_data(sv, request_id.raw(), &Contract::stock("AAPL").build())?;
 
@@ -668,7 +668,7 @@ fn test_request_during_disconnect_raises_error() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let request_id = RequestId::nth(0);
     let packet = encode_request_contract_data(sv, request_id.raw(), &Contract::stock("AAPL").build())?;
 
@@ -710,7 +710,7 @@ fn test_contract_details_disconnect_raises_error() -> Result<(), Error> {
     let handler = ConnectionHandler::default();
     let sv = handler.min_version;
 
-    let start_api_bytes = handler.format_start_api(28, sv);
+    let start_api_bytes = handler.format_start_api(28);
     let contract = &Contract::stock("AAPL").build();
 
     // The stubbed client allocates the first request id.
@@ -732,7 +732,7 @@ fn test_contract_details_disconnect_raises_error() -> Result<(), Error> {
     connection.establish_connection()?;
     let server_version = connection.server_version();
     let bus = Arc::new(TcpMessageBus::new(connection)?);
-    bus.process_messages(server_version)?;
+    bus.process_messages()?;
     let client = Client::stubbed(bus.clone(), server_version);
 
     match client.contract_details(contract) {
@@ -768,12 +768,16 @@ fn test_request_encoding_roundtrip() {
 // `MemoryStream` lets tests push response frames freely and drive
 // `bus.dispatch()` directly.
 
+/// The client id the test buses connect with. Order fixtures default to
+/// client 100, so a frame for this client's own order sets it explicitly.
+const CLIENT_ID: i32 = 28;
+
 /// Wrap a fresh `MemoryStream` in a stubbed `TcpMessageBus`. Pins
 /// `server_version` to the current floor so `parse_raw_message` produces
 /// binary-text-payload frames from `body()` inputs.
 fn make_bus() -> (MemoryStream, Arc<TcpMessageBus<MemoryStream>>) {
     let stream = MemoryStream::default();
-    let connection = Connection::stubbed(stream.clone(), 28);
+    let connection = Connection::stubbed(stream.clone(), CLIENT_ID);
     connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(TcpMessageBus::new(connection).unwrap());
     (stream, bus)
@@ -853,9 +857,9 @@ fn test_order_id_correlation_with_interleaved_responses() -> Result<(), Error> {
 
 /// Shared-channel fan-out: `RequestOpenOrders`, `RequestAllOpenOrders`, and
 /// `RequestAutoOpenOrders` all map to `[OpenOrder, OrderStatus, OpenOrderEnd]`
-/// in `CHANNEL_MAPPINGS`. With no `send_order_request` subscriber for the
-/// incoming order_id, the `OrderOrShared` strategy in `process_orders` fans
-/// the message out to every shared subscriber registered for `OpenOrder`.
+/// in `CHANNEL_MAPPINGS`. The `OrderAndShared` strategy in `process_orders`
+/// fans every `OpenOrder` out to each shared subscriber, with or without an
+/// order id.
 #[test]
 fn test_shared_channel_fan_out_for_open_orders() -> Result<(), Error> {
     let (stream, bus) = make_bus();
@@ -864,21 +868,60 @@ fn test_shared_channel_fan_out_for_open_orders() -> Result<(), Error> {
     let sub_all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, &[])?;
     let sub_auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, &[])?;
 
-    // OpenOrder carries `order_id` at proto tag 1; no matching order subscription
-    // means the OrderOrShared strategy falls back to fan-out across shared subs.
+    for order_id in [Some(42), None] {
+        stream.push_inbound(binary_proto(
+            crate::messages::IncomingMessages::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id,
+                ..Default::default()
+            },
+        ));
+        bus.dispatch()?;
+
+        for (name, sub) in [("open", &sub_open), ("all", &sub_all), ("auto", &sub_auto)] {
+            let msg = sub.next_timeout(TICK).unwrap_or_else(|| panic!("sub_{name} got no message"))?;
+            assert_eq!(msg.message_type(), crate::messages::IncomingMessages::OpenOrder);
+            assert_eq!(msg.order_id(), order_id);
+        }
+    }
+    Ok(())
+}
+
+/// An order with a live `send_order_request` route still answers an
+/// open-orders request: `OpenOrder` and `OrderStatus` reach both (#1033).
+#[test]
+fn test_routed_order_also_reaches_open_orders() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+
+    let order = bus.send_order_request(OrderId::from(42), &[])?;
+    let open_orders = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+
     stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::OpenOrder as i32,
+        M::OpenOrder as i32,
         &crate::proto::OpenOrder {
             order_id: Some(42),
             ..Default::default()
         },
     ));
+    stream.push_inbound(binary_proto(
+        M::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(42),
+            status: Some("Submitted".into()),
+            ..Default::default()
+        },
+    ));
+    bus.dispatch()?;
     bus.dispatch()?;
 
-    for (name, sub) in [("open", &sub_open), ("all", &sub_all), ("auto", &sub_auto)] {
-        let msg = sub.next_timeout(TICK).unwrap_or_else(|| panic!("sub_{name} got no message"))?;
-        assert_eq!(msg.message_type(), crate::messages::IncomingMessages::OpenOrder);
-        assert_eq!(msg.order_id(), Some(42));
+    for (name, sub) in [("order", &order), ("open orders", &open_orders)] {
+        for expected in [M::OpenOrder, M::OrderStatus] {
+            let msg = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no {expected:?}"))?;
+            assert_eq!(msg.message_type(), expected, "{name}");
+            assert_eq!(msg.order_id(), Some(42), "{name}");
+        }
+        assert!(sub.try_next().is_none(), "{name} received an extra message");
     }
     Ok(())
 }
@@ -952,7 +995,7 @@ fn test_cleanup_thread_exits_promptly_on_shutdown() {
 #[test]
 fn test_dispatcher_thread_exits_promptly_on_shutdown() {
     let (_stream, bus) = make_bus();
-    bus.process_messages(0).expect("process_messages");
+    bus.process_messages().expect("process_messages");
 
     let start = Instant::now();
     bus.ensure_shutdown();
@@ -2205,7 +2248,7 @@ fn test_execution_data_routes_to_order_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-1"));
     bus.dispatch()?;
 
     let msg = sub.next_timeout(TICK).expect("order sub got no message")?;
@@ -2220,7 +2263,7 @@ fn test_execution_data_falls_back_to_request_channel() -> Result<(), Error> {
     let request_id = RequestId::nth(99);
     let sub = bus.send_request(request_id, &[])?;
 
-    stream.push_inbound(execution_data_frame(request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1"));
     bus.dispatch()?;
 
     let msg = sub.next_timeout(TICK).expect("request sub got no message")?;
@@ -2273,7 +2316,7 @@ fn test_commission_report_routes_via_execution_id_mapping() -> Result<(), Error>
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-abc"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-abc"));
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::CommissionsReport as i32,
         &crate::proto::CommissionAndFeesReport {
@@ -2667,7 +2710,7 @@ fn test_execution_data_orphan_dropped() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let unrelated = bus.send_request(RequestId::nth(42), &[])?;
 
-    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-1"));
     bus.dispatch()?;
 
     assert!(unrelated.try_next().is_none(), "unrelated sub got an orphan message");
@@ -2718,8 +2761,8 @@ fn test_execution_aliases_pruned_when_subscriptions_drop() -> Result<(), Error> 
 
     let order = bus.send_order_request(OrderId::from(7), &[])?;
     let executions = bus.send_request(RequestId::nth(99), &[])?;
-    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
-    stream.push_inbound(execution_data_frame(RequestId::nth(99).raw(), 0, "exec-request"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, 0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 0, "exec-request"));
     bus.dispatch()?;
     bus.dispatch()?;
     assert_eq!(bus.executions.len(), 2, "both executions mapped");
@@ -2747,7 +2790,7 @@ fn test_execution_aliases_pruned_on_cancel() -> Result<(), Error> {
 
     let order_id = OrderId::from(7);
     let order = bus.send_order_request(order_id, &[])?;
-    stream.push_inbound(execution_data_frame(0, 7, "exec-order"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, 0, 7, "exec-order"));
     bus.dispatch()?;
     order.cancel();
     drain_cleanup_signals(&bus);
@@ -2771,10 +2814,10 @@ fn test_stale_cleanup_keeps_newer_execution_aliases() -> Result<(), Error> {
     let handle = bus.start_cleanup_thread();
 
     let sub_a = bus.send_order_request(OrderId::from(42), &[])?;
-    stream.push_inbound(execution_data_frame(0, 42, "exec-a"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, 0, 42, "exec-a"));
     bus.dispatch()?;
     let sub_b = bus.send_order_request(OrderId::from(42), &[])?;
-    stream.push_inbound(execution_data_frame(0, 42, "exec-b"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, 0, 42, "exec-b"));
     bus.dispatch()?;
 
     drop(sub_a);
@@ -3152,6 +3195,43 @@ fn test_short_frame_body_reconnects() -> Result<(), Error> {
     Ok(())
 }
 
+/// A market data type sent through the bus is re-sent by the reconnect, on
+/// the wire before the reconnect notice: a consumer acting on the notice
+/// already sees the new session with the type applied.
+#[test]
+fn test_reconnect_replays_market_data_type_before_notice() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let notices = bus.connection.notice_broadcaster.subscribe();
+
+    let packet = crate::market_data::realtime::common::encoders::encode_request_market_data_type(crate::market_data::MarketDataType::Delayed)?;
+    bus.send_market_data_type(&packet)?;
+
+    stream.push_inbound(b"xx".to_vec());
+    for frame in helpers::handshake_frames(crate::server_versions::PROTOBUF_REST_MESSAGES_3, "EST", 5000) {
+        stream.push_inbound(frame);
+    }
+
+    bus.dispatch()?;
+
+    let notice = notices.recv_timeout(TICK).expect("no reconnect notice on the notice fan-out");
+    assert_eq!(notice.code, TRANSPORT_RECONNECT_CODE, "{notice:?}");
+
+    let handler = &bus.connection.connection_handler;
+    let expected = [
+        encode_raw_length(&packet),
+        handler.format_handshake(),
+        encode_raw_length(&handler.format_start_api(28)),
+        encode_raw_length(&packet),
+    ]
+    .concat();
+    assert_eq!(
+        stream.captured(),
+        expected,
+        "the replay must be on the wire by the time the notice is published"
+    );
+    Ok(())
+}
+
 /// Every send is refused while the session is down: nothing reaches the socket
 /// the reconnect is replacing, and nothing is registered on a channel no reset
 /// would clear again.
@@ -3298,7 +3378,10 @@ fn order_binding_reaches_updates_without_using_raw_order_id() {
     let (stream, bus) = make_bus();
     let order_sub = bus.send_order_request(OrderId::from(42), &[]).unwrap();
     let update_sub = bus.create_order_update_subscription().unwrap();
-    stream.push_inbound(binary_proto(IncomingMessages::OrderBound as i32, &order_bound().client_id(73).to_proto()));
+    stream.push_inbound(binary_proto(
+        IncomingMessages::OrderBound as i32,
+        &order_bound().client_id(CLIENT_ID).to_proto(),
+    ));
     bus.dispatch().unwrap();
     let message = update_sub.next_timeout(TICK).expect("update stream got no message").unwrap();
     assert_eq!(message.message_type(), IncomingMessages::OrderBound);
@@ -3495,6 +3578,23 @@ fn sender_hash_deliver_hands_the_item_back_when_unrouted() {
     assert!(matches!(item, Err(RoutedItem::Error(Error::Cancelled))));
 }
 
+/// A subscription dropped before its cleanup signal is processed is still
+/// registered at shutdown: failing it must not stop the others being failed.
+/// (That the failed send is silent, not warned, is unasserted: no log capture.)
+#[test]
+fn sender_hash_fail_all_skips_a_dropped_receiver_and_clears() {
+    let (routes, live, _lease) = sender_hash_route();
+    let (sender, dropped) = channel::unbounded();
+    let dropped_lease = Lease::new();
+    routes.insert(RequestId::nth(2), sender, dropped_lease.downgrade());
+    drop(dropped);
+
+    routes.fail_all(|| Error::Shutdown.into());
+
+    assert!(matches!(live.try_recv(), Ok(RoutedItem::Error(Error::Shutdown))));
+    assert!(!routes.contains(&RequestId::nth(1)) && !routes.contains(&RequestId::nth(2)));
+}
+
 #[test]
 fn sender_hash_deliver_aliased_aliases_the_route() {
     let (routes, receiver, lease) = sender_hash_route();
@@ -3668,11 +3768,26 @@ fn test_throttled_shared_subscribe_does_not_hold_up_shared_cancel() -> Result<()
 fn test_order_status_stream_starts_with_earlier_status() -> Result<(), Error> {
     let (stream, bus) = make_bus();
 
-    stream.push_inbound(order_status_frame(7, OrderStatusKind::Filled));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Filled));
     bus.dispatch()?;
 
     let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
     assert_eq!(statuses.next_timeout(TICK).expect("no status")?.order_id(), Some(7));
+    Ok(())
+}
+
+/// An order TWS refused with an error and no status (110) reaches a status
+/// stream opened afterwards, so `submit()` then `wait_for_fill` cannot miss it.
+#[test]
+fn test_order_status_stream_starts_with_earlier_rejection() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+
+    stream.push_inbound(helpers::error_frame(7, 110, "price off the tick"));
+    bus.dispatch()?;
+
+    let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
+    let item = statuses.next_timeout(TICK).expect("no item");
+    assert!(matches!(&item, Err(Error::Notice(n)) if n.code == 110), "{item:?}");
     Ok(())
 }
 
@@ -3686,7 +3801,7 @@ fn test_order_status_stream_takes_nothing_from_other_routes() -> Result<(), Erro
     let updates = bus.create_order_update_subscription()?;
     let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
 
-    stream.push_inbound(order_status_frame(7, OrderStatusKind::Submitted));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
     bus.dispatch()?;
 
     assert_eq!(statuses.next_timeout(TICK).expect("status stream got no message")?.order_id(), Some(7));
@@ -3701,7 +3816,126 @@ fn test_order_status_stream_sees_unrouted_status() -> Result<(), Error> {
     let (stream, bus) = make_bus();
 
     let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
-    stream.push_inbound(order_status_frame(7, OrderStatusKind::Submitted));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
+    bus.dispatch()?;
+
+    assert_eq!(statuses.next_timeout(TICK).expect("no status")?.order_id(), Some(7));
+    Ok(())
+}
+
+/// Order ids are unique per client only: another client's order 7 (e.g.
+/// from `all_open_orders`) is not this client's order 7.
+#[test]
+fn test_order_status_stream_ignores_other_clients_status() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+
+    let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
+    stream.push_inbound(order_status_frame(CLIENT_ID + 1, 7, OrderStatusKind::Filled));
+    bus.dispatch()?;
+
+    assert!(statuses.next_timeout(TICK).is_none(), "open stream got it");
+    let later = bus.create_order_status_subscription(OrderId::from(7))?;
+    assert!(later.next_timeout(TICK).is_none(), "later stream started with it");
+    Ok(())
+}
+
+// ---- other clients' order frames (#1021) ----
+
+fn foreign_open_order_frame(order_id: i32) -> Vec<u8> {
+    let order = crate::testdata::builders::orders::open_order()
+        .order_id(order_id)
+        .client_id(CLIENT_ID + 1);
+    binary_proto(IncomingMessages::OpenOrder as i32, &order.to_proto())
+}
+
+fn commission_frame(execution_id: &str) -> Vec<u8> {
+    binary_proto(
+        IncomingMessages::CommissionsReport as i32,
+        &crate::proto::CommissionAndFeesReport {
+            exec_id: Some(execution_id.into()),
+            ..Default::default()
+        },
+    )
+}
+
+/// Order ids are unique per client only: another client's `OpenOrder` and
+/// `OrderStatus` for an id this client also uses answer `all_open_orders`,
+/// and reach neither this client's order route nor its update stream.
+#[test]
+fn test_foreign_order_frames_reach_only_shared_channel() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+    let updates = bus.create_order_update_subscription()?;
+    let all_open = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, b"all-open-orders")?;
+
+    stream.push_inbound(foreign_open_order_frame(7));
+    stream.push_inbound(order_status_frame(CLIENT_ID + 1, 7, OrderStatusKind::Submitted));
+    bus.dispatch()?;
+    bus.dispatch()?;
+
+    let types: Vec<_> = std::iter::from_fn(|| all_open.next_timeout(TICK))
+        .map(|m| m.unwrap().message_type())
+        .collect();
+    assert_eq!(types, [IncomingMessages::OpenOrder, IncomingMessages::OrderStatus]);
+    assert!(order_route.next_timeout(TICK).is_none(), "order route got it");
+    assert!(updates.next_timeout(TICK).is_none(), "update stream got it");
+    Ok(())
+}
+
+/// Another client's execution still answers an `executions()` request (its
+/// filter can name that client), with its commission report; one TWS sends
+/// unprompted reaches neither this client's order route nor its update stream.
+#[test]
+fn test_foreign_execution_answers_requests_only() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+    let updates = bus.create_order_update_subscription()?;
+    let request_id = RequestId::nth(99);
+    let request = bus.send_request(request_id, &[])?;
+
+    stream.push_inbound(execution_data_frame(CLIENT_ID + 1, request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID + 1, -1, 7, "exec-2"));
+    for _ in 0..3 {
+        bus.dispatch()?;
+    }
+
+    let types: Vec<_> = std::iter::from_fn(|| request.next_timeout(TICK))
+        .map(|m| m.unwrap().message_type())
+        .collect();
+    assert_eq!(types, [IncomingMessages::ExecutionData, IncomingMessages::CommissionsReport]);
+    assert!(order_route.next_timeout(TICK).is_none(), "order route got it");
+    let updates: Vec<_> = std::iter::from_fn(|| updates.next_timeout(TICK))
+        .map(|m| m.unwrap().message_type())
+        .collect();
+    assert!(!updates.contains(&IncomingMessages::ExecutionData), "update stream got {updates:?}");
+    Ok(())
+}
+
+#[test]
+fn test_foreign_order_bound_is_ignored() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let updates = bus.create_order_update_subscription()?;
+
+    stream.push_inbound(binary_proto(
+        IncomingMessages::OrderBound as i32,
+        &order_bound().client_id(CLIENT_ID + 1).to_proto(),
+    ));
+    bus.dispatch()?;
+
+    assert!(updates.next_timeout(TICK).is_none());
+    Ok(())
+}
+
+/// The status in `wait_for_fill`'s open-orders snapshot reply reaches the
+/// order's status stream as well as the snapshot.
+#[test]
+fn test_order_status_stream_sees_snapshot_reply() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+
+    let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
+    let _snapshot = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, b"open-orders")?;
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
     bus.dispatch()?;
 
     assert_eq!(statuses.next_timeout(TICK).expect("no status")?.order_id(), Some(7));
@@ -3829,10 +4063,10 @@ fn test_close_during_reconnect_closes_the_new_connection() {
 /// A blocking client on a dispatching bus over loopback TCP, and the peer end.
 fn tcp_client_with_peer() -> (Client, Arc<TcpMessageBus<TcpSocket>>, std::net::TcpStream) {
     let (socket, peer, _listener) = tcp_socket_pair();
-    let connection = Connection::stubbed(socket, 28);
+    let connection = Connection::stubbed(socket, CLIENT_ID);
     connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(TcpMessageBus::new(connection).unwrap());
-    bus.process_messages(crate::server_versions::PROTOBUF_REST_MESSAGES_3).unwrap();
+    bus.process_messages().unwrap();
     let client = Client::stubbed(bus.clone(), crate::server_versions::PROTOBUF_REST_MESSAGES_3);
     (client, bus, peer)
 }
@@ -3859,4 +4093,155 @@ fn test_client_drop_closes_tcp_with_retained_subscription() {
     drop(client);
     assert_peer_sees_eof(peer);
     assert!(!bus.is_connected());
+}
+
+// ---- wait_for_fill lookup on a cache miss (#1020) ----
+
+fn read_frame(peer: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut len = [0u8; 4];
+    peer.read_exact(&mut len).unwrap();
+    peer.read_exact(&mut vec![0u8; u32::from_be_bytes(len) as usize]).unwrap();
+}
+
+/// A length-prefixed protobuf frame, as TWS writes it.
+fn tws_frame(message: IncomingMessages, proto: &impl prost::Message) -> Vec<u8> {
+    encode_raw_length(&helpers::binary_proto(message as i32, proto))
+}
+
+fn open_orders_end_frame() -> Vec<u8> {
+    tws_frame(
+        IncomingMessages::OpenOrderEnd,
+        &crate::testdata::builders::orders::open_order_end().to_proto(),
+    )
+}
+
+fn completed_orders_end_frame() -> Vec<u8> {
+    tws_frame(
+        IncomingMessages::CompletedOrdersEnd,
+        &crate::testdata::builders::orders::completed_orders_end().to_proto(),
+    )
+}
+
+/// On a cache miss `wait_for_fill` asks for open orders, then completed
+/// orders, and reads each reply to its end marker (sent late here), so the
+/// caller's next request of either kind cannot end on it and come back empty.
+#[test]
+fn test_wait_for_fill_lookup_ends_do_not_end_next_requests() {
+    use crate::orders::Orders;
+    use crate::subscriptions::SubscriptionItem;
+    use crate::testdata::builders::orders::{completed_order, open_order};
+    use std::io::Write;
+
+    let order = tws_frame(IncomingMessages::OpenOrder, &open_order().order_id(7).to_proto());
+    let completed = tws_frame(IncomingMessages::CompletedOrder, &completed_order().order_id(9).to_proto());
+
+    let (client, _bus, mut peer) = tcp_client_with_peer();
+    let tws = thread::spawn(move || {
+        read_frame(&mut peer); // the lookup's open orders
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(&open_orders_end_frame()).unwrap();
+        read_frame(&mut peer); // the lookup's completed orders
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(&completed_orders_end_frame()).unwrap();
+        read_frame(&mut peer); // the caller's completed_orders
+        peer.write_all(&completed).unwrap();
+        peer.write_all(&completed_orders_end_frame()).unwrap();
+        read_frame(&mut peer); // the caller's open_orders
+        peer.write_all(&order).unwrap();
+        peer.write_all(&open_orders_end_frame()).unwrap();
+        peer
+    });
+
+    let outcome = client.wait_for_fill(7, Duration::ZERO).unwrap();
+    assert_eq!(outcome, crate::orders::OrderOutcome::TimedOut(None));
+    let orders = client.completed_orders(false).unwrap();
+    let first = orders.next_timeout(Duration::from_secs(1));
+    assert!(
+        matches!(&first, Some(Ok(SubscriptionItem::Data(Orders::OrderData(d)))) if d.order.order_id == 9),
+        "{first:?}"
+    );
+    let orders = client.open_orders().unwrap();
+    let first = orders.next_timeout(Duration::from_secs(1));
+    assert!(
+        matches!(&first, Some(Ok(SubscriptionItem::Data(Orders::OrderData(d)))) if d.order.order_id == 7),
+        "{first:?}"
+    );
+    drop(tws.join().unwrap());
+}
+
+/// An order missing from open orders but among completed ones (e.g. it ended
+/// before this connection) ends the wait at once, with no fill prices.
+#[test]
+fn test_wait_for_fill_finds_order_among_completed() {
+    use crate::orders::{OrderOutcome, OrderStatusKind};
+    use crate::testdata::builders::orders::completed_order;
+    use std::io::Write;
+
+    let (client, _bus, mut peer) = tcp_client_with_peer();
+    let completed = tws_frame(
+        IncomingMessages::CompletedOrder,
+        &completed_order()
+            .client_id(client.client_id())
+            .order_id(7)
+            .status(OrderStatusKind::Cancelled)
+            .total_quantity(100.0)
+            .filled_quantity(40.0)
+            .to_proto(),
+    );
+    let tws = thread::spawn(move || {
+        read_frame(&mut peer);
+        peer.write_all(&open_orders_end_frame()).unwrap();
+        read_frame(&mut peer);
+        peer.write_all(&completed).unwrap();
+        peer.write_all(&completed_orders_end_frame()).unwrap();
+        peer
+    });
+
+    let started = Instant::now();
+    let outcome = client.wait_for_fill(7, Duration::from_secs(10)).unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(5), "waited {:?}", started.elapsed());
+    let OrderOutcome::Ended(status) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(status.status, OrderStatusKind::Cancelled);
+    assert_eq!((status.filled, status.remaining), (40.0, 60.0));
+    assert_eq!(status.average_fill_price, None);
+    drop(tws.join().unwrap());
+}
+
+/// An order open orders list is working: its status reaches the wait and no
+/// completed-orders request follows.
+#[test]
+fn test_wait_for_fill_skips_completed_when_order_is_open() {
+    use crate::orders::{OrderOutcome, OrderStatusKind};
+    use crate::testdata::builders::orders::open_order;
+    use std::io::{ErrorKind, Read, Write};
+
+    let order = tws_frame(IncomingMessages::OpenOrder, &open_order().order_id(7).to_proto());
+    let status = encode_raw_length(&helpers::order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
+
+    let (client, _bus, mut peer) = tcp_client_with_peer();
+    let tws = thread::spawn(move || {
+        read_frame(&mut peer);
+        peer.write_all(&order).unwrap();
+        peer.write_all(&status).unwrap();
+        peer.write_all(&open_orders_end_frame()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let next = peer.read(&mut [0u8; 4]);
+        assert!(
+            matches!(&next, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "unexpected request: {next:?}"
+        );
+        peer
+    });
+
+    let outcome = client.wait_for_fill(7, Duration::from_millis(100)).unwrap();
+
+    assert!(
+        matches!(&outcome, OrderOutcome::TimedOut(Some(s)) if s.status == OrderStatusKind::Submitted),
+        "{outcome:?}"
+    );
+    drop(tws.join().unwrap());
 }

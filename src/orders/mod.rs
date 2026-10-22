@@ -63,7 +63,6 @@ use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::Contract;
-use crate::{encode_option_field, ToField};
 
 // Public types - always available regardless of feature flags
 
@@ -494,6 +493,9 @@ pub struct Order {
     pub conditions_ignore_rth: bool,
     /// Conditions can determine if an order should become active or canceled.
     pub conditions_cancel_order: bool,
+    /// Indicates whether or not conditions will also be valid during the OVERNIGHT trading session.
+    /// Takes effect with [`include_overnight`](Self::include_overnight). Requires server version 226.
+    pub conditions_include_overnight: bool,
     /// Define the Soft Dollar Tier used for the order. Only provided for registered professional advisors and hedge and mutual funds.
     pub soft_dollar_tier: SoftDollarTier,
     /// Set to true to create tickets from API orders when TWS is used as an OMS.
@@ -656,6 +658,7 @@ impl Default for Order {
             conditions: vec![],
             conditions_ignore_rth: false,
             conditions_cancel_order: false,
+            conditions_include_overnight: false,
             soft_dollar_tier: SoftDollarTier::default(),
             is_oms_container: false,
             discretionary_up_to_limit_price: false,
@@ -1011,12 +1014,6 @@ pub enum OcaType {
     Unknown(i32),
 }
 
-impl ToField for OcaType {
-    fn to_field(&self) -> String {
-        i32::from(*self).to_string()
-    }
-}
-
 impl From<OcaType> for i32 {
     fn from(value: OcaType) -> i32 {
         match value {
@@ -1054,12 +1051,6 @@ pub enum OrderOrigin {
     Unknown(i32),
 }
 
-impl ToField for OrderOrigin {
-    fn to_field(&self) -> String {
-        i32::from(*self).to_string()
-    }
-}
-
 impl From<OrderOrigin> for i32 {
     fn from(value: OrderOrigin) -> i32 {
         match value {
@@ -1093,12 +1084,6 @@ pub enum ShortSaleSlot {
     ThirdParty,
     /// Short sale slot code not modeled by this version of the API.
     Unknown(i32),
-}
-
-impl ToField for ShortSaleSlot {
-    fn to_field(&self) -> String {
-        i32::from(*self).to_string()
-    }
 }
 
 impl From<ShortSaleSlot> for i32 {
@@ -1135,18 +1120,6 @@ pub enum VolatilityType {
     Unknown(i32),
 }
 
-impl ToField for VolatilityType {
-    fn to_field(&self) -> String {
-        i32::from(*self).to_string()
-    }
-}
-
-impl ToField for Option<VolatilityType> {
-    fn to_field(&self) -> String {
-        encode_option_field(self)
-    }
-}
-
 impl From<VolatilityType> for i32 {
     fn from(value: VolatilityType) -> i32 {
         match value {
@@ -1177,18 +1150,6 @@ pub enum ReferencePriceType {
     NBBO,
     /// Reference price type code not modeled by this version of the API.
     Unknown(i32),
-}
-
-impl ToField for ReferencePriceType {
-    fn to_field(&self) -> String {
-        i32::from(*self).to_string()
-    }
-}
-
-impl ToField for Option<ReferencePriceType> {
-    fn to_field(&self) -> String {
-        encode_option_field(self)
-    }
 }
 
 impl From<ReferencePriceType> for i32 {
@@ -1236,12 +1197,6 @@ pub enum Rule80A {
     /// Rule 80A code not modeled by this version of the API. Carries the raw
     /// wire value as received on an inbound order; sent back unchanged.
     Unknown(String),
-}
-
-impl ToField for Option<Rule80A> {
-    fn to_field(&self) -> String {
-        encode_option_field(self)
-    }
 }
 
 impl Rule80A {
@@ -1468,12 +1423,6 @@ pub enum OrderOpenClose {
     /// Open/close value not modeled by this version of the API. Carries the
     /// raw wire value as received on an inbound order; sent back unchanged.
     Unknown(String),
-}
-
-impl ToField for Option<OrderOpenClose> {
-    fn to_field(&self) -> String {
-        encode_option_field(self)
-    }
 }
 
 impl OrderOpenClose {
@@ -1767,9 +1716,11 @@ impl OrderStatus {
 
 /// How an order ended, as reported by `Client::wait_for_fill`.
 ///
-/// Each variant carries the order's last [`OrderStatus`]: `filled`,
-/// `remaining` and `average_fill_price` give the fill, which may be partial
-/// for [`Ended`](Self::Ended) and [`TimedOut`](Self::TimedOut).
+/// [`Filled`](Self::Filled), [`Ended`](Self::Ended) and
+/// [`TimedOut`](Self::TimedOut) carry the order's last [`OrderStatus`]:
+/// `filled`, `remaining` and `average_fill_price` give the fill, which may be
+/// partial for `Ended` and `TimedOut`. [`Rejected`](Self::Rejected) carries
+/// TWS's error instead, since the order never got a status.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum OrderOutcome {
@@ -1786,6 +1737,11 @@ pub enum OrderOutcome {
     /// status seen, if any. The order is left alone; cancel it yourself if
     /// you no longer want it.
     TimedOut(Option<OrderStatus>),
+    /// TWS refused the order with an error and no status, so it never
+    /// worked (e.g. 110, a price off the minimum tick). A rejection TWS
+    /// reports with an [`Inactive`](OrderStatusKind::Inactive) status, such as
+    /// 201 for insufficient margin, is [`Ended`](Self::Ended).
+    Rejected(crate::Notice),
 }
 
 /// Enumerates possible results from cancelling an order.

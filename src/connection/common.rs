@@ -1,5 +1,7 @@
 //! Common connection logic shared between sync and async implementations
 
+use std::sync::Arc;
+
 use log::{debug, error, warn};
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -96,6 +98,20 @@ pub(crate) struct StartupHandshakeContext<'a> {
     pub notice_sink: &'a (dyn NoticeSink + Sync),
 }
 
+/// User callback for typed startup messages; fires on every handshake.
+pub(crate) type StartupCallback = Arc<dyn Fn(StartupMessage) + Send + Sync>;
+
+/// Validated connection settings shared by both transports. Each side passes
+/// its notice sink alongside.
+pub(crate) struct ConnectionConfig {
+    pub(crate) address: String,
+    pub(crate) client_id: i32,
+    pub(crate) tcp_no_delay: bool,
+    pub(crate) startup_callback: Option<StartupCallback>,
+    /// `None` means retry forever.
+    pub(crate) max_reconnect_attempts: Option<u32>,
+}
+
 /// Data exchanged during the connection handshake
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -117,7 +133,7 @@ pub trait ConnectionProtocol {
     fn parse_handshake_response(&self, response: &mut ResponseMessage) -> Result<HandshakeData, Self::Error>;
 
     /// Format the start API message as raw bytes (without length prefix).
-    fn format_start_api(&self, client_id: i32, server_version: i32) -> Vec<u8>;
+    fn format_start_api(&self, client_id: i32) -> Vec<u8>;
 
     /// Parse account information from incoming messages.
     ///
@@ -125,12 +141,7 @@ pub trait ConnectionProtocol {
     /// [`AccountInfo`]. Anything else is delegated to
     /// [`dispatch_unsolicited_message`] so the callbacks decide how to surface
     /// (or drop) it.
-    fn parse_account_info(
-        &self,
-        server_version: i32,
-        message: &mut ResponseMessage,
-        ctx: &StartupHandshakeContext<'_>,
-    ) -> Result<AccountInfo, Self::Error>;
+    fn parse_account_info(&self, message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) -> Result<AccountInfo, Self::Error>;
 }
 
 /// Account information received during connection establishment
@@ -180,7 +191,7 @@ impl Default for ConnectionHandler {
     fn default() -> Self {
         Self {
             min_version: server_versions::PROTOBUF_REST_MESSAGES_3,
-            max_version: server_versions::ODD_LOT_BID_ASK_QUOTES,
+            max_version: server_versions::CONDITIONS_INCLUDE_OVERNIGHT,
         }
     }
 }
@@ -209,7 +220,7 @@ impl ConnectionProtocol for ConnectionHandler {
         })
     }
 
-    fn format_start_api(&self, client_id: i32, _server_version: i32) -> Vec<u8> {
+    fn format_start_api(&self, client_id: i32) -> Vec<u8> {
         use prost::Message;
 
         let request = crate::proto::StartApiRequest {
@@ -220,26 +231,19 @@ impl ConnectionProtocol for ConnectionHandler {
         encode_protobuf_message(OutgoingMessages::StartApi as i32, &request.encode_to_vec())
     }
 
-    fn parse_account_info(
-        &self,
-        server_version: i32,
-        message: &mut ResponseMessage,
-        ctx: &StartupHandshakeContext<'_>,
-    ) -> Result<AccountInfo, Self::Error> {
-        use crate::proto::decoders::DecodeProto;
-
+    fn parse_account_info(&self, message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) -> Result<AccountInfo, Self::Error> {
         let mut info = AccountInfo::default();
 
         match message.message_type() {
             IncomingMessages::NextValidId => {
-                let proto = crate::proto::NextValidId::decode_proto(message.require_proto()?)?;
+                let proto: crate::proto::NextValidId = message.proto()?;
                 info.next_order_id = proto.order_id;
             }
             IncomingMessages::ManagedAccounts => {
-                let proto = crate::proto::ManagedAccounts::decode_proto(message.require_proto()?)?;
+                let proto: crate::proto::ManagedAccounts = message.proto()?;
                 info.managed_accounts = proto.accounts_list;
             }
-            _ => dispatch_unsolicited_message(server_version, message, ctx),
+            _ => dispatch_unsolicited_message(message, ctx),
         }
 
         Ok(info)
@@ -257,7 +261,7 @@ impl ConnectionProtocol for ConnectionHandler {
 /// ([`HANDSHAKE_DECODE_FAILURE_CODE`], [`HANDSHAKE_UNKNOWN_FRAME_CODE`] and
 /// [`UNKNOWN_MESSAGE_TYPE_CODE`](crate::UNKNOWN_MESSAGE_TYPE_CODE)) so observers via
 /// [`Client::notice_stream`](crate::Client::notice_stream) can detect them.
-pub(crate) fn dispatch_unsolicited_message(_server_version: i32, message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) {
+pub(crate) fn dispatch_unsolicited_message(message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) {
     use crate::accounts::common::decode_account_update_message;
     use crate::orders::common::{decode_commission_report, decode_completed_order, decode_execution_data, decode_open_order, decode_order_status};
 

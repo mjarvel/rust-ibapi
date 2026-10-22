@@ -485,12 +485,7 @@ fn test_pnl_comprehensive() {
     drop(subscriptions);
 
     let count = request_message_count(&message_bus);
-    assert!(
-        count >= test_cases.len() * 2,
-        "Expected at least {} messages (subscribe + cancel for each), got {}",
-        test_cases.len() * 2,
-        count
-    );
+    assert_eq!(count, test_cases.len() * 2, "subscribe + cancel for each case");
 }
 
 #[test]
@@ -514,11 +509,7 @@ fn test_pnl_single_edge_cases() {
     drop(subscriptions);
 
     let count = request_message_count(&message_bus);
-    assert!(
-        count >= test_cases.len() * 2,
-        "Expected at least {} messages (subscribe + cancel for each)",
-        test_cases.len() * 2
-    );
+    assert_eq!(count, test_cases.len() * 2, "subscribe + cancel for each case");
 }
 
 #[test]
@@ -548,11 +539,7 @@ fn test_positions_multi_parameter_combinations() {
     drop(subscriptions);
 
     let count = request_message_count(&message_bus);
-    assert!(
-        count >= test_cases.len() * 2,
-        "Expected at least {} messages (subscribe + cancel for each)",
-        test_cases.len() * 2
-    );
+    assert_eq!(count, test_cases.len() * 2, "subscribe + cancel for each case");
 }
 
 #[test]
@@ -612,12 +599,7 @@ fn test_subscription_lifecycle() {
     }
 
     let count = request_message_count(&message_bus);
-    assert!(
-        count >= test_cases.len() * 2,
-        "Expected subscribe and cancel messages for {} subscriptions, got {} messages",
-        test_cases.len(),
-        count
-    );
+    assert_eq!(count, test_cases.len() * 2, "subscribe + cancel for each case");
 }
 
 #[test]
@@ -731,6 +713,32 @@ fn test_request_fa() {
     assert_eq!(cfg.xml, "<groups/>");
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(&message_bus, 0, &fa_request().fa_data_type(FaDataType::Groups as i32));
+}
+
+#[test]
+fn test_request_fa_skips_another_datasets_frame() {
+    use crate::accounts::FaDataType;
+
+    // A concurrent request_fa(AccountAliases) was answered first; every
+    // live request_fa receives that frame too.
+    let (client, message_bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::ReceiveFA,
+            receive_fa()
+                .fa_data_type(FaDataType::AccountAliases as i32)
+                .xml("<aliases/>")
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ReceiveFA,
+            receive_fa().fa_data_type(FaDataType::Groups as i32).xml("<groups/>").encode_proto(),
+        ),
+    ]);
+
+    let cfg = client.request_fa(FaDataType::Groups).expect("request_fa failed");
+    assert_eq!(cfg.fa_data_type, FaDataType::Groups);
+    assert_eq!(cfg.xml, "<groups/>");
+    assert_eq!(request_message_count(&message_bus), 1);
 }
 
 #[test]

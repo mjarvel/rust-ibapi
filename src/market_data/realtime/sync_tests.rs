@@ -1,9 +1,11 @@
 use super::*;
-use crate::common::test_utils::helpers::{assert_request, proto_response, request_message_count, TEST_REQ_ID_FIRST};
+use crate::common::test_utils::helpers::{
+    assert_request, assert_request_proto, proto_response, request_message_count, text_response, TEST_REQ_ID_FIRST,
+};
 use crate::contracts::tick_types::TickType;
 use crate::contracts::{ComboLeg, Contract, Currency, DeltaNeutralContract, Exchange, LegAction, SecurityType, Symbol};
 use crate::market_data::realtime::{BidAsk, MidPoint, Trade};
-use crate::market_data::{IgnoreSize, SmartDepth, TradingHours};
+use crate::market_data::{IgnoreSize, MarketDataType, SmartDepth, TradingHours};
 use crate::messages::IncomingMessages;
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
@@ -15,6 +17,20 @@ use crate::testdata::builders::market_data::{
 use crate::testdata::builders::ResponseProtoEncoder;
 use std::sync::Arc;
 use time::OffsetDateTime;
+
+#[test]
+fn test_switch_market_data_type() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    client.switch_market_data_type(MarketDataType::Delayed).expect("request failed");
+
+    assert_eq!(request_message_count(&message_bus), 1);
+    let expected = crate::proto::MarketDataTypeRequest {
+        market_data_type: Some(MarketDataType::Delayed as i32),
+    };
+    assert_request_proto(&message_bus, 0, OutgoingMessages::RequestMarketDataType, &expected);
+}
 
 #[test]
 fn test_realtime_bars() {
@@ -486,7 +502,7 @@ fn test_basic_market_data() {
 
 #[test]
 fn test_market_data_with_combo_legs() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
 
     let client = Client::stubbed(message_bus.clone(), server_versions::PRICE_BASED_VOLATILITY);
     let mut contract = Contract::stock("AAPL").build();
@@ -517,7 +533,7 @@ fn test_market_data_with_combo_legs() {
 
 #[test]
 fn test_market_data_with_delta_neutral() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
 
     let client = Client::stubbed(message_bus.clone(), server_versions::PRICE_BASED_VOLATILITY);
     let mut contract = Contract::stock("AAPL").build();
@@ -545,7 +561,7 @@ fn test_market_data_with_delta_neutral() {
 
 #[test]
 fn test_market_data_regulatory_snapshot() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
 
     let client = Client::stubbed(message_bus.clone(), server_versions::REQ_SMART_COMPONENTS);
     let contract = Contract {
@@ -644,7 +660,7 @@ fn test_tick_by_tick_last() {
 fn test_text_framed_fixture_fails_the_subscription() {
     // Payload beyond the message id and request id is irrelevant — the decoder
     // rejects on framing before reading a field.
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec!["50\0\09000\0".to_owned()]));
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![text_response("50\0\09000\0")]));
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
     let contract = Contract::stock("AAPL").build();
 

@@ -5,11 +5,11 @@ use crate::messages::OutgoingMessages;
 use crate::orders::OrderId;
 use crate::subscriptions::{Subscription, SubscriptionItem};
 use crate::{Client, Error};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::common::fill::FillTracker;
+use super::common::fill::{completed_status, lists_order, lookup_wait, FillTracker};
 use super::common::{decoders, encoders, verify};
 use super::*;
 
@@ -151,7 +151,7 @@ impl Client {
     /// ```
     pub async fn submit_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<(), Error> {
         let checked_id = verify::verify_order_ids(order_id.into(), order)?;
-        verify::verify_order(self, order)?;
+        verify::verify_order(self.server_version(), order)?;
 
         let request = encoders::encode_place_order(checked_id.value(), contract, order)?;
         self.send_message(request).await?;
@@ -189,7 +189,7 @@ impl Client {
     /// ```
     pub async fn place_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<Subscription<PlaceOrder>, Error> {
         let checked_id = verify::verify_order_ids(order_id.into(), order)?;
-        verify::verify_order(self, order)?;
+        verify::verify_order(self.server_version(), order)?;
 
         let request = encoders::encode_place_order(checked_id.value(), contract, order)?;
         let internal_subscription = self.send_order(checked_id, request).await?;
@@ -300,7 +300,8 @@ impl Client {
     /// server.
     ///
     /// # Errors
-    /// [`Error::OrderIdInRequestRange`] if TWS returns an id at or above 1,500,000,000 (reserved for request ids).
+    /// - [`Error::OrderIdInRequestRange`] if TWS returns an id at or above 1,500,000,000 (reserved for request ids).
+    /// - [`Error::Timeout`] if TWS sends no answer within 30 seconds.
     ///
     /// # Examples
     ///
@@ -492,8 +493,14 @@ impl Client {
     ///
     /// Starts with the order's latest status, if this client has seen one
     /// (the latest statuses of the 10,000 most recent orders are kept), then
-    /// yields each new [`OrderStatus`] as TWS sends it. The stream does not end
-    /// on its own when the order does; stop reading, or see
+    /// yields each new [`OrderStatus`] as TWS sends it. A reconnect keeps only
+    /// statuses of orders that ended: TWS does not replay what happened while
+    /// disconnected, so a working order's stream starts empty until its next
+    /// status. If TWS refuses the
+    /// order with an error before any status (e.g. 110, a price off the
+    /// minimum tick), the stream yields that error as [`Error::Notice`] and
+    /// ends; a stream opened later starts with it. Otherwise the stream does
+    /// not end on its own when the order does; stop reading, or see
     /// [`wait_for_fill`](Self::wait_for_fill) for the common case.
     ///
     /// Takes nothing from [`order_update_stream`](Self::order_update_stream) or
@@ -537,19 +544,29 @@ impl Client {
     ///
     /// Returns [`OrderOutcome::Filled`] when the order filled completely,
     /// [`OrderOutcome::Ended`] when it was cancelled or became inactive first,
-    /// and [`OrderOutcome::TimedOut`] with the last status seen when time runs
+    /// [`OrderOutcome::Rejected`] with TWS's error when TWS refused the order
+    /// without a status (e.g. 110, a price off the minimum tick), and
+    /// [`OrderOutcome::TimedOut`] with the last status seen when time runs
     /// out. A timeout leaves the order working; cancel it yourself if needed.
     ///
     /// Built on [`order_status_stream`](Self::order_status_stream), so an
     /// order that already finished before the call is reported at once, as
-    /// long as this client saw its status since connecting. An order whose
-    /// statuses never reach this client (placed by another client, or
-    /// finished before this connection) waits out the timeout.
+    /// long as this client saw its status since connecting. When it has seen
+    /// none, the wait first looks the order up: an order this client's open
+    /// orders ([`open_orders`](Self::open_orders)) list is still working, and
+    /// the wait goes on; otherwise one found among
+    /// [`completed_orders`](Self::completed_orders) ends the wait at once,
+    /// with a status built from the completed order, whose fill prices are
+    /// `None` (see [`executions`](Self::executions) for them). Each lookup
+    /// reads its replies to the end, which can add a round trip to `timeout`.
+    /// With client id 0, the open-orders request also binds manual TWS orders
+    /// to this client. An order placed by another client, or one in neither
+    /// reply, waits out the timeout.
     ///
     /// # Errors
     ///
-    /// [`Error::ConnectionReset`] if the connection drops during the wait,
-    /// [`Error::Shutdown`] if the client shuts down.
+    /// [`Error::ConnectionReset`] if the connection is down or drops during
+    /// the wait, [`Error::Shutdown`] if the client shuts down.
     ///
     /// # Examples
     ///
@@ -571,27 +588,71 @@ impl Client {
     ///         OrderOutcome::Filled(status) => println!("filled {} @ {:?}", status.filled, status.average_fill_price),
     ///         OrderOutcome::Ended(status) => println!("ended {:?} after {} filled", status.status, status.filled),
     ///         OrderOutcome::TimedOut(status) => println!("still working: {status:?}"),
+    ///         OrderOutcome::Rejected(notice) => println!("rejected: {notice}"),
     ///     }
     /// }
     /// ```
     pub async fn wait_for_fill(&self, order_id: impl Into<OrderId>, timeout: Duration) -> Result<OrderOutcome, Error> {
+        let order_id = order_id.into();
         let mut statuses = self.order_status_stream(order_id).await?;
         let mut tracker = FillTracker::default();
+        let deadline = Instant::now().checked_add(timeout);
+        // Nothing ready: this client has no status for the order (e.g.
+        // placed on an earlier connection). Look it up.
+        let first = statuses.next().now_or_never();
+        if first.is_none() {
+            if let Some(status) = self.find_finished(order_id, deadline).await? {
+                if let Some(outcome) = tracker.observe(status) {
+                    return Ok(outcome);
+                }
+            }
+        }
 
         let wait = async {
-            while let Some(item) = statuses.next().await {
-                if let SubscriptionItem::Data(status) = item? {
-                    if let Some(outcome) = tracker.observe(status) {
-                        return Ok(outcome);
+            let mut items = futures::stream::iter(first.flatten()).chain(statuses);
+            while let Some(item) = items.next().await {
+                match item {
+                    Ok(SubscriptionItem::Data(status)) => {
+                        if let Some(outcome) = tracker.observe(status) {
+                            return Ok(outcome);
+                        }
                     }
+                    Ok(SubscriptionItem::Notice(_)) => {}
+                    Err(error) => return FillTracker::error(error),
                 }
             }
             Err(Error::UnexpectedEndOfStream)
         };
-        match tokio::time::timeout(timeout, wait).await {
+        let remaining = deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(Instant::now()));
+        match tokio::time::timeout(remaining, wait).await {
             Ok(result) => result,
             Err(_) => Ok(tracker.timed_out()),
         }
+    }
+
+    /// Look up an order this client has no status for: `None` when this
+    /// client's open orders list it (their statuses reach the order's status
+    /// streams like any other) or neither reply does; otherwise its status
+    /// from completed orders. Each reply is read to its end marker.
+    async fn find_finished(&self, order_id: OrderId, deadline: Option<Instant>) -> Result<Option<OrderStatus>, Error> {
+        async fn read(mut subscription: Subscription<Orders>, deadline: Option<Instant>) -> Result<Vec<Orders>, Error> {
+            match deadline {
+                Some(deadline) => subscription.collect_to_end_within(lookup_wait(deadline)).await,
+                None => subscription.collect_to_end().await,
+            }
+        }
+        // A reply cut short (deadline, dropped connection) proves nothing:
+        // keep waiting; the status stream reports a dropped connection.
+        let Ok(open) = read(self.open_orders().await?, deadline).await else {
+            return Ok(None);
+        };
+        if lists_order(&open, order_id) {
+            return Ok(None);
+        }
+        let Ok(completed) = read(self.completed_orders(false).await?, deadline).await else {
+            return Ok(None);
+        };
+        Ok(completed_status(&completed, self.client_id(), order_id))
     }
 
     /// Exercise or lapse an option position.

@@ -23,16 +23,16 @@ fn validate_passes_reconnect_limit_through() {
         ..Default::default()
     };
 
-    let pieces = base().validate().expect("validate");
-    assert_eq!(pieces.max_reconnect_attempts, Some(MAX_RECONNECT_ATTEMPTS));
+    let config = base().validate().expect("validate");
+    assert_eq!(config.connection.max_reconnect_attempts, Some(MAX_RECONNECT_ATTEMPTS));
 
     let mut limited = base();
     limited.max_reconnect_attempts = Some(50);
-    assert_eq!(limited.validate().expect("validate").max_reconnect_attempts, Some(50));
+    assert_eq!(limited.validate().expect("validate").connection.max_reconnect_attempts, Some(50));
 
     let mut unlimited = base();
     unlimited.max_reconnect_attempts = None;
-    assert_eq!(unlimited.validate().expect("validate").max_reconnect_attempts, None);
+    assert_eq!(unlimited.validate().expect("validate").connection.max_reconnect_attempts, None);
 }
 
 fn connectable() -> BuilderState {
@@ -50,7 +50,7 @@ fn validate_passes_rate_limiter_through() {
         "limiter on by default"
     );
 
-    // The pieces carry the caller's limiter, not a copy with its own budget.
+    // The config carries the caller's limiter, not a copy with its own budget.
     let limiter = RateLimiter::per_second(10);
     let mut state = connectable();
     state.rate_limiter = Some(limiter.clone());

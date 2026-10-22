@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use time_tz::Tz;
 
 use crate::client::builders::client_builder::sync_impl::ClientBuilder;
-use crate::client::builders::client_builder::ValidatedPieces;
+use crate::client::builders::client_builder::ClientConfig;
 use crate::connection::{sync::Connection, ConnectionMetadata};
 use crate::errors::Error;
 use crate::messages::OutgoingMessages;
@@ -91,32 +91,24 @@ impl Client {
     /// Internal entry point shared by `Client::connect` and `ClientBuilder`.
     /// Builds the `Connection`, wraps it in a `TcpMessageBus`, and kicks off
     /// the dispatcher thread.
-    pub(crate) fn connect_with_pieces(pieces: ValidatedPieces, notice_broadcaster: Arc<NoticeBroadcaster>) -> Result<Client, Error> {
-        let connection = Connection::with_pieces(
-            &pieces.address,
-            pieces.client_id,
-            pieces.tcp_no_delay,
-            pieces.startup_callback,
-            notice_broadcaster,
-            pieces.max_reconnect_attempts,
-        )?;
+    pub(crate) fn connect_with_config(config: ClientConfig, notice_broadcaster: Arc<NoticeBroadcaster>) -> Result<Client, Error> {
+        let connection = Connection::connect(config.connection, notice_broadcaster)?;
         let connection_metadata = connection.connection_metadata();
 
         let message_bus = Arc::new(TcpMessageBus::new(connection)?);
 
-        let server_version = connection_metadata.server_version;
         let client = Client::new(connection_metadata, message_bus.clone())?;
 
         // Share the order-ID generator with the bus so a successful reconnect
         // re-seeds it from the handshake's NextValidId; must be installed
         // before the dispatcher thread starts.
         message_bus.set_order_ids(client.id_manager.clone());
-        if let Some(limiter) = pieces.rate_limiter {
+        if let Some(limiter) = config.rate_limiter {
             message_bus.set_rate_limiter(limiter);
         }
 
         // Starts thread to read messages from TWS
-        message_bus.process_messages(server_version)?;
+        message_bus.process_messages()?;
 
         Ok(client)
     }
@@ -323,14 +315,6 @@ impl Client {
     /// Sends request for the next valid order id.
     pub(crate) fn send_shared_request(&self, message_id: OutgoingMessages, message: Vec<u8>) -> Result<InternalSubscription, Error> {
         self.message_bus.send_shared_request(message_id, &message)
-    }
-
-    pub(crate) fn check_server_version(&self, version: i32, message: &str) -> Result<(), Error> {
-        if version <= self.server_version {
-            Ok(())
-        } else {
-            Err(Error::ServerVersion(version, self.server_version, message.into()))
-        }
     }
 }
 

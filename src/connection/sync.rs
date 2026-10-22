@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use log::{debug, info};
 
 use super::common::{
-    parse_handshake_ack, parse_raw_message, require_protobuf_support, AccountInfo, ConnectionHandler, ConnectionProtocol, StartupHandshakeContext,
-    StartupMessage, MAX_ACCOUNT_INFO_ATTEMPTS,
+    parse_handshake_ack, parse_raw_message, require_protobuf_support, AccountInfo, ConnectionConfig, ConnectionHandler, ConnectionProtocol,
+    StartupCallback, StartupHandshakeContext, MAX_ACCOUNT_INFO_ATTEMPTS,
 };
 use super::ConnectionMetadata;
 use crate::errors::Error;
@@ -29,7 +29,7 @@ pub struct Connection<S: Stream> {
     pub(crate) connection_handler: ConnectionHandler,
     /// Optional typed-message callback supplied via [`ClientBuilder::startup_callback`].
     /// Fires on initial handshake *and* every auto-reconnect handshake.
-    startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+    startup_callback: Option<StartupCallback>,
     /// Fan-out for unrouted notices. Shared with the bus (the bus reads via
     /// `self.connection.notice_broadcaster`) and any pre-bound `NoticeStream`
     /// the user obtained from `ClientBuilder::connect_with_notice_stream`.
@@ -37,6 +37,10 @@ pub struct Connection<S: Stream> {
     /// Shared with the bus so `reconnect` can abandon its backoff as soon as
     /// shutdown is requested. See [`Connection::shutdown_signal`].
     shutdown: Arc<ShutdownSignal>,
+    /// The last `RequestMarketDataType` packet requested. TWS does not keep
+    /// the market data type across reconnects, so `establish_connection`
+    /// re-sends it after every reconnect handshake.
+    market_data_type_request: Mutex<Option<Vec<u8>>>,
 }
 
 impl<S: Stream> std::fmt::Debug for Connection<S> {
@@ -51,22 +55,16 @@ impl<S: Stream> std::fmt::Debug for Connection<S> {
 }
 
 impl Connection<TcpSocket> {
-    /// Create a connection from explicit pieces handed in by the builder.
+    /// Open the socket and run the TWS handshake. Settings come from the
+    /// builder's validated `ConnectionConfig`.
     ///
     /// `notice_broadcaster` is shared with any pre-bound `NoticeStream`; the
     /// builder allocates it (and the matching receiver) before calling here.
     /// Persists across reconnects.
-    pub(crate) fn with_pieces(
-        address: &str,
-        client_id: i32,
-        tcp_no_delay: bool,
-        startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
-        notice_broadcaster: Arc<NoticeBroadcaster>,
-        max_reconnect_attempts: Option<u32>,
-    ) -> Result<Self, Error> {
-        let socket = TcpSocket::connect(address, tcp_no_delay)?;
-        let mut connection = Self::with_socket(socket, client_id, startup_callback, notice_broadcaster);
-        connection.max_reconnect_attempts = max_reconnect_attempts;
+    pub(crate) fn connect(config: ConnectionConfig, notice_broadcaster: Arc<NoticeBroadcaster>) -> Result<Self, Error> {
+        let socket = TcpSocket::connect(&config.address, config.tcp_no_delay)?;
+        let mut connection = Self::with_socket(socket, config.client_id, config.startup_callback, notice_broadcaster);
+        connection.max_reconnect_attempts = config.max_reconnect_attempts;
         connection.establish_connection()?;
         Ok(connection)
     }
@@ -79,7 +77,7 @@ impl<S: Stream> Connection<S> {
     pub(crate) fn with_socket(
         socket: S,
         client_id: i32,
-        startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+        startup_callback: Option<StartupCallback>,
         notice_broadcaster: Arc<NoticeBroadcaster>,
     ) -> Self {
         Self {
@@ -95,6 +93,7 @@ impl<S: Stream> Connection<S> {
             startup_callback,
             notice_broadcaster,
             shutdown: Arc::new(ShutdownSignal::default()),
+            market_data_type_request: Mutex::new(None),
         }
     }
 
@@ -123,10 +122,11 @@ impl<S: Stream> Connection<S> {
         connection_metadata.server_version
     }
 
-    /// Reconnect to TWS with fibonacci backoff. Replays the handshake and
-    /// re-fires the persisted startup / notice callbacks. When every attempt
-    /// fails, returns the last attempt's error — a permanent cause (say, an
-    /// incompatible server version) must not exit as a generic failure.
+    /// Reconnect to TWS with fibonacci backoff. Replays the handshake,
+    /// re-fires the persisted startup / notice callbacks and re-sends the
+    /// remembered market data type. When every attempt fails, returns the
+    /// last attempt's error — a permanent cause (say, an incompatible server
+    /// version) must not exit as a generic failure.
     ///
     /// Returns [`Error::Shutdown`] once shutdown is requested. The backoff
     /// wait ends immediately on the request; a connect already in flight is
@@ -193,7 +193,23 @@ impl<S: Stream> Connection<S> {
         require_protobuf_support(self.server_version())?;
         self.start_api()?;
         self.receive_account_info()?;
+        self.replay_market_data_type()?;
         Ok(())
+    }
+
+    /// Keep `packet`, a `RequestMarketDataType`, for replay on reconnect.
+    pub(crate) fn remember_market_data_type(&self, packet: Vec<u8>) {
+        *self.market_data_type_request.lock().unwrap() = Some(packet);
+    }
+
+    /// Re-send the remembered market data type to the new session. No-op
+    /// until `remember_market_data_type` has been called.
+    fn replay_market_data_type(&self) -> Result<(), Error> {
+        let packet = self.market_data_type_request.lock().unwrap().clone();
+        match packet {
+            Some(packet) => self.write_message(&packet),
+            None => Ok(()),
+        }
     }
 
     /// Write a protobuf message to the connection
@@ -263,8 +279,7 @@ impl<S: Stream> Connection<S> {
 
     // asks server to start processing messages
     pub(crate) fn start_api(&self) -> Result<(), Error> {
-        let server_version = self.server_version();
-        let data = self.connection_handler.format_start_api(self.client_id, server_version);
+        let data = self.connection_handler.format_start_api(self.client_id);
         self.write_raw(&data)?;
         Ok(())
     }
@@ -275,10 +290,9 @@ impl<S: Stream> Connection<S> {
 
         let mut attempts = 0;
         let ctx = self.handshake_context();
-        let server_version = self.server_version();
         loop {
             let mut message = self.decode_frame(&self.read_startup_frame()?)?;
-            let info = self.connection_handler.parse_account_info(server_version, &mut message, &ctx)?;
+            let info = self.connection_handler.parse_account_info(&mut message, &ctx)?;
 
             attempts += 1;
             if account_info.merge(info) || attempts > MAX_ACCOUNT_INFO_ATTEMPTS {
@@ -306,6 +320,7 @@ impl<S: Stream> Connection<S> {
             startup_callback: None,
             notice_broadcaster: Arc::new(NoticeBroadcaster::new()),
             shutdown: Arc::new(ShutdownSignal::default()),
+            market_data_type_request: Mutex::new(None),
         }
     }
 

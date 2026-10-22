@@ -47,13 +47,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 # Async only (default features)
-ibapi = "5.0"
+ibapi = "5.2"
 
 # Blocking only
-ibapi = { version = "5.0", default-features = false, features = ["sync"] }
+ibapi = { version = "5.2", default-features = false, features = ["sync"] }
 
 # Async + blocking together
-ibapi = { version = "5.0", default-features = false, features = ["sync", "async"] }
+ibapi = { version = "5.2", default-features = false, features = ["sync", "async"] }
 ```
 
 ```bash
@@ -825,7 +825,7 @@ In this model, each client instance handles only the requests it initiates, impr
 
 ## Fault Tolerance
 
-The API will automatically attempt to reconnect to the TWS server if a disconnection is detected. The API will attempt to reconnect up to 20 times (by default — see `ClientBuilder::max_reconnect_attempts` and `ClientBuilder::reconnect_forever`) using a Fibonacci backoff strategy. In some cases, it will retry the request in progress. When receiving responses via a `Subscription`, the application may need to handle retries manually. Since v3.0, terminal errors surface as `Some(Err(_))` from `Subscription::next()` (no separate `error()` accessor); inspect the error and decide whether to resubscribe:
+The API will automatically attempt to reconnect to the TWS server if a disconnection is detected. The API will attempt to reconnect up to 20 times (by default — see `ClientBuilder::max_reconnect_attempts` and `ClientBuilder::reconnect_forever`) using a Fibonacci backoff strategy. In some cases, it will retry the request in progress. The market data type set with `switch_market_data_type` is re-sent after a reconnect, since TWS does not keep it across reconnects. When receiving responses via a `Subscription`, the application may need to handle retries manually. Since v3.0, terminal errors surface as `Some(Err(_))` from `Subscription::next()` (no separate `error()` accessor); inspect the error and decide whether to resubscribe:
 
 ```rust
 use ibapi::client::blocking::Client;

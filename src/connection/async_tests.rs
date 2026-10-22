@@ -12,7 +12,9 @@ use crate::client::r#async::Client;
 use crate::common::test_utils::helpers::{
     binary_text, error_frame, handshake_frames, handshake_response_frame, managed_accounts_frame, next_valid_id_frame, TEST_ACCOUNT,
 };
-use crate::messages::IncomingMessages;
+use crate::market_data::realtime::common::encoders::encode_request_market_data_type;
+use crate::market_data::MarketDataType;
+use crate::messages::{encode_raw_length, IncomingMessages};
 use crate::server_versions;
 use crate::transport::common::MAX_RECONNECT_ATTEMPTS;
 use crate::transport::r#async::{AsyncIo, AsyncMessageBus, AsyncReconnect, AsyncStream, AsyncTcpMessageBus, MemoryStream, ShutdownSignal};
@@ -118,9 +120,7 @@ async fn make_client() -> Client {
     let server_version = connection.server_version();
 
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).expect("AsyncTcpMessageBus::new"));
-    bus.clone()
-        .process_messages(server_version, Duration::from_secs(0))
-        .expect("process_messages");
+    bus.clone().process_messages().expect("process_messages");
 
     Client::stubbed(bus, server_version)
 }
@@ -243,6 +243,38 @@ async fn reconnect_retries_after_transient_handshake_failure() {
     let metadata = connection.connection_metadata().await;
     assert_eq!(metadata.next_order_id, 90);
     assert_eq!(metadata.managed_accounts, TEST_ACCOUNT);
+}
+
+/// TWS does not keep the market data type across reconnects, so a reconnect
+/// must re-send the remembered request after the handshake. Nothing is sent
+/// until one has been remembered.
+#[tokio::test]
+async fn reconnect_replays_market_data_type() {
+    let stream = MemoryStream::default();
+    let connection = AsyncConnection::stubbed(stream.clone(), CLIENT_ID);
+
+    let session_start = [
+        connection.connection_handler.format_handshake(),
+        encode_raw_length(&connection.connection_handler.format_start_api(CLIENT_ID)),
+    ]
+    .concat();
+
+    push_handshake(&stream);
+    connection.establish_connection().await.expect("initial establish_connection failed");
+    assert_eq!(stream.captured(), session_start, "nothing remembered: only the session start is sent");
+
+    let packet = encode_request_market_data_type(MarketDataType::Delayed).expect("encode");
+    connection.remember_market_data_type(packet.clone());
+
+    push_handshake(&stream);
+    connection.reconnect().await.expect("reconnect failed");
+
+    let expected = [session_start.clone(), session_start, encode_raw_length(&packet)].concat();
+    assert_eq!(
+        stream.captured(),
+        expected,
+        "the reconnect must re-send the market data type after the session start"
+    );
 }
 
 /// When the socket refuses reconnects through every Fibonacci attempt, the
@@ -479,12 +511,9 @@ async fn dispatcher_task_finishes_when_shutdown_requested_during_reconnect() {
 
     push_handshake(&stream);
     connection.establish_connection().await.expect("establish_connection failed");
-    let server_version = connection.server_version();
 
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).expect("AsyncTcpMessageBus::new"));
-    bus.clone()
-        .process_messages(server_version, Duration::from_millis(0))
-        .expect("process_messages");
+    bus.clone().process_messages().expect("process_messages");
     let message_bus: &dyn AsyncMessageBus = bus.as_ref();
 
     // Break the read: the dispatcher enters reconnect, waits out its backoff
@@ -522,12 +551,9 @@ async fn in_flight_subscription_is_reset_before_the_reconnect_completes() {
 
     push_handshake(&stream);
     connection.establish_connection().await.expect("establish_connection failed");
-    let server_version = connection.server_version();
 
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).expect("AsyncTcpMessageBus::new"));
-    bus.clone()
-        .process_messages(server_version, Duration::from_millis(0))
-        .expect("process_messages");
+    bus.clone().process_messages().expect("process_messages");
     let message_bus: &dyn AsyncMessageBus = bus.as_ref();
 
     let mut subscription = message_bus
@@ -581,9 +607,7 @@ async fn one_shot_request_is_retried_after_the_reconnect() {
     let server_version = connection.server_version();
 
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).expect("AsyncTcpMessageBus::new"));
-    bus.clone()
-        .process_messages(server_version, Duration::from_millis(0))
-        .expect("process_messages");
+    bus.clone().process_messages().expect("process_messages");
     let client = Arc::new(Client::stubbed(bus.clone(), server_version));
 
     let request = crate::accounts::common::encoders::encode_request_managed_accounts().expect("encode");

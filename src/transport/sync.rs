@@ -22,7 +22,7 @@ use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::raw_capture::RawFrameTap;
 use super::routing::{
-    classify_error, determine_routing, order_routing_strategy, order_update_notice, DecodedError, ErrorDisposition, OrderRoutingStrategy,
+    classify_error, determine_routing, is_foreign, order_routing_strategy, order_update_notice, DecodedError, ErrorDisposition, OrderRoutingStrategy,
     RoutingDecision,
 };
 use super::{
@@ -214,13 +214,16 @@ impl SharedChannels {
         selected
     }
 
-    // Deliver `message` to every live subscription registered for its type.
-    // With none, the frame is dropped: a shared response nobody asked for
-    // (e.g. `OpenOrder` from another client, or after the requester's drop).
-    fn send_message(&self, message_type: IncomingMessages, message: &ResponseMessage) {
-        if self.send_to(|subscriber| subscriber.receives(message_type), || message.clone().into()) == 0 {
-            debug!("no shared subscription for {message_type:?}: frame dropped");
+    // Deliver `message` to every live subscription registered for its type;
+    // returns whether any was. With none, the frame is dropped: a shared
+    // response nobody asked for (e.g. `OpenOrder` from another client, or
+    // after the requester's drop).
+    fn send_message(&self, message_type: IncomingMessages, message: &ResponseMessage) -> bool {
+        let delivered = self.send_to(|subscriber| subscriber.receives(message_type), || message.clone().into()) > 0;
+        if !delivered {
+            trace!("no shared subscription for {message_type:?}: frame dropped");
         }
+        delivered
     }
 
     // Deliver `message_fn()` once to every live subscription, then remove
@@ -333,6 +336,7 @@ pub struct TcpMessageBus<S: Stream> {
 
 impl<S: Stream> TcpMessageBus<S> {
     pub fn new(connection: Connection<S>) -> Result<TcpMessageBus<S>, Error> {
+        let order_taps = OrderTaps::new();
         let (signals_send, signals_recv) = channel::unbounded();
         let (shutdown_send, shutdown_recv) = channel::bounded(1);
         let shutdown = connection.shutdown_signal();
@@ -351,7 +355,7 @@ impl<S: Stream> TcpMessageBus<S> {
             shutdown,
             order_ids: OnceLock::new(),
             rate_limiter: OnceLock::new(),
-            order_taps: OrderTaps::default(),
+            order_taps,
             connection_state: ConnectionSignal::default(),
         })
     }
@@ -638,6 +642,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 self.shared_channels.fail_one_shot_channels(|| RoutedItem::Error(error.clone()));
             }
             ErrorDisposition::Route(id, item) => {
+                self.order_taps.publish_rejection(id, &item);
                 self.deliver(id, item, sent_to_update_stream);
             }
         }
@@ -684,11 +689,14 @@ impl<S: Stream> TcpMessageBus<S> {
     }
 
     fn process_orders(&self, message: ResponseMessage) {
-        let strategy = order_routing_strategy(message.message_type());
+        let foreign = is_foreign(&message, self.connection.client_id);
+        let strategy = order_routing_strategy(message.message_type(), foreign);
         let message_order_id = message.order_id().map(OrderId::from);
         let message_request_id = message.request_id().and_then(RequestId::from_raw);
 
-        self.order_taps.publish_status(&message);
+        if !foreign {
+            self.order_taps.publish_status(&message);
+        }
 
         match strategy {
             OrderRoutingStrategy::OrderUpdateOnly => {
@@ -708,19 +716,17 @@ impl<S: Stream> TcpMessageBus<S> {
                     warn!("could not route message {item:?}");
                 }
             }
-            OrderRoutingStrategy::OrderOrShared => {
+            OrderRoutingStrategy::OrderAndShared => {
                 let sent_to_update_stream = self.send_order_update(&message);
-
-                if let Some(order_id) = message_order_id {
-                    if self.orders.contains(&order_id) {
-                        let _ = self.orders.deliver(&order_id, message.into());
-                    } else {
-                        self.shared_channels.send_message(message.message_type(), &message);
+                let shared = self.shared_channels.send_message(message.message_type(), &message);
+                let unrouted = match message_order_id {
+                    Some(order_id) => self.orders.deliver(&order_id, message.into()).err(),
+                    None => Some(message.into()),
+                };
+                if let Some(item) = unrouted {
+                    if !shared && !sent_to_update_stream {
+                        warn!("could not route message {item:?}");
                     }
-                    return;
-                }
-                if !sent_to_update_stream {
-                    warn!("could not route message {message:?}");
                 }
             }
             OrderRoutingStrategy::ByExecutionId => {
@@ -739,6 +745,13 @@ impl<S: Stream> TcpMessageBus<S> {
             OrderRoutingStrategy::SharedOnly => {
                 self.shared_channels.send_message(message.message_type(), &message);
             }
+            OrderRoutingStrategy::ByRequestId => {
+                let execution_id = message.execution_id();
+                if let Err(item) = self.deliver_to_order_or_request(None, message_request_id, message.into(), execution_id.as_ref()) {
+                    debug!("another client's execution answers no request: {item:?}");
+                }
+            }
+            OrderRoutingStrategy::Ignore => {}
             OrderRoutingStrategy::ByOrderId => {
                 warn!("unhandled order message type: {message:?}");
             }
@@ -842,7 +855,7 @@ impl<S: Stream> TcpMessageBus<S> {
         })
     }
 
-    pub(crate) fn process_messages(self: &Arc<Self>, _server_version: i32) -> Result<(), Error> {
+    pub(crate) fn process_messages(self: &Arc<Self>) -> Result<(), Error> {
         let handle = self.start_dispatcher_thread();
         self.add_join_handle(handle);
 
@@ -937,6 +950,13 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     fn send_message(&self, message: &[u8]) -> Result<(), Error> {
         self.write_message(message)?;
         Ok(())
+    }
+
+    fn send_market_data_type(&self, message: &[u8]) -> Result<(), Error> {
+        // Remembered before the write: a reconnect between the two would
+        // otherwise replay the previous type after this call returned Ok.
+        self.connection.remember_market_data_type(message.to_vec());
+        self.write_message(message)
     }
 
     fn create_order_status_subscription(&self, order_id: OrderId) -> Result<InternalSubscription, Error> {
@@ -1039,8 +1059,10 @@ impl Entry<RoutedItem> {
             },
             None => item,
         };
-        if let Err(err) = self.sender.send(item) {
-            warn!("error sending: {id:?}, {err}")
+        // An unbounded send fails only once the receiver is gone: the
+        // subscription was dropped and its cleanup signal hasn't run yet.
+        if self.sender.send(item).is_err() {
+            trace!("discarding item for dropped subscription {id:?}");
         } else {
             warn_if_backlogged(format_args!("subscription queue for {id:?}"), self.sender.len());
         }
@@ -1180,16 +1202,16 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
 
     /// Send `message_fn()` to every route, skipping closed bounded ones (their
     /// stream already ended), then clear them all under the same write lock,
-    /// so a route registered meanwhile can't be cleared unnotified.
+    /// so a route registered meanwhile can't be cleared unnotified. A send
+    /// fails only for a dropped subscription not yet cleaned up, which has
+    /// nobody to tell.
     pub fn fail_all<F>(&self, message_fn: F)
     where
         F: Fn() -> RoutedItem,
     {
         let mut senders = self.write();
         for entry in senders.values().filter(|entry| !entry.closed()) {
-            if let Err(e) = entry.sender.send(message_fn()) {
-                warn!("error sending notification: {e}");
-            }
+            let _ = entry.sender.send(message_fn());
         }
         senders.clear();
     }

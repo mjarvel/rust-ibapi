@@ -15,7 +15,7 @@ use crate::subscriptions::SubscriptionItem;
 use crate::testdata::builders::orders::{
     cancel_order_request, commission_report, completed_order, completed_orders_end, completed_orders_request, execution_data, execution_data_end,
     executions_request, global_cancel_request, next_valid_order_id_request, open_order, open_order_end, open_orders_request, order_bound,
-    order_status, place_order_request,
+    order_status, place_order_request, CancelOrderRequestBuilder,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
 use crate::{server_versions, Client};
@@ -424,7 +424,7 @@ async fn test_executions() {
 
 #[tokio::test]
 async fn test_submit_order() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
     let contract = Contract {
@@ -760,7 +760,7 @@ async fn test_order_update_stream_ends_on_empty_action() {
 
 #[tokio::test]
 async fn test_order_update_stream_already_subscribed() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
 
     let stream1 = client.order_update_stream().await;
@@ -776,7 +776,7 @@ async fn test_order_update_stream_already_subscribed() {
 
 #[tokio::test]
 async fn test_order_update_stream_drop_releases_subscription() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
 
     let stream1 = client.order_update_stream().await.expect("failed to create initial order update stream");
@@ -790,7 +790,7 @@ async fn test_order_update_stream_drop_releases_subscription() {
 
 #[tokio::test]
 async fn test_global_cancel() {
-    let message_bus = Arc::new(MessageBusStub::with_responses(vec![]));
+    let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::REQ_GLOBAL_CANCEL);
 
     client.global_cancel().await.expect("failed to send global cancel");
@@ -1236,13 +1236,32 @@ async fn wait_for_fill_times_out_with_last_status() {
     assert!(matches!(&outcome, OrderOutcome::TimedOut(Some(s)) if s.filled == 40.0), "{outcome:?}");
 }
 
+/// No status seen for the order (e.g. placed on an earlier connection): the
+/// wait asks TWS for this client's open orders, then waits as usual.
 #[tokio::test]
-async fn wait_for_fill_times_out_without_status() {
-    let (client, _) = create_test_client_with_ordered_proto_responses(vec![]);
+async fn wait_for_fill_asks_for_open_orders_when_status_unseen() {
+    let (client, message_bus) = create_test_client_with_ordered_proto_responses(vec![]);
 
     let outcome = client.wait_for_fill(13, Duration::from_millis(20)).await.unwrap();
 
     assert_eq!(outcome, OrderOutcome::TimedOut(None));
+    assert_eq!(request_message_count(&message_bus), 1);
+    assert_request(&message_bus, 0, &open_orders_request());
+}
+
+/// An order TWS refuses with an error and no status (live: ES limit off the
+/// tick, 110) ends the wait at once instead of timing out.
+#[tokio::test]
+async fn wait_for_fill_reports_rejection_without_status() {
+    let (client, _) = create_test_client_with_ordered_proto_responses(vec![proto_error_response(
+        13,
+        110,
+        "The price does not conform to the minimum price variation for this contract.",
+    )]);
+
+    let outcome = client.wait_for_fill(13, Duration::from_secs(5)).await.unwrap();
+
+    assert!(matches!(&outcome, OrderOutcome::Rejected(n) if n.code == 110), "{outcome:?}");
 }
 
 #[tokio::test]
@@ -1287,7 +1306,10 @@ async fn sender_only_cancel_encodes_manual_time_at_the_supported_floor() {
     assert_request(
         &bus,
         0,
-        &cancel_order_request().order_id(42).manual_order_cancel_time("20261004-00:00:00"),
+        &CancelOrderRequestBuilder {
+            manual_order_cancel_time: "20261004-00:00:00".into(),
+            ..cancel_order_request().order_id(42)
+        },
     );
 }
 

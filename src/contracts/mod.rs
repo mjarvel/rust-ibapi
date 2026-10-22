@@ -640,6 +640,8 @@ pub struct ContractDetails {
     pub last_trade_time: String,
     /// Stock type.
     pub stock_type: String,
+    /// How the product settles on expiry: "Physical" or "Cash". Empty when TWS omits it.
+    pub settlement_method: String,
     /// The nine-character bond CUSIP. For Bonds only. Receiving CUSIPs requires a CUSIP market data subscription.
     pub cusip: String,
     /// Identifies the credit rating of the issuer. This field is not currently available from the TWS API. For Bonds only. A higher credit rating generally indicates a less risky investment. Bond ratings are from Moody's and S&P respectively. Not currently implemented due to bond market data restrictions.
@@ -915,20 +917,6 @@ pub struct SmartComponent {
 
 // ContractBuilder is deprecated - use the new builder methods on Contract instead
 // e.g., Contract::stock(), Contract::call(), Contract::put(), etc.
-
-#[cfg(all(test, feature = "utoipa"))]
-mod utoipa_tests {
-    use super::*;
-    fn assert_schema<T: utoipa::ToSchema>() {}
-
-    #[test]
-    fn schema_derives_work() {
-        assert_schema::<Contract>();
-        assert_schema::<ContractDetails>();
-        assert_schema::<SecurityType>();
-        assert_schema::<TagValue>();
-    }
-}
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

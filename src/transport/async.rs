@@ -27,7 +27,6 @@ use log::{debug, error, info, warn};
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task;
-use tokio::time::Duration;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -42,7 +41,7 @@ use super::common::{lock, log_orphan, report_unroutable_frame, Lease, LeaseRef};
 use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::routing::{
-    classify_error, determine_routing, order_routing_strategy, order_update_notice, DecodedError, ErrorDisposition, OrderRoutingStrategy,
+    classify_error, determine_routing, is_foreign, order_routing_strategy, order_update_notice, DecodedError, ErrorDisposition, OrderRoutingStrategy,
     RoutingDecision,
 };
 use super::{BufferBound, RoutedItem, SharedTicket};
@@ -217,6 +216,10 @@ pub trait AsyncMessageBus: Send + Sync {
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error>;
 
+    /// Keeps `message`, a `RequestMarketDataType`, so the connection re-sends
+    /// it after every reconnect, then writes it.
+    async fn send_market_data_type(&self, message: Vec<u8>) -> Result<(), Error>;
+
     /// Ends the subscription `ticket` names. `message` is the cancel to
     /// write for the last one; `None` for a stream TWS never cancels, which
     /// still releases the count.
@@ -387,6 +390,12 @@ impl AsyncInternalSubscription {
         }
     }
 
+    /// [`next`](Self::next) bounded by `deadline`: `Err(Error::Timeout)` once
+    /// it passes, `Ok(None)` when the stream has ended.
+    pub(crate) async fn next_before(&mut self, deadline: tokio::time::Instant) -> Result<Option<Result<ResponseMessage, Error>>, Error> {
+        tokio::time::timeout_at(deadline, self.next()).await.map_err(|_| Error::Timeout)
+    }
+
     pub async fn next(&mut self) -> Option<Result<ResponseMessage, Error>> {
         loop {
             let item = std::future::poll_fn(|cx| self.poll_next_routed(cx)).await?;
@@ -518,6 +527,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
 
         let shutdown = connection.shutdown_signal();
+        let order_taps = Arc::new(OrderTaps::new());
 
         let message_bus = Self {
             connection: Arc::new(connection),
@@ -525,7 +535,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             orders: Arc::new(SenderHash::new()),
             executions: Arc::new(SenderHash::new()),
             shared_channels: SharedChannels::new(|request| ChannelClass::of_shared(request).capacity(channel_capacity)),
-            order_taps: Arc::default(),
+            order_taps,
             channel_capacity,
             cleanup_sender,
             #[cfg(test)]
@@ -596,7 +606,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     }
 
     /// Start processing messages from TWS
-    pub fn process_messages(self: Arc<Self>, _server_version: i32, _reconnect_delay: Duration) -> Result<(), Error> {
+    pub fn process_messages(self: Arc<Self>) -> Result<(), Error> {
         let message_bus = self.clone();
         let shutdown = self.shutdown.clone();
 
@@ -852,6 +862,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                 self.shared_channels.fail_one_shot_channels(|| RoutedItem::Error(error.clone()));
             }
             ErrorDisposition::Route(id, item) => {
+                self.order_taps.publish_rejection(id, &item);
                 self.deliver(id, item, sent_to_update_stream).await;
             }
         }
@@ -884,12 +895,15 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
     /// Route message to order-specific channel
     async fn route_to_order_channel(&self, order_id: i32, message: ResponseMessage) -> Result<(), Error> {
-        let routed = self.send_order_update(&message);
-        let strategy = order_routing_strategy(message.message_type());
+        let foreign = is_foreign(&message, self.connection.client_id);
+        let routed = !foreign && self.send_order_update(&message);
+        let strategy = order_routing_strategy(message.message_type(), foreign);
         let message_order_id = message.order_id().map(OrderId::from);
         let message_request_id = message.request_id().and_then(RequestId::from_raw);
 
-        self.order_taps.publish_status(&message);
+        if !foreign {
+            self.order_taps.publish_status(&message);
+        }
 
         match strategy {
             OrderRoutingStrategy::OrderUpdateOnly => {}
@@ -906,21 +920,16 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                     warn!("could not route ExecutionDataEnd message {item:?}");
                 }
             }
-            OrderRoutingStrategy::OrderOrShared => {
-                if let Some(order_id) = message_order_id {
-                    // `contains` first, not `deliver`'s hand-back: the shared
-                    // fallback needs the message, and a second lookup is
-                    // cheaper than cloning every frame.
-                    if self.orders.contains(&order_id) {
-                        let _ = self.orders.deliver(&order_id, message.into());
-                        return Ok(());
+            OrderRoutingStrategy::OrderAndShared => {
+                let shared = self.shared_channels.send_message(message.message_type(), &message);
+                let unrouted = match message_order_id {
+                    Some(order_id) => self.orders.deliver(&order_id, message.into()).err(),
+                    None => Some(message.into()),
+                };
+                if let Some(item) = unrouted {
+                    if !shared && !routed {
+                        warn!("could not route message {item:?}");
                     }
-                    if self.shared_channels.send_message(message.message_type(), &message) {
-                        return Ok(());
-                    }
-                }
-                if !routed {
-                    warn!("could not route message {:?}", message);
                 }
             }
             OrderRoutingStrategy::ByExecutionId => {
@@ -939,6 +948,13 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                     warn!("could not route message {:?}", message);
                 }
             }
+            OrderRoutingStrategy::ByRequestId => {
+                let execution_id = message.execution_id();
+                if let Err(item) = self.deliver_to_order_or_request(None, message_request_id, message.into(), execution_id.as_ref()) {
+                    debug!("another client's execution answers no request: {item:?}");
+                }
+            }
+            OrderRoutingStrategy::Ignore => {}
             OrderRoutingStrategy::ByOrderId => {
                 let unrouted = if order_id >= 0 {
                     self.orders.deliver(&OrderId::from(order_id), message.into())
@@ -1028,18 +1044,6 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
     /// Route message to shared channel
     async fn route_to_shared_channel(&self, message_type: IncomingMessages, message: ResponseMessage) -> Result<(), Error> {
-        // Send order-related messages to order update stream
-        match message_type {
-            IncomingMessages::OpenOrder
-            | IncomingMessages::OrderStatus
-            | IncomingMessages::ExecutionData
-            | IncomingMessages::CommissionsReport
-            | IncomingMessages::CompletedOrder => {
-                self.send_order_update(&message);
-            }
-            _ => {}
-        }
-
         if !self.shared_channels.send_message(message_type, &message) {
             // Nothing claimed the frame. Silent until now, which is why a
             // desynchronized stream looked identical to an idle one.
@@ -1124,6 +1128,13 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     }
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error> {
+        self.write_message(&message).await
+    }
+
+    async fn send_market_data_type(&self, message: Vec<u8>) -> Result<(), Error> {
+        // Remembered before the write: a reconnect between the two would
+        // otherwise replay the previous type after this call returned Ok.
+        self.connection.remember_market_data_type(message.clone());
         self.write_message(&message).await
     }
 
