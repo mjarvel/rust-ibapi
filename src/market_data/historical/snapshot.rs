@@ -2,7 +2,6 @@
 
 use super::{common, BarTimestamp};
 use crate::messages::{IncomingMessages, ResponseMessage};
-use crate::proto::decoders::DecodeProto;
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{proto, Error};
 use serde::{Deserialize, Serialize};
