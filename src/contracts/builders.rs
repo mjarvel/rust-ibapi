@@ -3,6 +3,7 @@
 use super::types::*;
 use super::{ComboLeg, Contract, SecurityType};
 use crate::accounts::types::ContractId;
+use crate::builder::Missing;
 use crate::Error;
 
 /// Stock contract builder with type-safe API
@@ -117,12 +118,12 @@ impl OptionBuilder<Missing, Missing, Missing> {
 
 // Can only set strike when symbol is present
 impl<E> OptionBuilder<Symbol, Missing, E> {
-    /// Specify the option strike price.
-    pub fn strike(self, price: f64) -> OptionBuilder<Symbol, Strike, E> {
+    /// Specify the option strike price. [`build()`](OptionBuilder::build) checks it.
+    pub fn strike(self, price: f64) -> OptionBuilder<Symbol, f64, E> {
         OptionBuilder {
             symbol: self.symbol,
             right: self.right,
-            strike: Strike::new_unchecked(price),
+            strike: price,
             expiry: self.expiry,
             exchange: self.exchange,
             currency: self.currency,
@@ -200,13 +201,18 @@ impl<S, E> OptionBuilder<Symbol, S, E> {
 }
 
 // Build only available when all required fields are set
-impl OptionBuilder<Symbol, Strike, ExpirationDate> {
+impl OptionBuilder<Symbol, f64, ExpirationDate> {
     /// Finalize the option contract once symbol, strike, and expiry are set.
-    pub fn build(self) -> Contract {
-        Contract {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] unless the strike is positive and finite.
+    pub fn build(self) -> Result<Contract, Error> {
+        let strike = Strike::new(self.strike).map_err(Error::InvalidArgument)?;
+        Ok(Contract {
             symbol: self.symbol,
             security_type: SecurityType::Option,
-            strike: self.strike.value(),
+            strike: strike.value(),
             right: Some(self.right),
             last_trade_date_or_contract_month: self.expiry.to_string(),
             exchange: self.exchange,
@@ -215,7 +221,7 @@ impl OptionBuilder<Symbol, Strike, ExpirationDate> {
             primary_exchange: self.primary_exchange.unwrap_or_else(|| Exchange::from("")),
             trading_class: self.trading_class.unwrap_or_default(),
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -493,6 +499,7 @@ impl CryptoBuilder {
 #[must_use = "SpreadBuilder does nothing until you call .build()"]
 pub struct SpreadBuilder {
     legs: Vec<Leg>,
+    symbol: Symbol,
     currency: Currency,
     exchange: Exchange,
 }
@@ -507,19 +514,15 @@ pub struct Leg {
 }
 
 impl SpreadBuilder {
-    /// Create an empty spread builder ready to accept legs.
-    pub fn new() -> Self {
+    /// Create a spread builder for the combo `symbol`, ready to accept legs. See
+    /// [`Contract::spread`].
+    pub fn new(symbol: impl Into<Symbol>) -> Self {
         SpreadBuilder {
             legs: Vec::new(),
+            symbol: symbol.into(),
             currency: "USD".into(),
             exchange: "SMART".into(),
         }
-    }
-}
-
-impl Default for SpreadBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -553,21 +556,131 @@ impl SpreadBuilder {
 
     /// Vertical spread: buy the long leg, sell the short leg.
     ///
-    /// Chain two verticals for a four-leg strategy. An iron condor is a put vertical plus a
-    /// call vertical, each long the wing and short the body:
+    /// For an iron condor, use [`iron_condor`](Self::iron_condor).
     ///
     /// ```
     /// use ibapi::contracts::Contract;
     ///
-    /// let (long_put, short_put, short_call, long_call) = (100, 105, 110, 115);
-    /// let iron_condor = Contract::spread()
-    ///     .vertical(long_put, short_put)
-    ///     .vertical(long_call, short_call)
-    ///     .build()?;
+    /// let (long_call, short_call) = (100, 105);
+    /// let bull_call = Contract::spread("AAPL").vertical(long_call, short_call).build()?;
     /// # Ok::<(), ibapi::Error>(())
     /// ```
     pub fn vertical(self, long_id: impl Into<ContractId>, short_id: impl Into<ContractId>) -> Self {
         self.add_leg(long_id, LegAction::Buy).done().add_leg(short_id, LegAction::Sell).done()
+    }
+
+    /// Long straddle: buy a call and a put with the same strike and expiry.
+    ///
+    /// Buy the combo to open.
+    ///
+    /// ```
+    /// use ibapi::contracts::Contract;
+    ///
+    /// let (call, put) = (100, 101);
+    /// let straddle = Contract::spread("AAPL").straddle(call, put).build()?;
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn straddle(self, call_id: impl Into<ContractId>, put_id: impl Into<ContractId>) -> Self {
+        self.add_leg(call_id, LegAction::Buy).done().add_leg(put_id, LegAction::Buy).done()
+    }
+
+    /// Long strangle: buy an out-of-the-money call and put with the same expiry and different
+    /// strikes.
+    ///
+    /// Buy the combo to open. The legs are those of [`straddle`](Self::straddle); only the
+    /// strikes differ.
+    ///
+    /// ```
+    /// use ibapi::contracts::Contract;
+    ///
+    /// let (call, put) = (110, 90);
+    /// let strangle = Contract::spread("AAPL").strangle(call, put).build()?;
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn strangle(self, call_id: impl Into<ContractId>, put_id: impl Into<ContractId>) -> Self {
+        self.straddle(call_id, put_id)
+    }
+
+    /// Long butterfly: buy 1 lower, sell 2 middle, buy 1 upper.
+    ///
+    /// All legs share right and expiry. Buy the combo to open. The legs are named fields, so a
+    /// wing cannot be swapped with the body by argument order.
+    ///
+    /// ```
+    /// use ibapi::contracts::{ButterflyLegs, Contract};
+    ///
+    /// let butterfly = Contract::spread("AAPL")
+    ///     .butterfly(ButterflyLegs {
+    ///         lower: 100.into(),
+    ///         middle: 105.into(),
+    ///         upper: 110.into(),
+    ///     })
+    ///     .build()?;
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn butterfly(self, legs: ButterflyLegs) -> Self {
+        self.add_leg(legs.lower, LegAction::Buy)
+            .done()
+            .add_leg(legs.middle, LegAction::Sell)
+            .ratio(2)
+            .done()
+            .add_leg(legs.upper, LegAction::Buy)
+            .done()
+    }
+
+    /// Iron condor: a put vertical plus a call vertical, each long the wing and short the body.
+    ///
+    /// Legs are added as buy long put, sell short put, buy long call, sell short call. Buy the
+    /// combo to open: it opens for a credit, so the limit price is negative. TWS rejects a
+    /// positive price with 201 ("Guaranteed-to-Lose"). The legs are named fields because four
+    /// ids in a fixed order compile when swapped and build a different strategy.
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, IronCondorLegs};
+    ///
+    /// let iron_condor = Contract::spread("AAPL")
+    ///     .iron_condor(IronCondorLegs {
+    ///         long_put: 100.into(),
+    ///         short_put: 105.into(),
+    ///         short_call: 110.into(),
+    ///         long_call: 115.into(),
+    ///     })
+    ///     .build()?;
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn iron_condor(self, legs: IronCondorLegs) -> Self {
+        self.vertical(legs.long_put, legs.short_put).vertical(legs.long_call, legs.short_call)
+    }
+
+    /// Collar: buy the stock, buy a put below it as a floor, sell a call above it as a cap.
+    ///
+    /// Legs are added as buy stock (ratio `shares_per_contract`), buy put, sell call. Buy the
+    /// combo to open. The limit price is per combo, a debit of about
+    /// `shares_per_contract × spot + put − call`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{CollarLegs, Contract};
+    ///
+    /// let collar = Contract::spread("AAPL")
+    ///     .collar(CollarLegs {
+    ///         stock: 265598.into(),
+    ///         put: 100.into(),
+    ///         call: 101.into(),
+    ///         shares_per_contract: 100,
+    ///     })
+    ///     .build()?;
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn collar(self, legs: CollarLegs) -> Self {
+        self.add_leg(legs.stock, LegAction::Buy)
+            .ratio(legs.shares_per_contract)
+            .done()
+            .add_leg(legs.put, LegAction::Buy)
+            .done()
+            .add_leg(legs.call, LegAction::Sell)
+            .done()
     }
 
     /// Override the spread currency, useful for non-USD underlyings.
@@ -582,10 +695,14 @@ impl SpreadBuilder {
         self
     }
 
-    /// Finalize the spread contract, returning an error if no legs were added.
+    /// Finalize the spread contract, returning an error if no legs were added or the symbol is
+    /// empty (TWS rejects a combo without one with 321).
     pub fn build(self) -> Result<Contract, Error> {
         if self.legs.is_empty() {
             return Err(Error::InvalidArgument("Spread must have at least one leg".into()));
+        }
+        if self.symbol.as_str().is_empty() {
+            return Err(Error::InvalidArgument("Spread requires a symbol".into()));
         }
 
         let combo_legs: Vec<ComboLeg> = self
@@ -601,6 +718,7 @@ impl SpreadBuilder {
             .collect();
 
         Ok(Contract {
+            symbol: self.symbol,
             security_type: SecurityType::Spread,
             currency: self.currency,
             exchange: self.exchange,
@@ -608,6 +726,47 @@ impl SpreadBuilder {
             ..Default::default()
         })
     }
+}
+
+/// Legs of a [`SpreadBuilder::butterfly`], by option contract id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ButterflyLegs {
+    /// Lower-strike wing, bought.
+    pub lower: ContractId,
+    /// Middle strike, sold twice.
+    pub middle: ContractId,
+    /// Upper-strike wing, bought.
+    pub upper: ContractId,
+}
+
+/// Legs of a [`SpreadBuilder::iron_condor`], by option contract id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IronCondorLegs {
+    /// Lowest-strike put, bought.
+    pub long_put: ContractId,
+    /// Higher-strike put, sold.
+    pub short_put: ContractId,
+    /// Lower-strike call, sold.
+    pub short_call: ContractId,
+    /// Highest-strike call, bought.
+    pub long_call: ContractId,
+}
+
+/// Legs of a [`SpreadBuilder::collar`], by contract id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollarLegs {
+    /// The underlying stock, bought.
+    pub stock: ContractId,
+    /// Put below the stock price, bought.
+    pub put: ContractId,
+    /// Call above the stock price, sold.
+    pub call: ContractId,
+    /// Shares one option contract delivers: the stock leg's ratio. Usually 100, and for
+    /// split-adjusted options usually the option's `multiplier` (see
+    /// [`ContractDetails`](crate::contracts::ContractDetails)). After a merger or spin-off the
+    /// deliverable can differ from both, so check it before collaring an adjusted option. A
+    /// wrong value still places, as a mis-hedged position rather than a collar.
+    pub shares_per_contract: i32,
 }
 
 /// Builder for individual spread legs

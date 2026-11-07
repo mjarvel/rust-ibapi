@@ -10,7 +10,7 @@ use crate::orders::conditions::TriggerMethod;
 use crate::orders::OrderId;
 use crate::orders::{
     Action, OcaType, Order, OrderComboLeg, OrderCondition, OrderOpenClose, OrderOrigin, ReferencePriceType, Rule80A, ShortSaleSlot, TimeInForce,
-    VolatilityType, COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID,
+    VolatilityType, WhatIfType, COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID,
 };
 
 #[cfg(test)]
@@ -46,6 +46,7 @@ pub struct OrderBuilder<T> {
     algo_strategy: Option<String>,
     algo_params: Vec<TagValue>,
     pub(crate) what_if: bool,
+    what_if_type: Option<WhatIfType>,
 
     // Advanced fields
     discretionary_amt: Option<f64>,
@@ -187,6 +188,9 @@ impl<'a, C> OrderBuilder<ClientBound<'a, C>> {
 
     /// Build the order and return it without submitting
     /// Useful for batch operations or custom submission logic
+    ///
+    /// # Errors
+    /// [`Error::Validation`](crate::Error::Validation) if the builder's inputs fail validation.
     pub fn build_order(self) -> Result<Order, crate::Error> {
         self.build().map_err(Into::into)
     }
@@ -244,6 +248,7 @@ impl<T> OrderBuilder<T> {
             algo_strategy: None,
             algo_params: Vec::new(),
             what_if: false,
+            what_if_type: None,
             discretionary_amt: None,
             trailing_percent: None,
             trail_stop_price: None,
@@ -430,6 +435,11 @@ impl<T> OrderBuilder<T> {
     /// that doesn't take it is dropped: `.limit(100.0).order_type(OrderType::PeggedToStock)` sends
     /// no limit price. Prefer the named setter (`.relative(..)`, `.pegged_to_midpoint(..)`, ...).
     ///
+    /// `MarketOnOpen`, `LimitOnOpen` and `AtAuction` go out as `MKT`, `LMT` and `MTL`; the time in
+    /// force is what makes them, so these also set it (`OnOpen`, `OnOpen`, `Auction`), as their
+    /// named setters do. It replaces an earlier time in force; a later time-in-force setter
+    /// overrides it.
+    ///
     /// # Examples
     ///
     /// ```
@@ -442,6 +452,9 @@ impl<T> OrderBuilder<T> {
     /// # Ok::<(), ibapi::orders::builder::ValidationError>(())
     /// ```
     pub fn order_type(mut self, order_type: OrderType) -> Self {
+        if let Some(tif) = order_type.implied_time_in_force() {
+            self.time_in_force = tif;
+        }
         self.order_type = Some(order_type);
         self
     }
@@ -550,12 +563,46 @@ impl<T> OrderBuilder<T> {
         self
     }
 
+    /// Relative + Limit combo (`REL + LMT`); `limit_price` caps the combo
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::Order;
+    ///
+    /// let order = Order::builder().buy(1).relative_limit_combo(2.5).non_guaranteed().build()?;
+    /// assert_eq!(order.order_type, "REL + LMT");
+    /// assert_eq!(order.limit_price, Some(2.5));
+    /// # Ok::<(), ibapi::orders::builder::ValidationError>(())
+    /// ```
+    pub fn relative_limit_combo(mut self, limit_price: impl Into<f64>) -> Self {
+        self.limit_price = Some(limit_price.into());
+        // `build()` sends `aux_price` for the REL combos, so clear any an earlier setter wrote;
+        // C# `OrderSamples` sets none.
+        self.aux_price = None;
+        self.order_type(OrderType::RelativeLimitCombo)
+    }
+
+    /// Relative + Market combo (`REL + MKT`), with no limit price
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::Order;
+    ///
+    /// let order = Order::builder().buy(1).relative_market_combo().build()?;
+    /// assert_eq!(order.order_type, "REL + MKT");
+    /// # Ok::<(), ibapi::orders::builder::ValidationError>(())
+    /// ```
+    pub fn relative_market_combo(mut self) -> Self {
+        self.aux_price = None;
+        self.order_type(OrderType::RelativeMarketCombo)
+    }
+
     /// At Auction - for pre-market opening period execution
     pub fn at_auction(mut self, price: impl Into<f64>) -> Self {
-        self.order_type = Some(OrderType::AtAuction);
         self.limit_price = Some(price.into());
-        self.time_in_force = TimeInForce::Auction;
-        self
+        self.order_type(OrderType::AtAuction)
     }
 
     /// Market on Close - executes as market order at or near closing price
@@ -572,18 +619,35 @@ impl<T> OrderBuilder<T> {
     }
 
     /// Market on Open - executes as market order at market open
-    pub fn market_on_open(mut self) -> Self {
-        self.order_type = Some(OrderType::Market);
-        self.time_in_force = TimeInForce::OnOpen;
-        self
+    pub fn market_on_open(self) -> Self {
+        self.order_type(OrderType::MarketOnOpen)
     }
 
     /// Limit on Open - executes as limit order at market open
     pub fn limit_on_open(mut self, limit_price: impl Into<f64>) -> Self {
-        self.order_type = Some(OrderType::Limit);
         self.limit_price = Some(limit_price.into());
-        self.time_in_force = TimeInForce::OnOpen;
-        self
+        self.order_type(OrderType::LimitOnOpen)
+    }
+
+    /// Volatility order (`VOL`) - TWS derives the limit price from `volatility` (options and futures options)
+    ///
+    /// `volatility` is a percentage (`40.0` = 40%), per C# `OrderSamples`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::{Order, VolatilityType};
+    ///
+    /// let order = Order::builder().buy(1).volatility_order(40.0, VolatilityType::Annual).build()?;
+    /// assert_eq!(order.order_type, "VOL");
+    /// assert_eq!(order.volatility, Some(40.0));
+    /// assert_eq!(order.volatility_type, Some(VolatilityType::Annual));
+    /// # Ok::<(), ibapi::orders::builder::ValidationError>(())
+    /// ```
+    pub fn volatility_order(mut self, volatility: f64, volatility_type: VolatilityType) -> Self {
+        self.volatility = Some(volatility);
+        self.volatility_type = Some(volatility_type);
+        self.order_type(OrderType::Volatility)
     }
 
     /// Market with Protection - market order with protection against extreme price movements (futures only)
@@ -910,7 +974,7 @@ impl<T> OrderBuilder<T> {
     /// The first condition is always treated as AND. Use `and_condition()` or `or_condition()`
     /// for subsequent conditions to specify the logical relationship.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```ignore
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -928,6 +992,15 @@ impl<T> OrderBuilder<T> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// A condition builder becomes a condition only once its comparison is set:
+    ///
+    /// ```compile_fail,E0277
+    /// use ibapi::orders::builder::price;
+    /// use ibapi::orders::OrderCondition;
+    ///
+    /// let condition: OrderCondition = price(265598, "SMART").into();
+    /// ```
     pub fn condition(mut self, condition: impl Into<OrderCondition>) -> Self {
         let mut cond = condition.into();
         set_conjunction(&mut cond, true);
@@ -937,7 +1010,7 @@ impl<T> OrderBuilder<T> {
 
     /// Add a condition that must be met along with previous conditions (AND logic).
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```ignore
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -966,7 +1039,7 @@ impl<T> OrderBuilder<T> {
 
     /// Add a condition where either this OR previous conditions trigger the order (OR logic).
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```ignore
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1066,9 +1139,45 @@ impl<T> OrderBuilder<T> {
         self
     }
 
+    /// Set what a what-if order checks; see [`WhatIfType`].
+    ///
+    /// Use it with `.analyze()`, which makes the order what-if. It does not make the order
+    /// what-if itself: with `.submit()`, TWS rejects the order with error 321 and nothing is
+    /// placed.
+    ///
+    /// Requires TWS/Gateway server version 217 (`ADDITIONAL_ORDER_PARAMS_2`) or later.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "async")]
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use ibapi::Client;
+    /// # use ibapi::contracts::Contract;
+    /// # let client = Client::connect("127.0.0.1:4002", 100).await?;
+    /// # let contract = Contract::stock("AAPL").build();
+    /// use ibapi::orders::WhatIfType;
+    ///
+    /// let _ = client
+    ///     .order(&contract)
+    ///     .buy(100)
+    ///     .limit(50.0)
+    ///     .what_if_type(WhatIfType::MarginRequirements)
+    ///     .analyze()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn what_if_type(mut self, what_if_type: WhatIfType) -> Self {
+        self.what_if_type = Some(what_if_type);
+        self
+    }
+
     // Additional order attributes
 
-    /// Set volatility for volatility orders
+    /// Set the volatility figure for a volatility order, as a percentage (`40.0` = 40%).
+    ///
+    /// Sets the figure only, not the order type; [`volatility_order`](Self::volatility_order)
+    /// builds a VOL order in one call.
     pub fn volatility(mut self, volatility: f64) -> Self {
         self.volatility = Some(volatility);
         self
@@ -1094,7 +1203,7 @@ impl<T> OrderBuilder<T> {
     ///     .order(&contract)
     ///     .buy(1)
     ///     .order_type(OrderType::Volatility)
-    ///     .volatility(0.25)
+    ///     .volatility(40.0)
     ///     .volatility_type(VolatilityType::Annual)
     ///     .submit()
     ///     .await?;
@@ -1118,14 +1227,12 @@ impl<T> OrderBuilder<T> {
     /// # use ibapi::contracts::Contract;
     /// # let client = Client::connect("127.0.0.1:4002", 100).await?;
     /// # let contract = Contract::stock("AAPL").build();
-    /// use ibapi::orders::ReferencePriceType;
-    /// use ibapi::orders::builder::OrderType;
+    /// use ibapi::orders::{ReferencePriceType, VolatilityType};
     ///
     /// let _ = client
     ///     .order(&contract)
     ///     .buy(1)
-    ///     .order_type(OrderType::Volatility)
-    ///     .volatility(0.25)
+    ///     .volatility_order(40.0, VolatilityType::Annual)
     ///     .reference_price_type(ReferencePriceType::AverageOfNBBO)
     ///     .submit()
     ///     .await?;
@@ -1617,6 +1724,7 @@ impl<T> OrderBuilder<T> {
         }
 
         order.what_if = self.what_if;
+        order.what_if_type = self.what_if_type;
 
         // Set advanced fields
         if let Some(amt) = self.discretionary_amt {

@@ -1,7 +1,7 @@
 use crate::common::test_utils::helpers::{assert_decimal_parse_error, assert_missing_field};
 
 #[test]
-fn test_decode_server_time_proto_via_builder() {
+fn decode_server_time_proto_via_builder() {
     use crate::testdata::builders::accounts::current_time;
     use crate::testdata::builders::ResponseProtoEncoder;
     use time::macros::datetime;
@@ -12,7 +12,7 @@ fn test_decode_server_time_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_server_time_millis_proto_via_builder() {
+fn decode_server_time_millis_proto_via_builder() {
     use crate::testdata::builders::accounts::current_time_in_millis;
     use crate::testdata::builders::ResponseProtoEncoder;
     use time::macros::datetime;
@@ -23,7 +23,7 @@ fn test_decode_server_time_millis_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_account_update_time_proto() {
+fn decode_account_update_time_proto_works() {
     let proto_msg = crate::proto::AccountUpdateTime {
         time_stamp: Some("12:34:56".into()),
     };
@@ -33,7 +33,7 @@ fn test_decode_account_update_time_proto() {
 }
 
 #[test]
-fn test_decode_position_proto() {
+fn decode_position_proto_works() {
     let proto_msg = crate::proto::Position {
         account: Some("DU1234".into()),
         contract: Some(crate::proto::Contract {
@@ -57,7 +57,7 @@ fn test_decode_position_proto() {
 }
 
 #[test]
-fn test_decode_position_proto_via_builder() {
+fn decode_position_proto_via_builder() {
     use crate::testdata::builders::positions::position;
     use crate::testdata::builders::ResponseProtoEncoder;
 
@@ -81,7 +81,7 @@ fn test_decode_position_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_pnl_proto() {
+fn decode_pnl_proto_works() {
     let proto_msg = crate::proto::PnL {
         req_id: Some(1),
         daily_pn_l: Some(1234.56),
@@ -90,13 +90,13 @@ fn test_decode_pnl_proto() {
     };
 
     let result = super::decode_pnl_proto(proto_msg).unwrap();
-    assert_eq!(result.daily_pnl, 1234.56);
+    assert_eq!(result.daily_pnl, Some(1234.56));
     assert_eq!(result.unrealized_pnl, Some(500.0));
-    assert_eq!(result.realized_pnl, None); // f64::MAX filtered out
+    assert_eq!(result.realized_pnl, None); // f64::MAX (C#'s unset sentinel) reads as unset
 }
 
 #[test]
-fn test_decode_account_value_proto() {
+fn decode_account_value_proto_works() {
     let proto_msg = crate::proto::AccountValue {
         key: Some("NetLiquidation".into()),
         value: Some("100000".into()),
@@ -112,7 +112,7 @@ fn test_decode_account_value_proto() {
 }
 
 #[test]
-fn test_decode_account_portfolio_value_proto() {
+fn decode_account_portfolio_value_proto_works() {
     let proto_msg = crate::proto::PortfolioValue {
         contract: Some(crate::proto::Contract {
             sec_type: Some("STK".into()),
@@ -137,7 +137,7 @@ fn test_decode_account_portfolio_value_proto() {
 }
 
 #[test]
-fn test_decode_pnl_single_proto() {
+fn decode_pnl_single_proto_works() {
     let proto_msg = crate::proto::PnLSingle {
         req_id: Some(1),
         position: Some("500".into()),
@@ -149,14 +149,45 @@ fn test_decode_pnl_single_proto() {
 
     let result = super::decode_pnl_single_proto(proto_msg).unwrap();
     assert_eq!(result.position, 500.0);
-    assert_eq!(result.daily_pnl, 1000.0);
-    assert_eq!(result.unrealized_pnl, 2000.0);
-    assert_eq!(result.realized_pnl, 500.0);
-    assert_eq!(result.value, 75000.0);
+    assert_eq!(result.daily_pnl, Some(1000.0));
+    assert_eq!(result.unrealized_pnl, Some(2000.0));
+    assert_eq!(result.realized_pnl, Some(500.0));
+    assert_eq!(result.value, Some(75000.0));
+}
+
+/// TWS omits a figure it has no value for (live 2026-11-05, `docs/wire-facts/accounts.md`).
+/// `f64::MAX`, the C# client's own sentinel for an omitted figure, is never sent by TWS but is
+/// read as unset too, defensively. Both decode as `None`.
+#[test]
+fn decode_pnl_unset_values() {
+    use crate::testdata::builders::accounts::{pnl, pnl_single};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    for unset in [None, Some(f64::MAX)] {
+        let p = pnl().daily_pnl(unset).unrealized_pnl(unset).realized_pnl(unset).to_proto();
+        let pnl = super::decode_pnl_proto(p).unwrap();
+        assert_eq!(pnl.daily_pnl, None, "{unset:?}");
+        assert_eq!(pnl.unrealized_pnl, None, "{unset:?}");
+        assert_eq!(pnl.realized_pnl, None, "{unset:?}");
+
+        let p = pnl_single()
+            .position(500.0)
+            .daily_pnl(unset)
+            .unrealized_pnl(unset)
+            .realized_pnl(unset)
+            .value(unset)
+            .to_proto();
+        let single = super::decode_pnl_single_proto(p).unwrap();
+        assert_eq!(single.position, 500.0);
+        assert_eq!(single.daily_pnl, None, "{unset:?}");
+        assert_eq!(single.unrealized_pnl, None, "{unset:?}");
+        assert_eq!(single.realized_pnl, None, "{unset:?}");
+        assert_eq!(single.value, None, "{unset:?}");
+    }
 }
 
 #[test]
-fn test_decode_account_summary_proto() {
+fn decode_account_summary_proto_works() {
     let proto_msg = crate::proto::AccountSummary {
         req_id: Some(1),
         account: Some("DU1234".into()),
@@ -173,7 +204,7 @@ fn test_decode_account_summary_proto() {
 }
 
 #[test]
-fn test_decode_position_multi_proto() {
+fn decode_position_multi_proto_works() {
     let proto_msg = crate::proto::PositionMulti {
         req_id: Some(1),
         account: Some("DU1234".into()),
@@ -197,7 +228,7 @@ fn test_decode_position_multi_proto() {
 }
 
 #[test]
-fn test_decode_account_multi_value_proto() {
+fn decode_account_multi_value_proto_works() {
     let proto_msg = crate::proto::AccountUpdateMulti {
         req_id: Some(1),
         account: Some("DU1234".into()),
@@ -224,7 +255,7 @@ fn test_decode_account_multi_value_proto() {
 // here, not in a self-loop.
 
 #[test]
-fn test_decode_position_multi_proto_via_builder() {
+fn decode_position_multi_proto_via_builder() {
     use crate::testdata::builders::positions::position_multi;
     use crate::testdata::builders::ResponseProtoEncoder;
 
@@ -249,7 +280,7 @@ fn test_decode_position_multi_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_account_value_proto_via_builder() {
+fn decode_account_value_proto_via_builder() {
     use crate::testdata::builders::accounts::account_value;
     use crate::testdata::builders::ResponseProtoEncoder;
 
@@ -269,7 +300,7 @@ fn test_decode_account_value_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_account_summary_proto_via_builder() {
+fn decode_account_summary_proto_via_builder() {
     use crate::testdata::builders::accounts::account_summary;
     use crate::testdata::builders::ResponseProtoEncoder;
 
@@ -290,7 +321,7 @@ fn test_decode_account_summary_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_account_multi_value_proto_via_builder() {
+fn decode_account_multi_value_proto_via_builder() {
     use crate::testdata::builders::accounts::account_update_multi;
     use crate::testdata::builders::ResponseProtoEncoder;
 
@@ -312,43 +343,47 @@ fn test_decode_account_multi_value_proto_via_builder() {
 }
 
 #[test]
-fn test_decode_pnl_proto_via_builder() {
+fn decode_pnl_proto_via_builder() {
     use crate::testdata::builders::accounts::pnl;
     use crate::testdata::builders::ResponseProtoEncoder;
 
-    let p = pnl().daily_pnl(1234.56).unrealized_pnl(Some(500.0)).realized_pnl(Some(250.0)).to_proto();
+    let p = pnl()
+        .daily_pnl(Some(1234.56))
+        .unrealized_pnl(Some(500.0))
+        .realized_pnl(Some(250.0))
+        .to_proto();
 
     let result = super::decode_pnl_proto(p).unwrap();
 
-    assert_eq!(result.daily_pnl, 1234.56);
+    assert_eq!(result.daily_pnl, Some(1234.56));
     assert_eq!(result.unrealized_pnl, Some(500.0));
     assert_eq!(result.realized_pnl, Some(250.0));
 }
 
 #[test]
-fn test_decode_pnl_single_proto_via_builder() {
+fn decode_pnl_single_proto_via_builder() {
     use crate::testdata::builders::accounts::pnl_single;
     use crate::testdata::builders::ResponseProtoEncoder;
 
     let p = pnl_single()
         .position(500.0)
-        .daily_pnl(1000.0)
-        .unrealized_pnl(2000.0)
-        .realized_pnl(500.0)
-        .value(75000.0)
+        .daily_pnl(Some(1000.0))
+        .unrealized_pnl(Some(2000.0))
+        .realized_pnl(Some(500.0))
+        .value(Some(75000.0))
         .to_proto();
 
     let result = super::decode_pnl_single_proto(p).unwrap();
 
     assert_eq!(result.position, 500.0);
-    assert_eq!(result.daily_pnl, 1000.0);
-    assert_eq!(result.unrealized_pnl, 2000.0);
-    assert_eq!(result.realized_pnl, 500.0);
-    assert_eq!(result.value, 75000.0);
+    assert_eq!(result.daily_pnl, Some(1000.0));
+    assert_eq!(result.unrealized_pnl, Some(2000.0));
+    assert_eq!(result.realized_pnl, Some(500.0));
+    assert_eq!(result.value, Some(75000.0));
 }
 
 #[test]
-fn test_decode_managed_accounts_proto() {
+fn decode_managed_accounts_proto_works() {
     let proto_msg = crate::proto::ManagedAccounts {
         accounts_list: Some("DU1111,DU2222,DU3333".into()),
     };
@@ -358,7 +393,7 @@ fn test_decode_managed_accounts_proto() {
 }
 
 #[test]
-fn test_decode_managed_accounts_proto_skips_empty() {
+fn decode_managed_accounts_proto_skips_empty() {
     // Trailing comma is the wire shape TWS sometimes emits; empty fields filtered out.
     let proto_msg = crate::proto::ManagedAccounts {
         accounts_list: Some("DU1111,,DU2222,".into()),
@@ -369,7 +404,7 @@ fn test_decode_managed_accounts_proto_skips_empty() {
 }
 
 #[test]
-fn test_decode_managed_accounts_proto_empty_list() {
+fn decode_managed_accounts_proto_empty_list() {
     let proto_msg = crate::proto::ManagedAccounts { accounts_list: None };
 
     let result = super::decode_managed_accounts_proto(proto_msg).unwrap();
@@ -377,7 +412,7 @@ fn test_decode_managed_accounts_proto_empty_list() {
 }
 
 #[test]
-fn test_decode_family_codes_proto() {
+fn decode_family_codes_proto_works() {
     let proto_msg = crate::proto::FamilyCodes {
         family_codes: vec![
             crate::proto::FamilyCode {
@@ -400,7 +435,7 @@ fn test_decode_family_codes_proto() {
 }
 
 #[test]
-fn test_decode_family_codes_proto_empty() {
+fn decode_family_codes_proto_empty() {
     let proto_msg = crate::proto::FamilyCodes { family_codes: vec![] };
 
     let result = super::decode_family_codes_proto(proto_msg).unwrap();
@@ -408,7 +443,7 @@ fn test_decode_family_codes_proto_empty() {
 }
 
 #[test]
-fn test_decode_soft_dollar_tiers_proto_round_trip() {
+fn decode_soft_dollar_tiers_proto_round_trip() {
     let p = crate::proto::SoftDollarTiers {
         req_id: Some(1),
         soft_dollar_tiers: vec![
@@ -431,7 +466,7 @@ fn test_decode_soft_dollar_tiers_proto_round_trip() {
 }
 
 #[test]
-fn test_decode_user_info_proto_round_trip() {
+fn decode_user_info_proto_round_trip() {
     let p = crate::proto::UserInfo {
         req_id: Some(1),
         white_branding_id: Some("brand-xyz".into()),
@@ -441,7 +476,7 @@ fn test_decode_user_info_proto_round_trip() {
 }
 
 #[test]
-fn test_decode_receive_fa_proto_round_trip() {
+fn decode_receive_fa_proto_round_trip() {
     use crate::accounts::FaDataType;
 
     let p = crate::proto::ReceiveFa {
@@ -454,7 +489,7 @@ fn test_decode_receive_fa_proto_round_trip() {
 }
 
 #[test]
-fn test_decode_receive_fa_rejects_invalid_fa_data_type() {
+fn decode_receive_fa_rejects_invalid_fa_data_type() {
     let p = crate::proto::ReceiveFa {
         fa_data_type: Some(2),
         xml: Some("<bad/>".into()),
@@ -464,7 +499,7 @@ fn test_decode_receive_fa_rejects_invalid_fa_data_type() {
 }
 
 #[test]
-fn test_decode_receive_fa_rejects_missing_fa_data_type() {
+fn decode_receive_fa_rejects_missing_fa_data_type() {
     let p = crate::proto::ReceiveFa {
         fa_data_type: None,
         xml: Some("<groups/>".into()),
@@ -474,7 +509,7 @@ fn test_decode_receive_fa_rejects_missing_fa_data_type() {
 }
 
 #[test]
-fn test_decode_replace_fa_end_proto_round_trip() {
+fn decode_replace_fa_end_proto_round_trip() {
     let p = crate::proto::ReplaceFaEnd {
         req_id: Some(7),
         text: Some("done".into()),
@@ -484,7 +519,7 @@ fn test_decode_replace_fa_end_proto_round_trip() {
 }
 
 #[test]
-fn test_decode_verify_message_api_proto_round_trip() {
+fn decode_verify_message_api_proto_round_trip() {
     let p = crate::proto::VerifyMessageApi {
         api_data: Some("payload".into()),
     };
@@ -493,7 +528,7 @@ fn test_decode_verify_message_api_proto_round_trip() {
 }
 
 #[test]
-fn test_decode_verify_completed_proto_round_trip() {
+fn decode_verify_completed_proto_round_trip() {
     let p = crate::proto::VerifyCompleted {
         is_successful: Some(true),
         error_text: Some(String::new()),
@@ -504,7 +539,7 @@ fn test_decode_verify_completed_proto_round_trip() {
 }
 
 #[test]
-fn test_decode_verify_completed_proto_failure_path() {
+fn decode_verify_completed_proto_failure_path() {
     let p = crate::proto::VerifyCompleted {
         is_successful: Some(false),
         error_text: Some("signature mismatch".into()),
@@ -517,7 +552,7 @@ fn test_decode_verify_completed_proto_failure_path() {
 // === decimal wire fields are routed through parse_optional_decimal (issue #716) ===
 
 #[test]
-fn test_decode_position_proto_preserves_fractional_position() {
+fn decode_position_proto_preserves_fractional_position() {
     // Crypto and fractional-share accounts really do report these; the old
     // `parse_f64` path happened to handle them, but nothing pinned it.
     use crate::testdata::builders::positions::position;
@@ -528,7 +563,7 @@ fn test_decode_position_proto_preserves_fractional_position() {
 }
 
 #[test]
-fn test_decode_position_proto_rejects_malformed_position() {
+fn decode_position_proto_rejects_malformed_position() {
     // The builder stringifies an f64, so a malformed wire value needs raw proto.
     let p = crate::proto::Position {
         account: Some("DU1234".into()),
@@ -545,7 +580,7 @@ fn test_decode_position_proto_rejects_malformed_position() {
 }
 
 #[test]
-fn test_decode_position_multi_proto_rejects_malformed_position() {
+fn decode_position_multi_proto_rejects_malformed_position() {
     let p = crate::proto::PositionMulti {
         req_id: Some(9000),
         account: Some("DU1234".into()),
@@ -563,7 +598,7 @@ fn test_decode_position_multi_proto_rejects_malformed_position() {
 }
 
 #[test]
-fn test_decode_account_portfolio_value_proto_rejects_malformed_position() {
+fn decode_account_portfolio_value_proto_rejects_malformed_position() {
     let p = crate::proto::PortfolioValue {
         contract: Some(crate::proto::Contract {
             sec_type: Some("STK".into()),
@@ -578,7 +613,7 @@ fn test_decode_account_portfolio_value_proto_rejects_malformed_position() {
 }
 
 #[test]
-fn test_decode_pnl_single_proto_rejects_malformed_position() {
+fn decode_pnl_single_proto_rejects_malformed_position() {
     let p = crate::proto::PnLSingle {
         req_id: Some(9000),
         position: Some("abc".into()),
@@ -592,7 +627,7 @@ fn test_decode_pnl_single_proto_rejects_malformed_position() {
 // reference clients (EDecoder.cs PositionEventProtoBuf and siblings) return
 // before the typed callback here.
 #[test]
-fn test_decode_position_frames_require_contract() {
+fn decode_position_frames_require_contract() {
     use crate::common::test_utils::helpers::constants::TEST_CONTRACT_ID;
     use crate::testdata::builders::accounts::portfolio_value;
     use crate::testdata::builders::positions::{position, position_multi};
@@ -628,4 +663,87 @@ fn test_decode_position_frames_require_contract() {
         assert_eq!(contract_id, TEST_CONTRACT_ID, "{message}");
         assert_missing_field(missing, "contract", message);
     }
+}
+
+// Absent position quantity: Error::Parse, not a fabricated flat 0 (#1088).
+// An explicit "0" is how TWS reports a closed position (live) and still decodes.
+#[test]
+fn decode_position_frames_require_position() {
+    use crate::testdata::builders::accounts::{pnl_single, portfolio_value};
+    use crate::testdata::builders::positions::{position, position_multi};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    let position = position().to_proto();
+    let position_multi = position_multi().to_proto();
+    let portfolio = portfolio_value().to_proto();
+    let pnl_single = pnl_single().to_proto();
+    let zero = || Some("0".to_string());
+    let cases = [
+        (
+            "Position",
+            super::decode_position_proto(crate::proto::Position {
+                position: zero(),
+                ..position.clone()
+            })
+            .map(|p| p.position),
+            super::decode_position_proto(crate::proto::Position { position: None, ..position }).map(|p| p.position),
+        ),
+        (
+            "PositionMulti",
+            super::decode_position_multi_proto(crate::proto::PositionMulti {
+                position: zero(),
+                ..position_multi.clone()
+            })
+            .map(|p| p.position),
+            super::decode_position_multi_proto(crate::proto::PositionMulti {
+                position: None,
+                ..position_multi
+            })
+            .map(|p| p.position),
+        ),
+        (
+            "PortfolioValue",
+            super::decode_account_portfolio_value_proto(crate::proto::PortfolioValue {
+                position: zero(),
+                ..portfolio.clone()
+            })
+            .map(|p| p.position),
+            super::decode_account_portfolio_value_proto(crate::proto::PortfolioValue { position: None, ..portfolio }).map(|p| p.position),
+        ),
+        (
+            "PnLSingle",
+            super::decode_pnl_single_proto(crate::proto::PnLSingle {
+                position: zero(),
+                ..pnl_single.clone()
+            })
+            .map(|p| p.position),
+            super::decode_pnl_single_proto(crate::proto::PnLSingle {
+                position: None,
+                ..pnl_single
+            })
+            .map(|p| p.position),
+        ),
+    ];
+
+    for (message, flat_result, missing) in cases {
+        assert_eq!(
+            flat_result.unwrap_or_else(|e| panic!("{message} flat frame must decode: {e}")),
+            0.0,
+            "{message}"
+        );
+        assert_missing_field(missing, "position", message);
+    }
+}
+
+// An "unset" sentinel on position is treated as absent (C# maps both to MaxValue).
+#[test]
+fn decode_position_proto_rejects_unset_sentinel_position() {
+    use crate::testdata::builders::positions::position;
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    let p = crate::proto::Position {
+        position: Some("9223372036854775807".into()),
+        ..position().to_proto()
+    };
+    assert_missing_field(super::decode_position_proto(p), "position", "Position");
 }

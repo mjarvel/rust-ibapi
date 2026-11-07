@@ -163,21 +163,11 @@ fn strike_new_accepts_positive() {
 }
 
 #[test]
-fn strike_new_rejects_zero_and_negative() {
+fn strike_new_rejects_non_positive_and_non_finite() {
     assert!(Strike::new(0.0).is_err());
     assert!(Strike::new(-1.0).is_err());
-}
-
-#[test]
-fn strike_new_unchecked_succeeds_for_positive() {
-    let s = Strike::new_unchecked(42.0);
-    assert_eq!(s.value(), 42.0);
-}
-
-#[test]
-#[should_panic(expected = "Strike price must be positive")]
-fn strike_new_unchecked_panics_for_non_positive() {
-    let _ = Strike::new_unchecked(0.0);
+    assert!(Strike::new(f64::NAN).is_err());
+    assert!(Strike::new(f64::INFINITY).is_err());
 }
 
 #[test]
@@ -360,12 +350,4 @@ fn bond_identifier_variants_equality_and_match() {
         BondIdentifier::Cusip(ref id) => assert_eq!(id.as_str(), "037833100"),
         BondIdentifier::Isin(_) => panic!("expected Cusip"),
     }
-}
-
-#[test]
-fn missing_marker_is_copyable_and_debug() {
-    let m = Missing;
-    let copy = m;
-    let _ = copy;
-    assert_eq!(format!("{:?}", Missing), "Missing");
 }

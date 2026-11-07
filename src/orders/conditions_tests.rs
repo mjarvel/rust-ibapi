@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn test_price_condition_builder() {
+fn price_condition_builder() {
     let condition = PriceCondition::builder(12345, "NASDAQ")
         .greater_than(150.0)
         .trigger_method(TriggerMethod::DoubleBidAsk)
@@ -16,8 +16,46 @@ fn test_price_condition_builder() {
     assert!(!condition.is_conjunction);
 }
 
+/// Setters called before the comparison survive the move to the complete state.
 #[test]
-fn test_time_condition_builder() {
+fn setters_before_the_comparison_carry_over() {
+    let price = PriceCondition::builder(12345, "NASDAQ")
+        .trigger_method(TriggerMethod::Last)
+        .conjunction(false)
+        .less_than(150.0)
+        .build();
+    assert_eq!(
+        (
+            price.contract_id,
+            price.exchange.as_str(),
+            price.trigger_method,
+            price.is_more,
+            price.is_conjunction
+        ),
+        (12345, "NASDAQ", TriggerMethod::Last, false, false)
+    );
+
+    let time = TimeCondition::builder().conjunction(false).greater_than("20251230 23:59:59 UTC").build();
+    assert_eq!((time.is_more, time.is_conjunction), (true, false));
+
+    let margin = MarginCondition::builder().conjunction(false).greater_than(30).build();
+    assert_eq!((margin.is_more, margin.is_conjunction), (true, false));
+
+    let volume = VolumeCondition::builder(12345, "NASDAQ").conjunction(false).greater_than(1000).build();
+    assert_eq!(
+        (volume.contract_id, volume.exchange.as_str(), volume.is_more, volume.is_conjunction),
+        (12345, "NASDAQ", true, false)
+    );
+
+    let percent = PercentChangeCondition::builder(12345, "NASDAQ").conjunction(false).less_than(5.0).build();
+    assert_eq!(
+        (percent.contract_id, percent.exchange.as_str(), percent.is_more, percent.is_conjunction),
+        (12345, "NASDAQ", false, false)
+    );
+}
+
+#[test]
+fn time_condition_builder() {
     let condition = TimeCondition::builder().less_than("20251230 23:59:59 UTC").build();
 
     assert_eq!(condition.time, "20251230 23:59:59 UTC");
@@ -26,7 +64,7 @@ fn test_time_condition_builder() {
 }
 
 #[test]
-fn test_margin_condition_builder() {
+fn margin_condition_builder() {
     let condition = MarginCondition::builder().less_than(30).conjunction(false).build();
 
     assert_eq!(condition.percent, 30);
@@ -35,7 +73,7 @@ fn test_margin_condition_builder() {
 }
 
 #[test]
-fn test_execution_condition_builder() {
+fn execution_condition_builder() {
     let condition = ExecutionCondition::builder("AAPL", "STK", "SMART").conjunction(false).build();
 
     assert_eq!(condition.symbol, "AAPL");
@@ -45,7 +83,7 @@ fn test_execution_condition_builder() {
 }
 
 #[test]
-fn test_volume_condition_builder() {
+fn volume_condition_builder() {
     let condition = VolumeCondition::builder(12345, "NASDAQ").less_than(1000000).build();
 
     assert_eq!(condition.contract_id, 12345);
@@ -56,7 +94,7 @@ fn test_volume_condition_builder() {
 }
 
 #[test]
-fn test_percent_change_condition_builder() {
+fn percent_change_condition_builder() {
     let condition = PercentChangeCondition::builder(12345, "NASDAQ")
         .greater_than(5.0)
         .conjunction(false)
@@ -70,42 +108,12 @@ fn test_percent_change_condition_builder() {
 }
 
 #[test]
-fn test_default_values() {
+fn default_values() {
     let condition = PriceCondition::builder(12345, "NASDAQ").greater_than(150.0).build();
 
     assert_eq!(condition.trigger_method, TriggerMethod::Default);
     assert!(condition.is_more);
     assert!(condition.is_conjunction);
-}
-
-#[test]
-#[should_panic(expected = "PriceConditionBuilder requires a price threshold")]
-fn test_price_condition_builder_missing_threshold_panics() {
-    let _ = PriceCondition::builder(12345, "NASDAQ").build();
-}
-
-#[test]
-#[should_panic(expected = "TimeConditionBuilder requires a time value")]
-fn test_time_condition_builder_missing_time_panics() {
-    let _ = TimeCondition::builder().build();
-}
-
-#[test]
-#[should_panic(expected = "MarginConditionBuilder requires a percentage threshold")]
-fn test_margin_condition_builder_missing_threshold_panics() {
-    let _ = MarginCondition::builder().build();
-}
-
-#[test]
-#[should_panic(expected = "VolumeConditionBuilder requires a volume threshold")]
-fn test_volume_condition_builder_missing_threshold_panics() {
-    let _ = VolumeCondition::builder(12345, "NASDAQ").build();
-}
-
-#[test]
-#[should_panic(expected = "PercentChangeConditionBuilder requires a threshold")]
-fn test_percent_change_condition_builder_missing_threshold_panics() {
-    let _ = PercentChangeCondition::builder(12345, "NASDAQ").build();
 }
 
 #[test]

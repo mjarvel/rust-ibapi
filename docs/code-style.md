@@ -14,7 +14,7 @@
 - Modules own one domain (accounts, orders, market_data)
 - Functions do one thing: encode, decode, validate, or orchestrate
 - Max 50 lines per function; extract if larger
-- Three parameters is the budget; the receiver does not count. See [param budget](rules/style/param-budget.md) for what a fourth argument should become and when a flat signature is still right.
+- Three parameters is the budget for public API; the receiver does not count, and `pub(crate)` / private fns are exempt. See [param budget](rules/style/param-budget.md) for what a fourth argument should become and when a flat signature is still right.
 
 ### Composition
 - Combine small, focused components to build complex behavior
@@ -75,7 +75,7 @@ Run clippy once per feature configuration before committing — three legs, all 
 - **Types**: PascalCase (e.g., `MessageBus`, `AccountSummary`)
 - **Functions/Methods**: snake_case (e.g., `connect`, `server_time`)
 - **Constants**: UPPER_SNAKE_CASE (e.g., `MAX_RECONNECT_ATTEMPTS`)
-- **Module names**: snake_case (e.g., `market_data`, `order_management`)
+- **Module names**: snake_case (e.g., `market_data`, `display_groups`)
 
 ## Import Organization
 

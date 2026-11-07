@@ -44,7 +44,7 @@ and option rights:
 use ibapi::contracts::Contract;
 
 let stock = Contract::stock("AAPL").build();
-let option = Contract::call("AAPL").strike(150.0).expires_on(2024, 12, 20).build();
+let option = Contract::call("AAPL").strike(150.0).expires_on(2024, 12, 20).build()?;
 ```
 
 The full per-asset-type reference (stocks, options, futures, forex, crypto,
@@ -362,27 +362,26 @@ For comprehensive conditional order documentation, see [Order Types - Conditiona
 ## Protocol Version Checking
 
 The handshake refuses servers below version 213 (`PROTOBUF_REST_MESSAGES_3`), so
-a feature at or below it needs no check; those `Features` constants are
-deprecated. Check only a feature above the floor, on the line before the request:
+a feature at or below it needs no check. Gate only a feature above the floor,
+with `check_version` on the line before the request. A caller sees
+`Error::ServerVersion(required, actual, name)`. `protocol` is crate-private:
+callers can't change the server version, so they get the error from the call
+itself rather than pre-checking.
 
 ```rust
-use crate::protocol::{check_version, is_supported, Features};
+use crate::protocol::{check_version, Features};
 
 // Gate a request (from `config/sync.rs`)
 pub fn config(&self) -> Result<Config, Error> {
-    check_version(self.server_version, Features::CONFIG)?;
+    check_version(self.server_version(), Features::CONFIG)?;
     // ... implementation
-}
-
-// Conditional field encoding: a field gated above the floor stays `None`
-// when the server is too old
-if is_supported(server_version, Features::MY_FEATURE) {
-    proto.my_field = Some(request.my_field.clone());
 }
 ```
 
-Order fields gated above the floor are checked in `verify_order`
-(`orders/common/verify.rs`), mirroring C# `ValidateOrderParameters`.
+`Features` holds the request gates. Order fields gated above the floor are
+local `const ProtocolFeature`s in `orders/common/verify.rs`.
+
+`verify_order` checks them, mirroring C# `ValidateOrderParameters`.
 
 ## Subscription Patterns
 
@@ -491,16 +490,13 @@ See: <https://www.interactivebrokers.com/docs/tws-api/doc/market-data-live/avail
 ```rust
 // The client reconnects on its own. A request sent while the connection is
 // down is refused with Error::ConnectionReset, which is_connection_lost()
-// matches. If reconnection is exhausted, is_connected() stays false and every
-// send keeps getting ConnectionReset, so bound the wait.
+// matches. wait_connected() blocks until the session is back, or fails with
+// Error::ConnectionFailed once the reconnect gives up (Error::Shutdown after
+// a shutdown); later requests then fail with that same error.
 match client.market_data(contract).subscribe() {
     Ok(subscription) => process_data(subscription),
     Err(e) if e.is_connection_lost() => {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !client.is_connected() {
-            if Instant::now() >= deadline { return Err(e); }
-            thread::sleep(Duration::from_secs(1));
-        }
+        client.wait_connected()?;
         // Retry
     },
     Err(e) => return Err(e),
@@ -513,10 +509,28 @@ for result in subscription {
     match result {
         Ok(data) => process(data),
         Err(e) if e.is_connection_lost() => {
-            // Resubscribe after reconnection
+            // Ends before the reconnect starts: wait_connected(), then resubscribe
             break;
         },
         Err(e) => log::error!("Error: {}", e),
+    }
+}
+```
+
+`client.resubscribing(open)` packages that loop for streams: it waits out the reconnect, calls
+`open` again, and yields a `TRANSPORT_RECONNECT_CODE` notice before the new subscription's first
+item. Data from the outage is missing; depth books, `keep_up_to_date` bars and account snapshots
+start over. Order streams are rejected at compile time. `filter_data` drops the gap notice, so match
+the items to see it.
+
+```rust
+for item in client.resubscribing(|| client.realtime_bars(&contract).subscribe()) {
+    match item {
+        Ok(SubscriptionItem::Data(bar)) => process(bar),
+        Ok(SubscriptionItem::Notice(n)) if n.code == TRANSPORT_RECONNECT_CODE => mark_gap(),
+        Ok(SubscriptionItem::Notice(n)) => log::info!("{n}"),
+        // Any other error, or the reconnect gave up
+        Err(e) => return Err(e),
     }
 }
 ```
@@ -548,7 +562,7 @@ for notice in notices.iter() {
 
 ### Correlating Commissions with Executions
 
-`CommissionReport` joins to its `ExecutionData` by `execution_id` — the same value
+`CommissionAndFeesReport` joins to its `ExecutionData` by `execution_id` — the same value
 carried on `Execution::execution_id`. TWS sends the execution first and the commission
 shortly after, but order-status and open-order frames can land between them, so index
 commissions by `execution_id` rather than assuming the two are adjacent. Both arrive on
@@ -567,10 +581,10 @@ for update in updates.iter_data() {
             // The execution arrives first: index it by execution_id.
             executions.insert(exec.execution.execution_id.clone(), exec);
         }
-        OrderUpdate::CommissionReport(report) => {
+        OrderUpdate::CommissionAndFeesReport(report) => {
             // The commission follows: join it to the execution it belongs to.
             if let Some(exec) = executions.remove(&report.execution_id) {
-                println!("{} x {} commission {}", exec.execution.shares, exec.contract.symbol, report.commission);
+                println!("{} x {} commission {}", exec.execution.shares, exec.contract.symbol, report.commission_and_fees);
             }
         }
         _ => {}

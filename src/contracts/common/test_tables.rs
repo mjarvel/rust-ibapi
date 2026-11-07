@@ -5,43 +5,39 @@ use crate::common::test_utils::helpers::proto_error_response;
 use crate::common::test_utils::helpers::{proto_response, text_response, TEST_REQ_ID_FIRST};
 use crate::contracts::{Contract, ContractDetails, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use crate::messages::{IncomingMessages, OutgoingMessages, ResponseMessage};
-use crate::testdata::builders::contracts::{contract_data, market_rule, option_chain, smart_components, symbol_samples, symbol_samples_entry};
+use crate::testdata::builders::contracts::{
+    contract_data, contract_data_end, market_rule, option_chain, smart_components, symbol_samples, symbol_samples_entry,
+};
 use crate::testdata::builders::market_data::tick_option_computation;
 use crate::testdata::builders::ResponseProtoEncoder;
 
 /// Test case for contract details tests
-#[allow(clippy::type_complexity, dead_code)]
+#[allow(clippy::type_complexity)]
 pub struct ContractDetailsTestCase {
     pub name: &'static str,
     pub contract: Contract,
     pub ordered_responses: Vec<ResponseMessage>,
-    pub expected_request: &'static str,
     pub expected_count: usize,
     pub validations: Box<dyn Fn(&[ContractDetails]) + Send + Sync>,
 }
 
 /// Test case for matching symbols tests
-#[allow(dead_code)]
 pub struct MatchingSymbolsTestCase {
     pub name: &'static str,
     pub pattern: &'static str,
     pub ordered_responses: Vec<ResponseMessage>,
-    pub expected_request: &'static str,
     pub expected_count: usize,
 }
 
 /// Test case for market rule tests
-#[allow(dead_code)]
 pub struct MarketRuleTestCase {
     pub name: &'static str,
     pub market_rule_id: i32,
     pub ordered_responses: Vec<ResponseMessage>,
-    pub expected_request: &'static str,
     pub expected_price_increments: usize,
 }
 
 /// Test case for smart components tests
-#[allow(dead_code)]
 pub struct SmartComponentsTestCase {
     pub name: &'static str,
     pub bbo_exchange: &'static str,
@@ -51,7 +47,6 @@ pub struct SmartComponentsTestCase {
 }
 
 /// Test case for option calculation tests
-#[allow(dead_code)]
 pub struct OptionCalculationTestCase {
     pub name: &'static str,
     pub contract: Contract,
@@ -59,7 +54,6 @@ pub struct OptionCalculationTestCase {
     pub option_price: Option<f64>,
     pub underlying_price: f64,
     pub ordered_responses: Vec<ResponseMessage>,
-    pub expected_request_prefix: &'static str,
     pub expected_price: f64,
     pub expected_delta: f64,
 }
@@ -91,9 +85,8 @@ pub enum StreamDecoderResult {
 /// Test case for cancel message generation
 pub struct CancelMessageTestCase {
     pub name: &'static str,
-    pub decoder_type: &'static str,
+    pub cancel: fn(Option<i32>) -> Result<Vec<u8>, crate::Error>,
     pub request_id: Option<i32>,
-    pub request_type: Option<OutgoingMessages>,
     pub expected_msg_id: Result<i32, &'static str>,
 }
 
@@ -102,10 +95,6 @@ const STK_VALID_EXCHANGES: &str =
     "SMART,AMEX,NYSE,CBOE,PHLX,ISE,CHX,ARCA,ISLAND,DRCTEDGE,BEX,BATS,EDGEA,CSFBALGO,JEFFALGO,BYX,IEX,EDGX,FOXRIVER,PEARL,NYSENAT,LTSE,MEMX,PSX";
 const FUT_ORDER_TYPES: &str = "ACTIVETIM,AD,ADJUST,ALERT,ALGO,ALLOC,AON,AVGCOST,BASKET,BENCHPX,CASHQTY,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,ICE,IOC,LIT,LMT,LOC,MIT,MKT,MOC,MTL,NGCOMB,NONALGO,OCA,PEGBENCH,PEGMID,PEGSTK,POSTONLY,PREOPGRTH,REL,RPI,RTH,SCALE,SCALEODD,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF";
 const AMEX_ORDER_TYPES: &str = "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,BENCHPX,CASHQTY,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,PEGBENCH,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF";
-
-pub fn contract_data_end(request_id: i32) -> ResponseMessage {
-    text_response(format!("52|1|{request_id}|"))
-}
 
 /// Test cases for contract details
 pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
@@ -143,9 +132,8 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                         .stock_type("COMMON")
                         .encode_proto(),
                 ),
-                contract_data_end(9001),
+                proto_response(IncomingMessages::ContractDataEnd, contract_data_end().request_id(9001).encode_proto()),
             ],
-            expected_request: "9|8|9000|0|TSLA|STK||0|||SMART||USD|||0|||",
             expected_count: 1,
             validations: Box::new(|contracts| {
                 assert_eq!(contracts[0].contract.symbol, Symbol::from("TSLA"));
@@ -198,9 +186,8 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                         .settlement_method("Cash")
                         .encode_proto(),
                 ),
-                contract_data_end(9001),
+                proto_response(IncomingMessages::ContractDataEnd, contract_data_end().request_id(9001).encode_proto()),
             ],
-            expected_request: "9|8|9000|0|ES|FUT|202406|0|||CME||USD|||0|||",
             expected_count: 1,
             validations: Box::new(|contracts| {
                 assert_eq!(contracts[0].contract.symbol, Symbol::from("ES"));
@@ -246,9 +233,8 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                         .time_zone_id("US/Eastern")
                         .encode_proto(),
                 ),
-                contract_data_end(9001),
+                proto_response(IncomingMessages::ContractDataEnd, contract_data_end().request_id(9001).encode_proto()),
             ],
-            expected_request: "9|8|9000|0|TLT|BOND||0|||SMART||USD|||0|||",
             expected_count: 1,
             validations: Box::new(|contracts| {
                 assert_eq!(contracts[0].contract.symbol, Symbol::from("TLT"));
@@ -319,9 +305,8 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                         .stock_type("COMMON")
                         .encode_proto(),
                 ),
-                contract_data_end(9001),
+                proto_response(IncomingMessages::ContractDataEnd, contract_data_end().request_id(9001).encode_proto()),
             ],
-            expected_request: "9|8|9000|0|AAPL|STK||0|||SMART||USD|||0|||",
             expected_count: 2,
             validations: Box::new(|contracts| {
                 assert_eq!(contracts.len(), 2);
@@ -387,9 +372,8 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                         .stock_type("COMMON")
                         .encode_proto(),
                 ),
-                contract_data_end(9001),
+                proto_response(IncomingMessages::ContractDataEnd, contract_data_end().request_id(9001).encode_proto()),
             ],
-            expected_request: "9|8|9000|0|TSLA|STK||0|||SMART||USD|||0|||",
             expected_count: 2,
             validations: Box::new(|contracts| {
                 assert_eq!(contracts.len(), 2);
@@ -414,8 +398,10 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
                 currency: Currency::from("USD"),
                 ..Default::default()
             },
-            ordered_responses: vec![contract_data_end(TEST_REQ_ID_FIRST)],
-            expected_request: "",
+            ordered_responses: vec![proto_response(
+                IncomingMessages::ContractDataEnd,
+                contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+            )],
             expected_count: 0,
             validations: Box::new(|_| {}),
         },
@@ -435,7 +421,6 @@ pub fn matching_symbols_test_cases() -> Vec<MatchingSymbolsTestCase> {
                     .entry(symbol_samples_entry(12345, "AAPL").primary_exchange("NASDAQ").description("APPLE INC"))
                     .encode_proto(),
             )],
-            expected_request: "81|9000|AAPL|",
             expected_count: 1,
         },
         MatchingSymbolsTestCase {
@@ -454,7 +439,6 @@ pub fn matching_symbols_test_cases() -> Vec<MatchingSymbolsTestCase> {
                     .entry(symbol_samples_entry(12346, "AAPL").primary_exchange("SMART").description("APPLE INC"))
                     .encode_proto(),
             )],
-            expected_request: "81|9000|AA|",
             expected_count: 2,
         },
     ]
@@ -475,7 +459,6 @@ pub fn market_rule_test_cases() -> Vec<MarketRuleTestCase> {
                     .increment(0.05, 0.05)
                     .encode_proto(),
             )],
-            expected_request: "91|26|",
             expected_price_increments: 4,
         },
         MarketRuleTestCase {
@@ -489,7 +472,6 @@ pub fn market_rule_test_cases() -> Vec<MarketRuleTestCase> {
                     .increment(10.0, 0.01)
                     .encode_proto(),
             )],
-            expected_request: "91|635|",
             expected_price_increments: 3,
         },
         MarketRuleTestCase {
@@ -506,7 +488,6 @@ pub fn market_rule_test_cases() -> Vec<MarketRuleTestCase> {
                     .increment(10000000000.0, 0.1)
                     .encode_proto(),
             )],
-            expected_request: "91|239|",
             expected_price_increments: 6,
         },
     ]
@@ -583,7 +564,6 @@ pub fn option_calculation_test_cases() -> Vec<OptionCalculationTestCase> {
                     .underlying_price(6.87)
                     .encode_proto(),
             )],
-            expected_request_prefix: "54|3|9000|0|AAPL|OPT|20231215|150|C|100|SMART||USD||0.3|145|",
             expected_price: 7.85,
             expected_delta: 0.42,
         },
@@ -618,7 +598,6 @@ pub fn option_calculation_test_cases() -> Vec<OptionCalculationTestCase> {
                     .underlying_price(4.55)
                     .encode_proto(),
             )],
-            expected_request_prefix: "54|3|9000|0|AAPL|OPT|20231215|150|C|100|SMART||USD||5|145|",
             expected_price: 5.0,
             expected_delta: 0.32,
         },
@@ -743,43 +722,31 @@ pub fn stream_decoder_test_cases() -> Vec<StreamDecoderTestCase> {
     ]
 }
 
-/// Test cases for cancel message generation
+/// Test cases for cancel message generation: the option one-shots' cancels,
+/// as `OneShot` builds them when dropped before the answer.
 pub fn cancel_message_test_cases() -> Vec<CancelMessageTestCase> {
+    use crate::common::request_helpers::OneShot;
+    use crate::contracts::common::stream_decoders::{ImpliedVolatilityRequest, OptionPriceRequest};
+    use crate::subscriptions::StreamDecoder;
+
     vec![
         CancelMessageTestCase {
             name: "cancel implied volatility calculation",
-            decoder_type: "OptionComputation",
+            cancel: |id| OneShot::<ImpliedVolatilityRequest>::cancel_message(0, id, None),
             request_id: Some(9000),
-            request_type: Some(OutgoingMessages::ReqCalcImpliedVolat),
             expected_msg_id: Ok(OutgoingMessages::CancelImpliedVolatility as i32 + 200),
         },
         CancelMessageTestCase {
             name: "cancel option price calculation",
-            decoder_type: "OptionComputation",
+            cancel: |id| OneShot::<OptionPriceRequest>::cancel_message(0, id, None),
             request_id: Some(9001),
-            request_type: Some(OutgoingMessages::ReqCalcOptionPrice),
             expected_msg_id: Ok(OutgoingMessages::CancelOptionPrice as i32 + 200),
         },
         CancelMessageTestCase {
             name: "cancel option computation without request id",
-            decoder_type: "OptionComputation",
+            cancel: |id| OneShot::<OptionPriceRequest>::cancel_message(0, id, None),
             request_id: None,
-            request_type: Some(OutgoingMessages::ReqCalcOptionPrice),
-            expected_msg_id: Err("Request ID required to cancel option calculations"),
-        },
-        CancelMessageTestCase {
-            name: "cancel option computation without request type",
-            decoder_type: "OptionComputation",
-            request_id: Some(9002),
-            request_type: None,
-            expected_msg_id: Err("Unsupported request message type option computation cancel: None"),
-        },
-        CancelMessageTestCase {
-            name: "cancel option chain - not supported",
-            decoder_type: "OptionChain",
-            request_id: Some(9003),
-            request_type: None,
-            expected_msg_id: Err("cancel not implemented"),
+            expected_msg_id: Err("Request ID required to cancel one-shot request"),
         },
     ]
 }
@@ -791,7 +758,6 @@ pub struct ClientMethodTestCase {
     pub test_type: ClientMethodTest,
     pub ordered_responses: Vec<ResponseMessage>,
     #[allow(dead_code)]
-    pub expected_request: &'static str,
     pub expected_result: ClientMethodResult,
 }
 
@@ -843,7 +809,6 @@ pub fn client_method_test_cases() -> Vec<ClientMethodTestCase> {
                     .underlying_price(6.87)
                     .encode_proto(),
             )],
-            expected_request: "54|3|9000|0|AAPL|OPT|20231215|150|C||SMART||USD||0.25|155|",
             expected_result: ClientMethodResult::OptionComputation {
                 option_price: Some(85.5),
                 implied_volatility: Some(0.25),
@@ -871,7 +836,6 @@ pub fn client_method_test_cases() -> Vec<ClientMethodTestCase> {
                     .underlying_price(4.55)
                     .encode_proto(),
             )],
-            expected_request: "54|3|9000|0|AAPL|OPT|20231215|150|C||SMART||USD||8.5|155|",
             expected_result: ClientMethodResult::OptionComputation {
                 implied_volatility: Some(0.45),
                 option_price: Some(8.5),
@@ -906,7 +870,10 @@ pub fn contract_details_error_test_cases() -> Vec<ContractDetailsErrorTestCase> 
         ContractDetailsErrorTestCase {
             name: "empty response (no contracts found)",
             contract: Contract::stock("NOEXIST").build(),
-            ordered_responses: vec![contract_data_end(TEST_REQ_ID_FIRST)],
+            ordered_responses: vec![proto_response(
+                IncomingMessages::ContractDataEnd,
+                contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+            )],
             should_error: false,
             error_contains: None,
             expected_count: 0,

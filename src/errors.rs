@@ -62,7 +62,18 @@ pub enum Error {
     #[error("InvalidArgument: {0}")]
     InvalidArgument(String),
 
-    /// Failed to establish connection to TWS/Gateway.
+    /// An order builder rejected its inputs before anything was sent (e.g.
+    /// `OrderBuilder::submit`), or `?` was applied to a [`ValidationError`].
+    /// Carries the `ValidationError`, so callers match on its variants instead
+    /// of parsing a message.
+    #[error("validation error: {0}")]
+    Validation(#[from] ValidationError),
+
+    /// The connection to TWS/Gateway is gone for good: the automatic
+    /// reconnect used up its attempts, or reading from the socket failed in a
+    /// way reconnecting cannot fix. Terminal - every later request, and
+    /// `Client::wait_connected`, fails with it. Streams open when the
+    /// connection dropped already ended with [`Error::ConnectionReset`].
     #[error("ConnectionFailed")]
     ConnectionFailed,
 
@@ -71,6 +82,21 @@ pub enum Error {
     /// Payload carries the underlying diagnostic.
     #[error("connection rejected: {0}")]
     ConnectionRejected(String),
+
+    /// TWS refused the session because another connection holds this client
+    /// id (TWS error 326). Connect with a different client id, or close the
+    /// other connection.
+    ///
+    /// Returned by `Client::connect`, which doesn't retry. The automatic
+    /// reconnect does retry it: after a dropped connection TWS can hold the
+    /// old session until it notices the socket is dead, and frees the id
+    /// then. If every attempt meets it, the client fails with
+    /// [`Error::ConnectionFailed`]; the error log names the cause.
+    #[error("client id {client_id} is already in use by another connection")]
+    ClientIdInUse {
+        /// The refused client id.
+        client_id: i32,
+    },
 
     /// IB Gateway sent a timezone name that could not be mapped to an IANA zone.
     #[error("unrecognized IB Gateway timezone {0:?}; register a mapping with `ibapi::register_timezone_alias({0:?}, \"<IANA-name>\")` before connecting, or set `IBAPI_TIMEZONE_ALIASES={0}=<IANA-name>` in the environment. See https://github.com/wboayue/rust-ibapi/blob/main/docs/troubleshooting.md#gateway-time-zone. To request it as a built-in, file an issue at https://github.com/wboayue/rust-ibapi/issues")]
@@ -292,21 +318,30 @@ impl Error {
     ///
     /// Returns `false` for failures reconnecting cannot recover, so a read loop can
     /// branch on them separately to stop retrying: intentional teardown
-    /// ([`Error::Shutdown`]), handshake refusal ([`Error::ConnectionRejected`]), and
-    /// exhausted reconnection ([`Error::ConnectionFailed`], returned only after the
-    /// transport already gave up).
+    /// ([`Error::Shutdown`]), handshake refusal ([`Error::ConnectionRejected`],
+    /// [`Error::ClientIdInUse`]), and
+    /// a session the client gave up on ([`Error::ConnectionFailed`]: reconnection
+    /// exhausted, or a read error reconnecting cannot fix).
+    ///
+    /// The client reconnects on its own, and streams open when the connection
+    /// dropped end with [`Error::ConnectionReset`] as soon as it does, before the
+    /// reconnect starts. A request sent while it is still reconnecting is refused
+    /// with `ConnectionReset` too; once it gives up, requests fail with
+    /// `ConnectionFailed` instead. So on `true`, call `Client::wait_connected`
+    /// before resubscribing: it returns once the session is back, or with
+    /// `ConnectionFailed` / `Shutdown` if it never will be.
     ///
     /// # Examples
     ///
     /// In a subscription read loop, branch on this predicate to decide whether to
-    /// re-establish the connection or surface a request-level failure:
+    /// wait for the reconnect and resubscribe or surface a request-level failure:
     ///
     /// ```
     /// use ibapi::Error;
     ///
     /// fn on_stream_error(err: Error) -> Result<(), Error> {
     ///     if err.is_connection_lost() {
-    ///         // tear down and resubscribe, then keep going
+    ///         // wait_connected, resubscribe, then keep going
     ///         Ok(())
     ///     } else {
     ///         // a request-level failure (or terminal disconnect) — surface it
@@ -315,7 +350,7 @@ impl Error {
     /// }
     ///
     /// assert!(on_stream_error(Error::ConnectionReset).is_ok());
-    /// assert!(on_stream_error(Error::ConnectionFailed).is_err()); // reconnect exhausted
+    /// assert!(on_stream_error(Error::ConnectionFailed).is_err()); // reconnect gave up
     /// assert!(on_stream_error(Error::Shutdown).is_err());
     /// ```
     pub fn is_connection_lost(&self) -> bool {
@@ -355,8 +390,10 @@ impl Clone for Error {
             Error::ServerVersion(a, b, s) => Error::ServerVersion(*a, *b, s.clone()),
             Error::Simple(s) => Error::Simple(s.clone()),
             Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
+            Error::Validation(e) => Error::Validation(e.clone()),
             Error::ConnectionFailed => Error::ConnectionFailed,
             Error::ConnectionRejected(s) => Error::ConnectionRejected(s.clone()),
+            Error::ClientIdInUse { client_id } => Error::ClientIdInUse { client_id: *client_id },
             Error::UnsupportedTimeZone(s) => Error::UnsupportedTimeZone(s.clone()),
             Error::ConnectionReset => Error::ConnectionReset,
             Error::Cancelled => Error::Cancelled,
@@ -384,27 +421,6 @@ impl Clone for Error {
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(err: std::sync::PoisonError<T>) -> Error {
         Error::Poison(format!("Mutex poison error: {err}"))
-    }
-}
-
-impl From<ValidationError> for Error {
-    fn from(err: ValidationError) -> Self {
-        match err {
-            ValidationError::InvalidQuantity(q) => Error::InvalidArgument(format!("Invalid quantity: {}", q)),
-            ValidationError::InvalidPrice(p) => Error::InvalidArgument(format!("Invalid price: {}", p)),
-            ValidationError::MissingRequiredField(field) => Error::InvalidArgument(format!("Missing required field: {}", field)),
-            ValidationError::InvalidCombination(msg) => Error::InvalidArgument(format!("Invalid combination: {}", msg)),
-            ValidationError::InvalidStopPrice { stop, current } => {
-                Error::InvalidArgument(format!("Invalid stop price {} for current price {}", stop, current))
-            }
-            ValidationError::InvalidLimitPrice { limit, current } => {
-                Error::InvalidArgument(format!("Invalid limit price {} for current price {}", limit, current))
-            }
-            ValidationError::InvalidBracketOrder(msg) => Error::InvalidArgument(format!("Invalid bracket order: {}", msg)),
-            ValidationError::InvalidPercentage { field, value, min, max } => {
-                Error::InvalidArgument(format!("Invalid {}: {} (must be between {} and {})", field, value, min, max))
-            }
-        }
     }
 }
 

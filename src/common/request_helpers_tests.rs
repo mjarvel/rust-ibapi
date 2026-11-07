@@ -7,13 +7,13 @@ fn current_time_message() -> ResponseMessage {
 }
 
 #[test]
-fn test_fold_one_shot_processes_response() {
+fn fold_one_shot_processes_response() {
     let result = fold_one_shot(Some(Ok(current_time_message())), |message| Ok(message.message_type()));
     assert!(matches!(result, Ok(IncomingMessages::CurrentTime)));
 }
 
 #[test]
-fn test_fold_one_shot_propagates_error() {
+fn fold_one_shot_propagates_error() {
     // A routed error (e.g. request-less hard error fanned to one-shot shared
     // channels, #694) must surface to the caller, never be masked.
     let result: Result<IncomingMessages, Error> = fold_one_shot(Some(Err(Error::Cancelled)), |message| Ok(message.message_type()));
@@ -21,13 +21,13 @@ fn test_fold_one_shot_propagates_error() {
 }
 
 #[test]
-fn test_fold_one_shot_reads_a_closed_stream_as_an_error() {
+fn fold_one_shot_reads_a_closed_stream_as_an_error() {
     let result: Result<i32, Error> = fold_one_shot(None, |_| Ok(1));
     assert!(matches!(result, Err(Error::UnexpectedEndOfStream)));
 }
 
 #[test]
-fn test_empty_on_end_of_stream_converts_only_that_variant() {
+fn empty_on_end_of_stream_converts_only_that_variant() {
     // The ten collection sites read a closed stream as "nothing to report"...
     let recovered: Result<Vec<i32>, Error> = empty_on_end_of_stream(Error::UnexpectedEndOfStream);
     assert_eq!(recovered.expect("end of stream becomes the empty collection"), Vec::<i32>::new());
@@ -38,7 +38,7 @@ fn test_empty_on_end_of_stream_converts_only_that_variant() {
 }
 
 #[test]
-fn test_expect_proto_decodes_the_expected_type() {
+fn expect_proto_decodes_the_expected_type() {
     // The expected type is not passed: it is CurrentTime::MESSAGE_ID, reached
     // through the payload this decoder accepts.
     let processor = expect_proto(|payload: crate::proto::CurrentTime| Ok(payload.current_time));
@@ -46,7 +46,7 @@ fn test_expect_proto_decodes_the_expected_type() {
 }
 
 #[test]
-fn test_expect_proto_rejects_a_foreign_type() {
+fn expect_proto_rejects_a_foreign_type() {
     // The frame is well-formed proto — only the type is wrong. Without the
     // narrow, the payload decoder would run on another message's bytes.
     let processor = expect_proto(|payload: crate::proto::UserInfo| Ok(payload.white_branding_id));
@@ -55,7 +55,7 @@ fn test_expect_proto_rejects_a_foreign_type() {
 }
 
 #[test]
-fn test_expect_proto_narrows_to_the_payloads_own_message_id() {
+fn expect_proto_narrows_to_the_payloads_own_message_id() {
     // The pairing a hand-listed roster used to guard: every declared payload
     // narrows to its own MESSAGE_ID, and a frame of that type is what it
     // accepts. Checked here for one payload per collision-prone shape; the
@@ -98,7 +98,7 @@ mod retry_wiring {
 
     #[cfg(feature = "sync")]
     #[test]
-    fn test_sync_one_shot_resends_after_a_connection_reset() {
+    fn sync_one_shot_resends_after_a_connection_reset() {
         use crate::client::blocking::Client;
 
         let message_bus = stub(2);
@@ -110,7 +110,7 @@ mod retry_wiring {
 
     #[cfg(feature = "sync")]
     #[test]
-    fn test_sync_one_shot_gives_up_past_the_retry_limit() {
+    fn sync_one_shot_gives_up_past_the_retry_limit() {
         use crate::client::blocking::Client;
         use crate::common::retry::DEFAULT_MAX_RETRIES;
 
@@ -125,7 +125,7 @@ mod retry_wiring {
 
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_async_one_shot_resends_after_a_connection_reset() {
+    async fn async_one_shot_resends_after_a_connection_reset() {
         use crate::Client;
 
         let message_bus = stub(2);
@@ -137,7 +137,7 @@ mod retry_wiring {
 
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_async_one_shot_gives_up_past_the_retry_limit() {
+    async fn async_one_shot_gives_up_past_the_retry_limit() {
         use crate::common::retry::DEFAULT_MAX_RETRIES;
         use crate::Client;
 
@@ -151,8 +151,11 @@ mod retry_wiring {
     }
 }
 
+/// The deadline: `one_shot_timeout` when set, else `ONE_SHOT_TIMEOUT` for
+/// shared one-shots and no bound for request-id ones.
 #[cfg(test)]
 mod bounded_wait {
+    use std::cell::Cell;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -163,6 +166,8 @@ mod bounded_wait {
     use crate::{common::test_utils::helpers::proto_response, server_versions, Error};
 
     const SHORT: Duration = Duration::from_millis(20);
+    /// Far past `SHORT`: a call that waits it out has ignored its deadline.
+    const RECONNECT: Duration = Duration::from_secs(10);
 
     fn frame() -> ResponseMessage {
         proto_response(IncomingMessages::CurrentTime, current_time().encode_proto())
@@ -173,140 +178,571 @@ mod bounded_wait {
         Arc::new(MessageBusStub::with_ordered_responses(vec![frame(); frames]).keeping_channels_open())
     }
 
+    /// The first request is reset, and the reconnect outlasts `SHORT`; the
+    /// resend would be answered at once. Answered means the deadline restarted.
+    fn reset_past_the_deadline() -> Arc<MessageBusStub> {
+        Arc::new(
+            MessageBusStub::with_ordered_responses(vec![frame()])
+                .with_connection_resets(1)
+                .with_reconnect_delay(RECONNECT)
+                .keeping_channels_open(),
+        )
+    }
+
     fn encoder() -> Result<Vec<u8>, Error> {
         Ok(vec![])
     }
 
-    #[cfg(feature = "sync")]
-    #[test]
-    fn test_sync_one_shot_shared_times_out_without_a_frame() {
-        use crate::client::blocking::Client;
-        use crate::common::request_helpers::blocking::one_shot_shared_within;
-
-        let client = Client::stubbed(silent_stub(0), server_versions::SIZE_RULES);
-        let error = one_shot_shared_within(&client, OutgoingMessages::RequestCurrentTime, SHORT, encoder, |_| Ok(())).unwrap_err();
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
+    fn foreign_frames_counter(seen: &Cell<usize>) -> impl Fn(&ResponseMessage) -> Result<Option<()>, Error> + '_ {
+        |_| {
+            seen.set(seen.get() + 1);
+            Ok(None)
+        }
     }
 
     #[cfg(feature = "sync")]
-    #[test]
-    fn test_sync_one_shot_shared_matching_reads_past_a_foreign_frame() {
+    mod sync {
+        use super::*;
         use crate::client::blocking::Client;
-        use crate::common::request_helpers::blocking::one_shot_shared_matching_within;
-        use std::cell::Cell;
+        use crate::common::request_helpers::blocking::{one_shot_by_request_id, one_shot_shared, one_shot_shared_matching};
 
-        let client = Client::stubbed(silent_stub(2), server_versions::SIZE_RULES);
-        let seen = Cell::new(0);
-        let processor = |_: &ResponseMessage| {
-            seen.set(seen.get() + 1);
-            Ok((seen.get() == 2).then_some("second"))
-        };
-        let answer = one_shot_shared_matching_within(&client, OutgoingMessages::RequestCurrentTime, SHORT, encoder, processor).unwrap();
-        assert_eq!(answer, "second");
-    }
+        fn client(bus: Arc<MessageBusStub>, timeout: Duration) -> Client {
+            Client::stubbed(bus, server_versions::SIZE_RULES).with_one_shot_timeout(timeout)
+        }
 
-    #[cfg(feature = "sync")]
-    #[test]
-    fn test_sync_one_shot_shared_matching_times_out_on_foreign_frames_only() {
-        use crate::client::blocking::Client;
-        use crate::common::request_helpers::blocking::one_shot_shared_matching_within;
+        #[test]
+        fn shared_times_out_without_a_frame() {
+            let error = one_shot_shared(&client(silent_stub(0), SHORT), OutgoingMessages::RequestCurrentTime, encoder, |_| Ok(())).unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+        }
 
-        let client = Client::stubbed(silent_stub(1), server_versions::SIZE_RULES);
-        let error = one_shot_shared_matching_within(&client, OutgoingMessages::RequestCurrentTime, SHORT, encoder, |_| Ok(None::<()>)).unwrap_err();
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
-    }
+        #[test]
+        fn shared_matching_reads_past_a_foreign_frame() {
+            let seen = Cell::new(0);
+            let processor = |_: &ResponseMessage| {
+                seen.set(seen.get() + 1);
+                Ok((seen.get() == 2).then_some("second"))
+            };
+            let answer = one_shot_shared_matching(&client(silent_stub(2), SHORT), OutgoingMessages::RequestCurrentTime, encoder, processor).unwrap();
+            assert_eq!(answer, "second");
+        }
 
-    #[cfg(feature = "sync")]
-    #[test]
-    fn test_sync_one_shot_shared_matching_stops_reading_at_the_deadline() {
-        use crate::client::blocking::Client;
-        use crate::common::request_helpers::blocking::one_shot_shared_matching_within;
-        use std::cell::Cell;
+        #[test]
+        fn shared_matching_times_out_on_foreign_frames_only() {
+            let seen = Cell::new(0);
+            let processor = foreign_frames_counter(&seen);
+            let error =
+                one_shot_shared_matching(&client(silent_stub(1), SHORT), OutgoingMessages::RequestCurrentTime, encoder, processor).unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+        }
 
-        // Foreign frames already queued: a passed deadline must not read them.
-        let client = Client::stubbed(silent_stub(3), server_versions::SIZE_RULES);
-        let seen = Cell::new(0);
-        let processor = |_: &ResponseMessage| {
-            seen.set(seen.get() + 1);
-            Ok(None::<()>)
-        };
-        let error = one_shot_shared_matching_within(&client, OutgoingMessages::RequestCurrentTime, Duration::ZERO, encoder, processor).unwrap_err();
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
-        assert_eq!(seen.get(), 0);
-    }
+        #[test]
+        fn shared_matching_stops_reading_at_the_deadline() {
+            // Foreign frames already queued: a passed deadline must not read them.
+            let seen = Cell::new(0);
+            let processor = foreign_frames_counter(&seen);
+            let client = client(silent_stub(3), Duration::ZERO);
+            let error = one_shot_shared_matching(&client, OutgoingMessages::RequestCurrentTime, encoder, processor).unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+            assert_eq!(seen.get(), 0);
+        }
 
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_one_shot_shared_times_out_without_a_frame() {
-        use crate::common::request_helpers::one_shot_shared_within;
-        use crate::Client;
+        #[test]
+        fn shared_deadline_spans_resends() {
+            let bus = reset_past_the_deadline();
+            let client = client(bus.clone(), SHORT);
+            let start = std::time::Instant::now();
+            let error = one_shot_shared(&client, OutgoingMessages::RequestCurrentTime, encoder, |_| Ok(())).unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+            assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+            assert_eq!(bus.request_messages().len(), 1, "no resend past the deadline");
+        }
 
-        let client = Client::stubbed(silent_stub(0), server_versions::SIZE_RULES);
-        let error = one_shot_shared_within(&client, OutgoingMessages::RequestCurrentTime, SHORT, encoder, |_| Ok(()))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
-    }
+        #[test]
+        fn by_request_id_times_out_without_a_frame() {
+            let error = one_shot_by_request_id(&client(silent_stub(0), SHORT), |_| encoder(), |_| Ok(())).unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+        }
 
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_one_shot_shared_matching_reads_past_a_foreign_frame() {
-        use crate::common::request_helpers::one_shot_shared_matching_within;
-        use crate::Client;
-        use std::cell::Cell;
-
-        let client = Client::stubbed(silent_stub(2), server_versions::SIZE_RULES);
-        let seen = Cell::new(0);
-        let processor = |_: &ResponseMessage| {
-            seen.set(seen.get() + 1);
-            Ok((seen.get() == 2).then_some("second"))
-        };
-        let answer = one_shot_shared_matching_within(&client, OutgoingMessages::RequestCurrentTime, SHORT, encoder, processor)
-            .await
-            .unwrap();
-        assert_eq!(answer, "second");
+        #[test]
+        fn by_request_id_deadline_spans_resends() {
+            let bus = reset_past_the_deadline();
+            let start = std::time::Instant::now();
+            let error = one_shot_by_request_id(&client(bus.clone(), SHORT), |_| encoder(), |_| Ok(())).unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+            assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+            assert_eq!(bus.request_messages().len(), 1, "no resend past the deadline");
+        }
     }
 
     #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_one_shot_shared_matching_times_out_on_foreign_frames_only() {
-        use crate::common::request_helpers::one_shot_shared_matching_within;
+    mod r#async {
+        use super::*;
+        use crate::common::request_helpers::{one_shot_by_request_id, one_shot_shared, one_shot_shared_matching};
         use crate::Client;
 
-        let client = Client::stubbed(silent_stub(1), server_versions::SIZE_RULES);
-        let error = one_shot_shared_matching_within(&client, OutgoingMessages::RequestCurrentTime, SHORT, encoder, |_| Ok(None::<()>))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
-    }
+        fn client(bus: Arc<MessageBusStub>, timeout: Duration) -> Client {
+            Client::stubbed(bus, server_versions::SIZE_RULES).with_one_shot_timeout(timeout)
+        }
 
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn test_async_one_shot_shared_matching_stops_reading_at_the_deadline() {
-        use crate::common::request_helpers::one_shot_shared_matching_within;
-        use crate::Client;
-        use std::cell::Cell;
+        #[tokio::test]
+        async fn shared_times_out_without_a_frame() {
+            let error = one_shot_shared(&client(silent_stub(0), SHORT), OutgoingMessages::RequestCurrentTime, encoder, |_| Ok(()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+        }
 
-        // Foreign frames already queued: a passed deadline must not read them.
-        let client = Client::stubbed(silent_stub(3), server_versions::SIZE_RULES);
-        let seen = Cell::new(0);
-        let processor = |_: &ResponseMessage| {
-            seen.set(seen.get() + 1);
-            Ok(None::<()>)
-        };
-        let error = one_shot_shared_matching_within(&client, OutgoingMessages::RequestCurrentTime, Duration::ZERO, encoder, processor)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::Timeout), "got {error:?}");
-        assert_eq!(seen.get(), 0);
+        #[tokio::test]
+        async fn shared_matching_reads_past_a_foreign_frame() {
+            let seen = Cell::new(0);
+            let processor = |_: &ResponseMessage| {
+                seen.set(seen.get() + 1);
+                Ok((seen.get() == 2).then_some("second"))
+            };
+            let answer = one_shot_shared_matching(&client(silent_stub(2), SHORT), OutgoingMessages::RequestCurrentTime, encoder, processor)
+                .await
+                .unwrap();
+            assert_eq!(answer, "second");
+        }
+
+        #[tokio::test]
+        async fn shared_matching_times_out_on_foreign_frames_only() {
+            let seen = Cell::new(0);
+            let processor = foreign_frames_counter(&seen);
+            let error = one_shot_shared_matching(&client(silent_stub(1), SHORT), OutgoingMessages::RequestCurrentTime, encoder, processor)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+        }
+
+        #[tokio::test]
+        async fn shared_matching_stops_reading_at_the_deadline() {
+            // Foreign frames already queued: a passed deadline must not read them.
+            let seen = Cell::new(0);
+            let processor = foreign_frames_counter(&seen);
+            let client = client(silent_stub(3), Duration::ZERO);
+            let error = one_shot_shared_matching(&client, OutgoingMessages::RequestCurrentTime, encoder, processor)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+            assert_eq!(seen.get(), 0);
+        }
+
+        #[tokio::test]
+        async fn shared_deadline_spans_resends() {
+            let bus = reset_past_the_deadline();
+            let client = client(bus.clone(), SHORT);
+            let start = std::time::Instant::now();
+            let error = one_shot_shared(&client, OutgoingMessages::RequestCurrentTime, encoder, |_| Ok(()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+            assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+            assert_eq!(bus.request_messages().len(), 1, "no resend past the deadline");
+        }
+
+        #[tokio::test]
+        async fn by_request_id_times_out_without_a_frame() {
+            let error = one_shot_by_request_id(&client(silent_stub(0), SHORT), |_| encoder(), |_| Ok(()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+        }
+
+        #[tokio::test]
+        async fn by_request_id_deadline_spans_resends() {
+            let bus = reset_past_the_deadline();
+            let start = std::time::Instant::now();
+            let error = one_shot_by_request_id(&client(bus.clone(), SHORT), |_| encoder(), |_| Ok(()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "got {error:?}");
+            assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+            assert_eq!(bus.request_messages().len(), 1, "no resend past the deadline");
+        }
     }
 }
 
 #[test]
-fn test_expect_proto_rejects_text_framing_of_the_expected_type() {
+fn expect_proto_rejects_text_framing_of_the_expected_type() {
     // Right type, unreadable framing: UnexpectedWireFormat, not UnexpectedResponse (#731).
     let message = ResponseMessage::from("49\01\01678890000\0");
     let processor = expect_proto(|payload: crate::proto::CurrentTime| Ok(payload.current_time));
     let err = processor(&message).expect_err("text framing must be rejected");
     assert!(matches!(err, Error::UnexpectedWireFormat(_)), "got {err:?}");
+}
+
+/// `one_shot_cancelling` (#1107): cancelled at TWS unless the request ended
+/// there, by its answer or a TWS error.
+mod cancelling {
+    use std::sync::Arc;
+
+    use super::super::CancellableOneShot;
+    use crate::common::test_utils::helpers::{count_proto_msgs, proto_error_response, proto_response, TEST_REQ_ID_FIRST};
+    use crate::contracts::Contract;
+    use crate::market_data::historical::{BarSize, Duration, WhatToShow};
+    use crate::market_data::TradingHours;
+    use crate::messages::{IncomingMessages, OutgoingMessages, ResponseMessage};
+    use crate::stubs::MessageBusStub;
+    use crate::{server_versions, Error};
+
+    const REQUEST: &[u8] = b"request";
+    const CANCEL: &[u8] = b"cancel";
+
+    /// Answered by a `HeadTimestamp` frame (any request-id-routed payload
+    /// does; the debug routing guard rejects one that isn't).
+    enum Answered {}
+
+    impl CancellableOneShot for Answered {
+        type Proto = crate::proto::HeadTimestamp;
+        type Output = ();
+
+        fn decode(_payload: Self::Proto) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn cancel(_request_id: i32) -> Result<Vec<u8>, Error> {
+            Ok(CANCEL.to_vec())
+        }
+    }
+
+    /// Its answer fails to decode.
+    enum Undecodable {}
+
+    impl CancellableOneShot for Undecodable {
+        type Proto = crate::proto::HeadTimestamp;
+        type Output = ();
+
+        fn decode(_payload: Self::Proto) -> Result<(), Error> {
+            Err(Error::Simple("bad answer".into()))
+        }
+
+        fn cancel(_request_id: i32) -> Result<Vec<u8>, Error> {
+            Ok(CANCEL.to_vec())
+        }
+    }
+
+    fn answer() -> ResponseMessage {
+        proto_response(IncomingMessages::HeadTimestamp, vec![])
+    }
+
+    fn tws_error() -> ResponseMessage {
+        proto_error_response(TEST_REQ_ID_FIRST, 200, "No security definition has been found for the request")
+    }
+
+    fn cancels(bus: &MessageBusStub) -> usize {
+        bus.request_messages().iter().filter(|m| m.as_slice() == CANCEL).count()
+    }
+
+    fn requests(bus: &MessageBusStub) -> usize {
+        bus.request_messages().iter().filter(|m| m.as_slice() == REQUEST).count()
+    }
+
+    /// Far past the 20 ms `one_shot_timeout`: a call that waits it out has
+    /// ignored its deadline.
+    const RECONNECT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The first request is reset, and the reconnect outlasts a 20 ms
+    /// `one_shot_timeout`; the resend would be answered at once.
+    fn reset_past_the_deadline() -> Arc<MessageBusStub> {
+        Arc::new(
+            MessageBusStub::with_ordered_responses(vec![answer()])
+                .with_connection_resets(1)
+                .with_reconnect_delay(RECONNECT),
+        )
+    }
+
+    struct Case {
+        label: &'static str,
+        responses: Vec<ResponseMessage>,
+        /// Whether the answer decodes (`Answered`) or fails to (`Undecodable`).
+        decodes: bool,
+        ok: bool,
+        cancels: usize,
+    }
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                label: "answered",
+                responses: vec![answer()],
+                decodes: true,
+                ok: true,
+                cancels: 0,
+            },
+            Case {
+                label: "TWS error ends the request",
+                responses: vec![tws_error()],
+                decodes: true,
+                ok: false,
+                cancels: 0,
+            },
+            Case {
+                label: "closed before the answer",
+                responses: vec![],
+                decodes: true,
+                ok: false,
+                cancels: 1,
+            },
+            Case {
+                label: "answer fails to decode",
+                responses: vec![answer()],
+                decodes: false,
+                ok: false,
+                cancels: 1,
+            },
+        ]
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_cancels_unless_ended_at_tws() {
+        use crate::client::blocking::Client;
+        use crate::common::request_helpers::blocking::one_shot_cancelling;
+
+        for Case {
+            label,
+            responses,
+            decodes,
+            ok,
+            cancels: expected_cancels,
+        } in cases()
+        {
+            let bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+            let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+            let encoder = |_| Ok(REQUEST.to_vec());
+
+            let result = if decodes {
+                one_shot_cancelling::<Answered>(&client, encoder)
+            } else {
+                one_shot_cancelling::<Undecodable>(&client, encoder)
+            };
+
+            assert_eq!(result.is_ok(), ok, "{label}: {result:?}");
+            assert_eq!(bus.request_messages()[0], REQUEST, "{label}");
+            assert_eq!(cancels(&bus), expected_cancels, "{label}");
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_cancels_unless_ended_at_tws() {
+        use crate::common::request_helpers::one_shot_cancelling;
+        use crate::Client;
+
+        for Case {
+            label,
+            responses,
+            decodes,
+            ok,
+            cancels: expected_cancels,
+        } in cases()
+        {
+            let bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+            let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+            let encoder = |_| Ok(REQUEST.to_vec());
+
+            let result = if decodes {
+                one_shot_cancelling::<Answered>(&client, encoder).await
+            } else {
+                one_shot_cancelling::<Undecodable>(&client, encoder).await
+            };
+            // Drop spawns its cancel; let it run.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+            assert_eq!(result.is_ok(), ok, "{label}: {result:?}");
+            assert_eq!(bus.request_messages()[0], REQUEST, "{label}");
+            assert_eq!(cancels(&bus), expected_cancels, "{label}");
+        }
+    }
+
+    /// The case the issue is about: a caller's timeout drops the pending
+    /// future, and the request is cancelled at TWS.
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_timeout_cancels() {
+        use crate::common::request_helpers::one_shot_cancelling;
+        use crate::Client;
+
+        let bus = Arc::new(MessageBusStub::default().keeping_channels_open());
+        let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+
+        let pending = one_shot_cancelling::<Answered>(&client, |_| Ok(REQUEST.to_vec()));
+        let result = tokio::time::timeout(std::time::Duration::from_millis(20), pending).await;
+        assert!(result.is_err(), "no answer, so the wait times out");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while cancels(&bus) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cancels(&bus), 1);
+    }
+
+    /// `one_shot_timeout` ends the wait, and the drop cancels at TWS.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_one_shot_timeout_cancels() {
+        use crate::client::blocking::Client;
+        use crate::common::request_helpers::blocking::one_shot_cancelling;
+
+        let bus = Arc::new(MessageBusStub::default().keeping_channels_open());
+        let client =
+            Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3).with_one_shot_timeout(std::time::Duration::from_millis(20));
+
+        let error = one_shot_cancelling::<Answered>(&client, |_| Ok(REQUEST.to_vec())).unwrap_err();
+        assert!(matches!(error, Error::Timeout), "got {error:?}");
+        assert_eq!(cancels(&bus), 1);
+    }
+
+    /// A reconnect that outlasts `one_shot_timeout` ends the call without a resend.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_one_shot_timeout_skips_resend_past_deadline() {
+        use crate::client::blocking::Client;
+        use crate::common::request_helpers::blocking::one_shot_cancelling;
+
+        let bus = reset_past_the_deadline();
+        let client =
+            Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3).with_one_shot_timeout(std::time::Duration::from_millis(20));
+
+        let start = std::time::Instant::now();
+        let error = one_shot_cancelling::<Answered>(&client, |_| Ok(REQUEST.to_vec())).unwrap_err();
+        assert!(matches!(error, Error::Timeout), "got {error:?}");
+        assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+        assert_eq!(requests(&bus), 1, "no resend past the deadline");
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_one_shot_timeout_skips_resend_past_deadline() {
+        use crate::common::request_helpers::one_shot_cancelling;
+        use crate::Client;
+
+        let bus = reset_past_the_deadline();
+        let client =
+            Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3).with_one_shot_timeout(std::time::Duration::from_millis(20));
+
+        let start = std::time::Instant::now();
+        let error = one_shot_cancelling::<Answered>(&client, |_| Ok(REQUEST.to_vec())).await.unwrap_err();
+        assert!(matches!(error, Error::Timeout), "got {error:?}");
+        assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+        assert_eq!(requests(&bus), 1, "no resend past the deadline");
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_one_shot_timeout_cancels() {
+        use crate::common::request_helpers::one_shot_cancelling;
+        use crate::Client;
+
+        let bus = Arc::new(MessageBusStub::default().keeping_channels_open());
+        let client =
+            Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3).with_one_shot_timeout(std::time::Duration::from_millis(20));
+
+        let error = one_shot_cancelling::<Answered>(&client, |_| Ok(REQUEST.to_vec())).await.unwrap_err();
+        assert!(matches!(error, Error::Timeout), "got {error:?}");
+
+        // Drop spawns its cancel; let it run.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while cancels(&bus) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cancels(&bus), 1);
+    }
+
+    fn stock() -> Contract {
+        Contract::stock("AAPL").build()
+    }
+
+    fn option() -> Contract {
+        Contract::call("AAPL").strike(240.0).expires_on(2026, 11, 20).build().unwrap()
+    }
+
+    /// Every cancellable one-shot goes through `one_shot_cancelling` with its
+    /// own cancel: unanswered, each sends the cancel IB defines for it.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_requests_send_their_cancel() {
+        use crate::client::blocking::Client;
+
+        type Call = fn(&Client);
+        let requests: [(&str, Call, OutgoingMessages); 7] = [
+            (
+                "head_timestamp",
+                |c| drop(c.head_timestamp(&stock(), WhatToShow::Trades, TradingHours::Regular)),
+                OutgoingMessages::CancelHeadTimestamp,
+            ),
+            (
+                "histogram_data",
+                |c| drop(c.histogram_data(&stock(), TradingHours::Regular, BarSize::Week)),
+                OutgoingMessages::CancelHistogramData,
+            ),
+            (
+                "historical_schedules",
+                |c| drop(c.historical_schedules(&stock(), Duration::days(1)).fetch()),
+                OutgoingMessages::CancelHistoricalData,
+            ),
+            (
+                "calculate_option_price",
+                |c| drop(c.calculate_option_price(&option(), 0.3, 235.0)),
+                OutgoingMessages::CancelOptionPrice,
+            ),
+            (
+                "calculate_implied_volatility",
+                |c| drop(c.calculate_implied_volatility(&option(), 10.0, 235.0)),
+                OutgoingMessages::CancelImpliedVolatility,
+            ),
+            ("wsh_metadata", |c| drop(c.wsh_metadata()), OutgoingMessages::CancelWshMetaData),
+            (
+                "wsh_event_data",
+                |c| drop(c.wsh_event_data_by_contract(1).fetch()),
+                OutgoingMessages::CancelWshEventData,
+            ),
+        ];
+
+        for (label, call, cancel) in requests {
+            let bus = Arc::new(MessageBusStub::default());
+            call(&Client::stubbed(bus.clone(), server_versions::CONDITIONS_INCLUDE_OVERNIGHT));
+            assert_eq!(count_proto_msgs(&bus.request_messages(), cancel), 1, "{label}");
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_requests_send_their_cancel() {
+        use crate::Client;
+
+        let bus = || Arc::new(MessageBusStub::default());
+        let client = |bus: &Arc<MessageBusStub>| Client::stubbed(bus.clone(), server_versions::CONDITIONS_INCLUDE_OVERNIGHT);
+        let mut runs = Vec::new();
+
+        let b = bus();
+        drop(client(&b).head_timestamp(&stock(), WhatToShow::Trades, TradingHours::Regular).await);
+        runs.push(("head_timestamp", b, OutgoingMessages::CancelHeadTimestamp));
+        let b = bus();
+        drop(client(&b).histogram_data(&stock(), TradingHours::Regular, BarSize::Week).await);
+        runs.push(("histogram_data", b, OutgoingMessages::CancelHistogramData));
+        let b = bus();
+        drop(client(&b).historical_schedules(&stock(), Duration::days(1)).fetch().await);
+        runs.push(("historical_schedules", b, OutgoingMessages::CancelHistoricalData));
+        let b = bus();
+        drop(client(&b).calculate_option_price(&option(), 0.3, 235.0).await);
+        runs.push(("calculate_option_price", b, OutgoingMessages::CancelOptionPrice));
+        let b = bus();
+        drop(client(&b).calculate_implied_volatility(&option(), 10.0, 235.0).await);
+        runs.push(("calculate_implied_volatility", b, OutgoingMessages::CancelImpliedVolatility));
+        let b = bus();
+        drop(client(&b).wsh_metadata().await);
+        runs.push(("wsh_metadata", b, OutgoingMessages::CancelWshMetaData));
+        let b = bus();
+        drop(client(&b).wsh_event_data_by_contract(1).fetch().await);
+        runs.push(("wsh_event_data", b, OutgoingMessages::CancelWshEventData));
+
+        // Drops spawn their cancels; let them run.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        for (label, bus, cancel) in runs {
+            assert_eq!(count_proto_msgs(&bus.request_messages(), cancel), 1, "{label}");
+        }
+    }
 }

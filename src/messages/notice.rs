@@ -44,10 +44,26 @@ pub const ORDER_MESSAGE_CODE: i32 = 399;
 /// depth subscription yields it as [`MarketDepths::Reset`](crate::market_data::realtime::MarketDepths::Reset).
 pub(crate) const MARKET_DEPTH_RESET_CODE: i32 = 317;
 
-/// "Historical Market Data Service query message". Classified `Error`, but a
-/// scanner subscription keeps its "no items retrieved" form nonterminal; see
+/// "Historical Market Data Service query message". Classified `Error`, except
+/// the [`HMDS_CONNECTED_TEXT`] form, which is a `Warning`; a scanner
+/// subscription also keeps its "no items retrieved" form nonterminal. See
 /// [`classify`].
 pub(crate) const HMDS_QUERY_MESSAGE_CODE: i32 = 165;
+
+/// Text of the [`HMDS_QUERY_MESSAGE_CODE`] frame TWS sends, bound to a
+/// historical request, when the HMDS farm connects on demand. The data follows
+/// it, so it is a warning, not a failed query (#1136).
+pub(crate) const HMDS_CONNECTED_TEXT: &str = "HMDS server connection was successful";
+
+/// "No security definition has been found for the request".
+pub(crate) const NO_SECURITY_DEFINITION_CODE: i32 = 200;
+
+/// "Historical Market Data Service error message" (e.g. a disabled scanner
+/// type, or no data for a historical query).
+pub(crate) const HMDS_ERROR_CODE: i32 = 162;
+
+/// "Error validating request" (e.g. an invalid account code).
+pub(crate) const REQUEST_VALIDATION_CODE: i32 = 321;
 
 /// Range of error codes that are considered warnings: the whole `21xx` band.
 ///
@@ -62,10 +78,14 @@ pub const WARNING_CODE_RANGE: std::ops::RangeInclusive<i32> = 2100..=2199;
 /// notices (e.g. "Warning: Approaching max rate of 50 messages per second"),
 /// and the absent field decodes to 0. An error frame that fails proto decode
 /// falls back to the same default, so code 0 never carries a hard error.
+///
+/// Code 165 is a warning only in its [`HMDS_CONNECTED_TEXT`] form; its other
+/// texts can be real query failures.
 pub(crate) fn is_warning_message(code: i32, message: &str) -> bool {
     code == 0
         || WARNING_CODE_RANGE.contains(&code)
         || (code == ORDER_MESSAGE_CODE && message.lines().any(|line| line.trim_start().starts_with("Warning:")))
+        || (code == HMDS_QUERY_MESSAGE_CODE && message.contains(HMDS_CONNECTED_TEXT))
 }
 
 /// Classify a raw error frame into a disjoint [`NoticeCategory`].
@@ -79,8 +99,9 @@ pub(crate) fn is_warning_message(code: i32, message: &str) -> bool {
 /// lets a subscription deliver a request-bound `Error` notice as
 /// `SubscriptionItem::Notice` instead of ending. The notice keeps its `Error`
 /// category. Only the scanner uses it, for [`HMDS_QUERY_MESSAGE_CODE`] "no items
-/// retrieved" (#886); making 165 informational here would also reach one-shot
-/// requests, which would wait for an answer that never comes.
+/// retrieved" (#886); making that form informational here would also reach
+/// one-shot requests, which would wait for an answer that never comes. The
+/// [`HMDS_CONNECTED_TEXT`] form is a `Warning` here instead: the data follows it.
 pub(crate) fn classify(code: i32, message: &str) -> NoticeCategory {
     if code == ORDER_CANCELLED_CODE {
         NoticeCategory::Cancellation
@@ -189,6 +210,11 @@ pub const DATA_ADVISORY_CODES: &[i32] = &[MARKET_DEPTH_RESET_CODE, 2188, 10089, 
 /// for callers that bind the constant explicitly.
 pub const REQUEST_ERROR_CODES: &[i32] = &[300, 301, 302, 309, 310, 316, 319, 326, 327, 330, 331, 354, 357, 365, 366, 385, 386];
 
+/// TWS refused the session: another connection holds this client id. Sent
+/// once after `start_api`, then TWS closes the socket; the handshake turns it
+/// into [`Error::ClientIdInUse`](crate::Error::ClientIdInUse).
+pub(crate) const CLIENT_ID_IN_USE_CODE: i32 = 326;
+
 /// Data-farm codes reporting a healthy connection ("…connection is OK").
 /// Subset of [`WARNING_CODE_RANGE`]; classified [`ConnectivityStatus::Ok`].
 pub(crate) const FARM_OK_CODES: [i32; 3] = [2104, 2106, 2158];
@@ -228,7 +254,7 @@ pub const HANDSHAKE_UNKNOWN_FRAME_CODE: i32 = -3;
 /// Synthesized notice code emitted when a typed handshake decoder fails for
 /// a known [`IncomingMessages`](super::IncomingMessages) kind (`OpenOrder`, `OrderStatus`,
 /// `AccountValue`/`PortfolioValue`/`AccountUpdateTime`/`AccountDownloadEnd`,
-/// `ExecutionData`, `CommissionsReport`, `CompletedOrder`). Distinct from
+/// `ExecutionData`, `CommissionsAndFeesReport`, `CompletedOrder`). Distinct from
 /// [`HANDSHAKE_UNKNOWN_FRAME_CODE`] so consumers can separate TWS schema
 /// drift from rust-ibapi decoder bugs. See
 /// [`Notice::is_handshake_synthetic`].
@@ -286,6 +312,12 @@ pub(crate) fn unknown_message_type_notice(message: &ResponseMessage) -> Notice {
 ///
 /// On receiving this notice the stream is still live, but frames are gone:
 /// reconcile the same way as after a reconnect gap.
+///
+/// Readers that assemble a complete result fail instead of returning rows
+/// with a gap: `collect_to_end_within`, `next_batch` and what is built on
+/// them (`contract_details`, account-summary snapshots) return
+/// `Error::Notice` carrying this code. `collect_for` and `collect_until`
+/// stop at the gap and return the rows read before it.
 ///
 /// - **Market data and other non-order streams** (ticks, bars, depth,
 ///   positions, account updates, PnL, news, contract details): bounded and
@@ -384,6 +416,10 @@ pub(crate) fn notice_stream_lag_notice(skipped: u64) -> Notice {
 /// set with `switch_market_data_type` needs no action: the reconnect re-sends
 /// it before this notice.
 ///
+/// `Client::resubscribing` also delivers it in-band, as a
+/// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice) before the first item
+/// of each subscription it reopens.
+///
 /// Published once the reconnected session is live: the channel reset runs
 /// before the reconnect, so a consumer may resubscribe from inside its handler
 /// and land on the new session without racing either. Like the other
@@ -398,6 +434,15 @@ pub(crate) fn transport_reconnect_notice() -> Notice {
     Notice::synthesized(
         TRANSPORT_RECONNECT_CODE,
         "transport reconnected to TWS/Gateway; this is a new connection whose server-side state starts empty, so every request subscription from the previous connection is gone".to_string(),
+    )
+}
+
+/// Build the in-band [`TRANSPORT_RECONNECT_CODE`] notice `Client::resubscribing`
+/// yields before a resubscribed stream's first item.
+pub(crate) fn resubscribed_notice() -> Notice {
+    Notice::synthesized(
+        TRANSPORT_RECONNECT_CODE,
+        "resubscribed after a transport reconnect; data from the outage is missing and the new subscription may repeat its initial state".to_string(),
     )
 }
 
@@ -446,7 +491,8 @@ pub enum NoticeCategory {
     /// Order cancellation confirmation (exact code 202).
     Cancellation,
     /// Informational warning ([`WARNING_CODE_RANGE`], code 399 with a `Warning:`
-    /// line, or code 0 — a code-less frame).
+    /// line, code 165 "HMDS server connection was successful", or code 0 — a
+    /// code-less frame).
     Warning,
     /// Connectivity / system status (codes 1100, 1101, 1102, 1300).
     SystemMessage,
@@ -759,10 +805,11 @@ impl Notice {
     /// sits in.
     ///
     /// Informational categories log at `warn` (the caller may want to act:
-    /// a fallback engaged, a book must be cleared), with two exceptions at `info`:
-    /// the cancellation confirmation, and data-farm notices that need no action.
-    /// A farm that is OK, `Inactive` ("…available upon demand") or `Connecting` is
-    /// routine on nearly every connect; only `Broken` warns.
+    /// a fallback engaged, a book must be cleared), with three exceptions at
+    /// `info`: the cancellation confirmation, data-farm notices that need no
+    /// action, and 165 "HMDS server connection was successful". A farm that is
+    /// OK, `Inactive` ("…available upon demand") or `Connecting` is routine on
+    /// nearly every connect; only `Broken` warns.
     /// System connectivity codes are graded by how much they matter: 1102
     /// (restored, data maintained) → info; 1101 (restored, data lost —
     /// resubscribe required) → warn; 1100 (connectivity lost) and 1300 (socket
@@ -779,6 +826,8 @@ impl Notice {
             {
                 Level::Info
             }
+            // A 165 classifies as Warning only in its HMDS-connected form.
+            NoticeCategory::Warning if self.code == HMDS_QUERY_MESSAGE_CODE => Level::Info,
             NoticeCategory::Warning | NoticeCategory::DataAdvisory => Level::Warn,
             NoticeCategory::SystemMessage => match self.code {
                 CONNECTIVITY_RESTORED_DATA_MAINTAINED_CODE => Level::Info,

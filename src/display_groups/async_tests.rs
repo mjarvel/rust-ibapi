@@ -1,10 +1,13 @@
 use super::*;
-use crate::common::test_utils::helpers::{assert_proto_msg_id, proto_response};
-use crate::messages::{IncomingMessages, OutgoingMessages};
+use crate::common::test_utils::helpers::constants::TEST_REQ_ID_FIRST;
+use crate::common::test_utils::helpers::{assert_request, proto_response, request_message_count};
+use crate::messages::IncomingMessages;
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
 use crate::subscriptions::SubscriptionItem;
-use crate::testdata::builders::display_groups::display_group_updated;
+use crate::testdata::builders::display_groups::{
+    display_group_list, display_group_updated, query_display_groups_request, subscribe_to_group_events_request, update_display_group_request,
+};
 use crate::testdata::builders::ResponseProtoEncoder;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -15,7 +18,21 @@ fn display_group_update_response(contract_info: &str) -> crate::messages::Respon
 }
 
 #[tokio::test]
-async fn test_subscribe_to_group_events() {
+async fn display_groups() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
+        IncomingMessages::DisplayGroupList,
+        display_group_list().request_id(TEST_REQ_ID_FIRST).groups("3|1|2").encode_proto(),
+    )]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+
+    let groups = client.display_groups().await.expect("display_groups failed");
+    assert_eq!(groups, vec![3, 1, 2]);
+    assert_eq!(request_message_count(&message_bus), 1);
+    assert_request(&message_bus, 0, &query_display_groups_request().request_id(TEST_REQ_ID_FIRST));
+}
+
+#[tokio::test]
+async fn subscribe_to_group_events() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![display_group_update_response(
         "265598@SMART",
     )]));
@@ -24,11 +41,12 @@ async fn test_subscribe_to_group_events() {
 
     let mut subscription = client.subscribe_to_group_events(1).await.expect("failed to subscribe");
 
-    {
-        let requests = message_bus.request_messages.read().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_proto_msg_id(&requests[0], OutgoingMessages::SubscribeToGroupEvents);
-    }
+    assert_eq!(request_message_count(&message_bus), 1);
+    assert_request(
+        &message_bus,
+        0,
+        &subscribe_to_group_events_request().request_id(TEST_REQ_ID_FIRST).group_id(1),
+    );
 
     let Some(Ok(SubscriptionItem::Data(update))) = subscription.next().await else {
         panic!("expected Data");
@@ -37,7 +55,7 @@ async fn test_subscribe_to_group_events() {
 }
 
 #[tokio::test]
-async fn test_subscribe_to_group_events_empty_group() {
+async fn subscribe_to_group_events_empty_group() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![display_group_update_response("")]));
 
     let client = Client::stubbed(message_bus, server_versions::PROTOBUF_REST_MESSAGES_3);
@@ -51,7 +69,7 @@ async fn test_subscribe_to_group_events_empty_group() {
 }
 
 #[tokio::test]
-async fn test_update_display_group() {
+async fn update_display_group() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![display_group_update_response(
         "265598@SMART",
     )]));
@@ -61,14 +79,21 @@ async fn test_update_display_group() {
     let subscription = client.subscribe_to_group_events(1).await.expect("failed to subscribe");
     subscription.update("265598@SMART").await.expect("update failed");
 
-    let requests = message_bus.request_messages.read().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_proto_msg_id(&requests[0], OutgoingMessages::SubscribeToGroupEvents);
-    assert_proto_msg_id(&requests[1], OutgoingMessages::UpdateDisplayGroup);
+    assert_eq!(request_message_count(&message_bus), 2);
+    assert_request(
+        &message_bus,
+        0,
+        &subscribe_to_group_events_request().request_id(TEST_REQ_ID_FIRST).group_id(1),
+    );
+    assert_request(
+        &message_bus,
+        1,
+        &update_display_group_request().request_id(TEST_REQ_ID_FIRST).contract_info("265598@SMART"),
+    );
 }
 
 #[tokio::test]
-async fn test_subscribe_to_group_events_skips_wrong_message_type() {
+async fn subscribe_to_group_events_skips_wrong_message_type() {
     // Regression for docs/rules/wire/proto-only-decoding.md: wrong-type frames
     // must skip-classify, not terminate.
     let wrong = proto_response(

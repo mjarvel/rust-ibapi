@@ -1,9 +1,10 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         LazyLock, Mutex, RwLock,
     },
+    time::Duration,
 };
 
 #[cfg(feature = "sync")]
@@ -46,6 +47,8 @@ pub(crate) struct MessageBusStub {
     /// Requests still to be answered with [`Error::ConnectionReset`] before the
     /// configured responses are served. See [`MessageBusStub::with_connection_resets`].
     connection_resets: AtomicUsize,
+    /// What `session_generation` reports; see [`MessageBusStub::start_new_session`].
+    session_generation: AtomicU64,
     /// The runtime the stub was built on, if any; sync-only tests build it
     /// with none. See [`AsyncMessageBus::runtime_handle`].
     #[cfg(feature = "async")]
@@ -62,14 +65,37 @@ pub(crate) struct MessageBusStub {
     /// Keep every stubbed subscription open after its scripted items, as a
     /// real one is until TWS answers. See [`MessageBusStub::keeping_channels_open`].
     keep_open: AtomicBool,
+    /// How long `wait_connected` takes, unless its deadline comes first. See [`MessageBusStub::with_reconnect_delay`].
+    reconnect_delay: Duration,
+    /// `wait_connected` reports the reconnect gave up. See [`MessageBusStub::with_failed_reconnect`].
+    reconnect_fails: bool,
+    /// What `send_message` does after recording the message. See [`MessageBusStub::with_failing_sends`].
+    send_mode: SendMode,
     #[cfg(feature = "sync")]
     open_sync_senders: Mutex<Vec<channel::Sender<RoutedItem>>>,
     #[cfg(feature = "async")]
     open_async_senders: Mutex<Vec<broadcast::Sender<RoutedItem>>>,
 }
 
+/// What `send_message` does after recording the message.
+#[derive(Clone, Copy)]
+enum SendMode {
+    Succeed,
+    Fail,
+    #[cfg(feature = "async")]
+    Stall,
+}
+
 // Separate tracking for order update subscriptions to maintain backward compatibility
 static ORDER_UPDATE_SUBSCRIPTION_TRACKER: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+impl MessageBusStub {
+    /// Simulate a reconnect's reset: subscriptions made before it now belong
+    /// to an earlier session.
+    pub(crate) fn start_new_session(&self) {
+        self.session_generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 impl Default for MessageBusStub {
     fn default() -> Self {
@@ -80,6 +106,7 @@ impl Default for MessageBusStub {
             #[cfg(feature = "async")]
             executions_requests: RwLock::new(vec![]),
             connection_resets: AtomicUsize::new(0),
+            session_generation: AtomicU64::new(0),
             #[cfg(feature = "async")]
             runtime: tokio::runtime::Handle::try_current().ok(),
             #[cfg(feature = "sync")]
@@ -87,6 +114,9 @@ impl Default for MessageBusStub {
             #[cfg(feature = "async")]
             status_senders: Mutex::default(),
             keep_open: AtomicBool::new(false),
+            reconnect_delay: Duration::ZERO,
+            reconnect_fails: false,
+            send_mode: SendMode::Succeed,
             #[cfg(feature = "sync")]
             open_sync_senders: Mutex::default(),
             #[cfg(feature = "async")]
@@ -144,6 +174,44 @@ impl MessageBusStub {
         self
     }
 
+    /// Make each `wait_connected` take `delay`, as a reconnect does; with
+    /// [`Self::with_connection_resets`], a retry resumes only after it.
+    pub fn with_reconnect_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_delay = delay;
+        self
+    }
+
+    /// Make each `wait_connected` fail with [`Error::ConnectionFailed`], as it
+    /// does once the reconnect gave up.
+    pub fn with_failed_reconnect(mut self) -> Self {
+        self.reconnect_fails = true;
+        self
+    }
+
+    /// Make each `send_message` fail with [`Error::ConnectionReset`] after
+    /// recording it, as a write to a lost connection does.
+    pub fn with_failing_sends(mut self) -> Self {
+        self.send_mode = SendMode::Fail;
+        self
+    }
+
+    /// Make each async `send_message` record its message, then never
+    /// complete, as a write stuck on a peer that stopped reading does.
+    #[cfg(feature = "async")]
+    pub fn with_stalled_sends(mut self) -> Self {
+        self.send_mode = SendMode::Stall;
+        self
+    }
+
+    /// What `wait_connected` returns once its delay has passed.
+    fn reconnect_outcome(&self) -> Result<(), Error> {
+        if self.reconnect_fails {
+            Err(Error::ConnectionFailed)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn request_messages(&self) -> Vec<Vec<u8>> {
         self.request_messages.read().unwrap().clone()
     }
@@ -195,7 +263,7 @@ impl MessageBusStub {
             self.open_async_senders.lock().unwrap().push(sender.clone());
         }
 
-        AsyncInternalSubscription::new(receiver)
+        AsyncInternalSubscription::new(receiver).in_session(self.session_generation.load(Ordering::Relaxed))
     }
 }
 
@@ -239,7 +307,10 @@ impl MessageBus for MessageBusStub {
 
     fn send_message(&self, message: &[u8]) -> Result<(), Error> {
         self.request_messages.write().unwrap().push(message.to_vec());
-        Ok(())
+        match self.send_mode {
+            SendMode::Fail => Err(Error::ConnectionReset),
+            _ => Ok(()),
+        }
     }
 
     fn send_market_data_type(&self, message: &[u8]) -> Result<(), Error> {
@@ -312,12 +383,24 @@ impl MessageBus for MessageBusStub {
 
     fn ensure_shutdown(&self) {}
 
-    fn wait_connected(&self) -> Result<(), Error> {
-        Ok(()) // Stub is always connected
+    fn wait_connected(&self, deadline: Option<std::time::Instant>) -> Result<(), Error> {
+        if !self.reconnect_delay.is_zero() {
+            let reconnected = std::time::Instant::now() + self.reconnect_delay;
+            if let Some(deadline) = deadline.filter(|deadline| *deadline < reconnected) {
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                return Err(Error::Timeout);
+            }
+            std::thread::sleep(self.reconnect_delay);
+        }
+        self.reconnect_outcome()
     }
 
     fn is_connected(&self) -> bool {
         true // Stub always returns connected
+    }
+
+    fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Relaxed)
     }
 
     // fn process_messages(&mut self, _server_version: i32) -> Result<(), Error> {
@@ -348,7 +431,8 @@ fn mock_request(stub: &MessageBusStub, route: MockRoute, message: &[u8]) -> Inte
     let subscription = SubscriptionBuilder::new()
         .signaler(stub.signals.0.clone())
         .lease(Lease::new())
-        .receiver(receiver);
+        .receiver(receiver)
+        .session(stub.session_generation.load(Ordering::Relaxed));
     match route {
         MockRoute::Request(request_id) => subscription.request_id(request_id),
         MockRoute::Order(order_id) => subscription.order_id(order_id),
@@ -389,7 +473,11 @@ impl AsyncMessageBus for MessageBusStub {
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error> {
         self.request_messages.write().unwrap().push(message);
-        Ok(())
+        match self.send_mode {
+            SendMode::Succeed => Ok(()),
+            SendMode::Fail => Err(Error::ConnectionReset),
+            SendMode::Stall => std::future::pending().await,
+        }
     }
 
     async fn send_market_data_type(&self, message: Vec<u8>) -> Result<(), Error> {
@@ -457,12 +545,26 @@ impl AsyncMessageBus for MessageBusStub {
         // No-op for test stub
     }
 
-    async fn wait_connected(&self) -> Result<(), Error> {
-        Ok(()) // Stub is always connected
+    async fn wait_connected(&self, deadline: Option<tokio::time::Instant>) -> Result<(), Error> {
+        // Even a zero sleep yields, letting a dropped subscription's spawned
+        // cancel run before the retry; tests counting requests rely on it not.
+        if !self.reconnect_delay.is_zero() {
+            let reconnected = tokio::time::Instant::now() + self.reconnect_delay;
+            if let Some(deadline) = deadline.filter(|deadline| *deadline < reconnected) {
+                tokio::time::sleep_until(deadline).await;
+                return Err(Error::Timeout);
+            }
+            tokio::time::sleep_until(reconnected).await;
+        }
+        self.reconnect_outcome()
     }
 
     fn is_connected(&self) -> bool {
         true // Stub always returns connected
+    }
+
+    fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Relaxed)
     }
 
     fn runtime_handle(&self) -> &tokio::runtime::Handle {

@@ -5,7 +5,7 @@
 //! Real-time methods are inherent methods on `ibapi::Client` — call
 //! `client.realtime_bars(...)`, `client.tick_by_tick(...)`,
 //! `client.market_depth(...)`, etc. The public types (`Bar`, `BidAsk`,
-//! `MidPoint`, `Trade`, `TickTypes`, `MarketDataBuilder`, `RealtimeBarsBuilder`,
+//! `MidPoint`, `Trade`, `TickTypes`, `Quote`, `MarketDataBuilder`, `RealtimeBarsBuilder`,
 //! `TickByTickBuilder`, `MarketDepthBuilder`, etc.) live at
 //! `ibapi::market_data::realtime::*` and via `ibapi::prelude::*`.
 //!
@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 
 use crate::common::error_helpers;
 use crate::contracts::OptionComputation;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, MARKET_DEPTH_RESET_CODE};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::Error;
 
@@ -29,6 +29,9 @@ mod builder;
 pub use builder::{MarketDataBuilder, MarketDepthBuilder, RealtimeBarsBuilder, TickByTickBuilder};
 
 pub mod generic_tick;
+
+mod quote;
+pub use quote::Quote;
 
 // Feature-specific implementations
 #[doc(hidden)]
@@ -75,6 +78,11 @@ impl StreamDecoder<BidAsk> for BidAsk {
         let request_id = error_helpers::require_request_id_for(request_id, "encode cancel bid/ask ticks")?;
         common::encoders::encode_cancel_tick_by_tick(request_id)
     }
+
+    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
+    }
 }
 
 /// Attributes for bid/ask tick data.
@@ -110,6 +118,11 @@ impl StreamDecoder<MidPoint> for MidPoint {
     fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
         let request_id = error_helpers::require_request_id_for(request_id, "encode cancel mid point ticks")?;
         common::encoders::encode_cancel_tick_by_tick(request_id)
+    }
+
+    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
     }
 }
 
@@ -149,6 +162,11 @@ impl StreamDecoder<Bar> for Bar {
         let request_id = error_helpers::require_request_id_for(request_id, "encode cancel realtime bars")?;
         common::encoders::encode_cancel_realtime_bars(request_id)
     }
+
+    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
+    }
 }
 
 /// Represents `Last` or `AllLast` tick-by-tick real-time tick.
@@ -182,6 +200,11 @@ impl StreamDecoder<Trade> for Trade {
     fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
         let request_id = error_helpers::require_request_id_for(request_id, "encode cancel trade ticks")?;
         common::encoders::encode_cancel_tick_by_tick(request_id)
+    }
+
+    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
     }
 }
 
@@ -246,16 +269,55 @@ pub enum MarketDepths {
     Reset,
 }
 
+/// How a [`MarketDepth`] / [`MarketDepthL2`] row changes the book.
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DepthOperation {
+    /// Insert a new row at `position`. Wire code `0`. Also the value when TWS omits the field.
+    #[default]
+    Insert,
+    /// Update the row at `position`. Wire code `1`.
+    Update,
+    /// Delete the row at `position`. Wire code `2`.
+    Delete,
+    /// Operation code not modeled by this version of the API.
+    Unknown(i32),
+}
+
+impl_wire_code!(DepthOperation {
+    Insert = 0,
+    Update = 1,
+    Delete = 2,
+});
+
+/// Which side of the book a [`MarketDepth`] / [`MarketDepthL2`] row belongs to.
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DepthSide {
+    /// Ask side. Wire code `0`. Also the value when TWS omits the field.
+    #[default]
+    Ask,
+    /// Bid side. Wire code `1`.
+    Bid,
+    /// Side code not modeled by this version of the API.
+    Unknown(i32),
+}
+
+impl_wire_code!(DepthSide {
+    Ask = 0,
+    Bid = 1,
+});
+
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 /// Returns the order book.
 pub struct MarketDepth {
     /// The order book's row being updated
     pub position: i32,
-    /// How to refresh the row: 0 - insert (insert this new order into the row identified by 'position')· 1 - update (update the existing order in the row identified by 'position')· 2 - delete (delete the existing order at the row identified by 'position').
-    pub operation: i32,
-    /// 0 for ask, 1 for bid
-    pub side: i32,
+    /// How to refresh the row.
+    pub operation: DepthOperation,
+    /// Which side of the book the row is on.
+    pub side: DepthSide,
     /// The order's price.
     pub price: f64,
     /// The order's size.
@@ -268,18 +330,18 @@ pub struct MarketDepth {
 pub struct MarketDepthL2 {
     /// The order book's row being updated
     pub position: i32,
-    /// The exchange holding the order if isSmartDepth is True, otherwise the MPID of the market maker
+    /// The exchange holding the order if `is_smart_depth` is `true`, otherwise the MPID of the market maker
     pub market_maker: String,
-    /// How to refresh the row: 0 - insert (insert this new order into the row identified by 'position')· 1 - update (update the existing order in the row identified by 'position')· 2 - delete (delete the existing order at the row identified by 'position').
-    pub operation: i32,
-    /// 0 for ask, 1 for bid
-    pub side: i32,
+    /// How to refresh the row.
+    pub operation: DepthOperation,
+    /// Which side of the book the row is on.
+    pub side: DepthSide,
     /// The order's price.
     pub price: f64,
     /// The order's size.
     pub size: f64,
-    /// Flag indicating if this is smart depth response (aggregate data from multiple exchanges, v974+)
-    pub smart_depth: bool,
+    /// Flag indicating if this is smart depth response (aggregate data from multiple exchanges)
+    pub is_smart_depth: bool,
 }
 
 impl StreamDecoder<MarketDepths> for MarketDepths {
@@ -300,6 +362,11 @@ impl StreamDecoder<MarketDepths> for MarketDepths {
     fn cancel_message(_server_version: i32, request_id: Option<i32>, context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
         let request_id = error_helpers::require_request_id_for(request_id, "encode cancel market depth")?;
         common::encoders::encode_cancel_market_depth(request_id, context.map(|c| c.is_smart_depth).unwrap_or(false))
+    }
+
+    /// Live: after 200 TWS answers the cancel with 310 (no such request).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
     }
 }
 
@@ -372,6 +439,11 @@ impl StreamDecoder<TickTypes> for TickTypes {
     fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
         let request_id = error_helpers::require_request_id_for(request_id, "encode cancel market data")?;
         common::encoders::encode_cancel_market_data(request_id)
+    }
+
+    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
     }
 
     fn is_snapshot_end(&self) -> bool {

@@ -126,9 +126,10 @@ pub mod helpers {
 
     /// `NextValidId` proto-framed handshake frame.
     pub fn next_valid_id_frame(order_id: i32) -> Vec<u8> {
+        use crate::testdata::builders::{orders::next_valid_id, ResponseProtoEncoder};
         binary_proto(
             crate::messages::IncomingMessages::NextValidId as i32,
-            &crate::proto::NextValidId { order_id: Some(order_id) },
+            &next_valid_id().order_id(order_id).to_proto(),
         )
     }
 
@@ -449,6 +450,27 @@ pub mod helpers {
             Err(crate::Error::UnexpectedWireFormat(_)) => {}
             other => panic!("expected Error::UnexpectedWireFormat for a text-framed {expected:?}, got {other:?}"),
         }
+    }
+
+    /// Poll `condition` until it holds, failing rather than hanging.
+    pub fn wait_for(label: &str, condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {label}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// [`wait_for`] for async tests: sleeps on the runtime, not the thread.
+    #[cfg(feature = "async")]
+    pub async fn wait_for_async(label: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
     }
 }
 

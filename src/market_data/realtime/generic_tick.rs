@@ -16,7 +16,7 @@
 //! Many tick types are delivered by default and require no entry in
 //! `genericTickList`. Only the IDs below opt in to additional data.
 //!
-//! # Example
+//! # Examples
 //!
 //! ```no_run
 //! use ibapi::market_data::realtime::generic_tick;
@@ -209,6 +209,13 @@ pub const CREDITMAN_SLOW_MARK_PRICE: &str = "619";
 ///
 /// Delivers received tick `ETF_FROZEN_NAV_LAST` (97).
 pub const ETF_FROZEN_NAV_LAST: &str = "623";
+
+/// `760` — Implied bid/ask prices for combo (BAG) contracts.
+///
+/// Delivers received ticks `COMBO_IMPLIED_BID` (112) and `COMBO_IMPLIED_ASK` (113).
+///
+/// Requires TWS/Gateway server version 227 (`COMBO_IMPLIED_BID_ASK`) or later.
+pub const COMBO_IMPLIED_BID_ASK: &str = "760";
 
 /// `787` — Odd-lot bid/ask quotes.
 ///

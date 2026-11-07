@@ -24,7 +24,10 @@ use futures::StreamExt;
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use ibapi::{
     contracts::Contract,
-    market_data::{realtime::MarketDepths, SmartDepth},
+    market_data::{
+        realtime::{DepthOperation, DepthSide, MarketDepths},
+        SmartDepth,
+    },
     Client,
 };
 
@@ -70,39 +73,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match depth_update? {
             MarketDepths::MarketDepth(depth) => {
-                let side = if depth.side == 1 { "Bid" } else { "Ask" };
-                let operation = match depth.operation {
-                    0 => "Insert",
-                    1 => "Update",
-                    2 => "Delete",
-                    _ => "Unknown",
-                };
-
-                println!("Update #{}: {} {} at position {}", update_count, operation, side, depth.position);
+                println!(
+                    "Update #{}: {:?} {:?} at position {}",
+                    update_count, depth.operation, depth.side, depth.position
+                );
 
                 // Update our order book
-                if depth.side == 1 {
-                    // Bid
-                    match depth.operation {
-                        0 | 1 if depth.position < bid_book.len() as i32 => {
-                            bid_book[depth.position as usize] = Some((depth.price, depth.size));
-                        }
-                        2 if depth.position < bid_book.len() as i32 => {
-                            bid_book[depth.position as usize] = None;
-                        }
-                        _ => {}
+                let book = match depth.side {
+                    DepthSide::Bid => &mut bid_book,
+                    DepthSide::Ask => &mut ask_book,
+                    DepthSide::Unknown(_) => continue, // no book for a side this version does not model
+                };
+                match depth.operation {
+                    DepthOperation::Insert | DepthOperation::Update if depth.position < book.len() as i32 => {
+                        book[depth.position as usize] = Some((depth.price, depth.size));
                     }
-                } else {
-                    // Ask
-                    match depth.operation {
-                        0 | 1 if depth.position < ask_book.len() as i32 => {
-                            ask_book[depth.position as usize] = Some((depth.price, depth.size));
-                        }
-                        2 if depth.position < ask_book.len() as i32 => {
-                            ask_book[depth.position as usize] = None;
-                        }
-                        _ => {}
+                    DepthOperation::Delete if depth.position < book.len() as i32 => {
+                        book[depth.position as usize] = None;
                     }
+                    _ => {}
                 }
 
                 // Display current order book
@@ -132,12 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             MarketDepths::MarketDepthL2(depth) => {
                 println!(
-                    "L2 Update: {} {} at {} - ${:.2} x {:.0}",
-                    depth.market_maker,
-                    if depth.side == 1 { "Bid" } else { "Ask" },
-                    depth.position,
-                    depth.price,
-                    depth.size
+                    "L2 Update: {} {:?} at {} - ${:.2} x {:.0}",
+                    depth.market_maker, depth.side, depth.position, depth.price, depth.size
                 );
             }
             MarketDepths::Reset => {

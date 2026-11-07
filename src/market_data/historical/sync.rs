@@ -7,10 +7,10 @@ use log::error;
 use time::OffsetDateTime;
 
 use crate::client::blocking::ClientRequestBuilders;
-use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
+use crate::client::ids::RequestId;
+use crate::common::request_helpers::{self, empty_on_end_of_stream};
 use crate::common::retry::blocking::retry_on_connection_reset;
 use crate::contracts::Contract;
-use crate::messages::IncomingMessages;
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::common::{RoutedItem, SubscriptionItem};
 use crate::subscriptions::log_cancel_error;
@@ -19,8 +19,11 @@ use crate::transport::{InternalSubscription, MessageBus};
 use crate::{client::sync::Client, Error};
 
 use super::common::tick::{classify, TickAction};
-use super::common::{self, decoders, encoders};
-use super::{BarSize, Duration, HistogramEntry, HistoricalBarUpdate, HistoricalData, Schedule, TickDecoder, WhatToShow};
+use super::common::{self, encoders};
+use super::{
+    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalBarUpdate, HistoricalData, HistoricalDataFrame,
+    Schedule, ScheduleRequest, TickDecoder, WhatToShow,
+};
 use crate::market_data::TradingHours;
 
 impl Client {
@@ -45,11 +48,9 @@ impl Client {
     /// print!("head_timestamp: {result:?}");
     /// ```
     pub fn head_timestamp(&self, contract: &Contract, what_to_show: WhatToShow, trading_hours: TradingHours) -> Result<OffsetDateTime, Error> {
-        request_helpers::blocking::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_request_head_timestamp(request_id, contract, what_to_show, trading_hours.use_rth()),
-            expect_proto(decoders::decode_head_timestamp_proto),
-        )
+        request_helpers::blocking::one_shot_cancelling::<HeadTimestampRequest>(self, |request_id| {
+            encoders::encode_request_head_timestamp(request_id, contract, what_to_show, trading_hours.use_rth())
+        })
     }
 
     /// Build a request for historical bar data.
@@ -93,12 +94,15 @@ impl Client {
     /// # let _ = bars;
     /// ```
     pub fn historical_data<'a>(&'a self, contract: &'a Contract, bar_size: BarSize) -> super::HistoricalDataBuilder<'a, Self> {
-        super::HistoricalDataBuilder::new(self, contract, bar_size)
+        super::HistoricalDataBuilder::new(self, contract, bar_size, self.mint_request_id())
     }
 
     /// Build a request for [`Schedule`] data over the given duration.
     ///
-    /// Defaults to anchoring at the current time. Use [`HistoricalScheduleBuilder::ending`](super::HistoricalScheduleBuilder::ending)
+    /// Defaults to regular trading hours, anchored at the current time. Use
+    /// [`HistoricalScheduleBuilder::trading_hours`](super::HistoricalScheduleBuilder::trading_hours)
+    /// to include extended-hours sessions, and
+    /// [`HistoricalScheduleBuilder::ending`](super::HistoricalScheduleBuilder::ending)
     /// to anchor at a specific end date.
     ///
     /// # Arguments
@@ -112,20 +116,22 @@ impl Client {
     /// use ibapi::client::blocking::Client;
     /// use ibapi::contracts::Contract;
     /// use ibapi::market_data::historical::ToDuration;
+    /// use ibapi::market_data::TradingHours;
     ///
     /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
     /// let contract = Contract::stock("GM").build();
-    ///
-    /// // Ending now:
-    /// let schedule = client
-    ///     .historical_schedules(&contract, 30.days())
-    ///     .fetch()
-    ///     .expect("historical schedule request failed");
     ///
     /// // Anchored to a specific end date:
     /// let schedule = client
     ///     .historical_schedules(&contract, 30.days())
     ///     .ending(datetime!(2023-04-15 0:00 UTC))
+    ///     .fetch()
+    ///     .expect("historical schedule request failed");
+    ///
+    /// // Extended-hours sessions, ending now:
+    /// let schedule = client
+    ///     .historical_schedules(&contract, 30.days())
+    ///     .trading_hours(TradingHours::Extended)
     ///     .fetch()
     ///     .expect("historical schedule request failed");
     ///
@@ -241,122 +247,101 @@ impl Client {
     /// }
     /// ```
     pub fn histogram_data(&self, contract: &Contract, trading_hours: TradingHours, period: BarSize) -> Result<Vec<HistogramEntry>, Error> {
-        request_helpers::blocking::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_request_histogram_data(request_id, contract, trading_hours.use_rth(), period),
-            expect_proto(decoders::decode_histogram_data_proto),
-        )
+        request_helpers::blocking::one_shot_cancelling::<HistogramRequest>(self, |request_id| {
+            encoders::encode_request_histogram_data(request_id, contract, trading_hours.use_rth(), period)
+        })
         .or_else(empty_on_end_of_stream)
     }
 }
 
-pub(crate) fn historical_data(
-    client: &Client,
-    contract: &Contract,
-    end_date: Option<OffsetDateTime>,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
-) -> Result<HistoricalData, Error> {
-    retry_on_connection_reset(client, || {
-        historical_data_once(client, contract, end_date, duration, bar_size, what_to_show, trading_hours)
+pub(crate) fn historical_data(client: &Client, request: BarRequest, request_id: RequestId) -> Result<HistoricalData, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    // One deadline for both reads and every resend.
+    let deadline = request_helpers::blocking::one_shot_deadline(client);
+    let mut first_id = Some(request_id);
+
+    retry_on_connection_reset(client, deadline, || {
+        request_helpers::blocking::check_deadline(deadline)?;
+        // The first attempt uses the builder's id; a resend takes a new one.
+        let builder = match first_id.take() {
+            Some(id) => client.request_with_id(id),
+            None => client.request(),
+        };
+        let message = request.encode(builder.request_id(), false)?;
+
+        // The window frame is a second read, which is why this is not a
+        // one-shot and cannot use the helpers in `common::request_helpers`.
+        // Dropping the subscription before it, on any error below, sends
+        // TWS's cancel; after it, nothing is sent.
+        let subscription = builder.send::<HistoricalDataFrame>(message)?;
+
+        let bars = request_helpers::blocking::next_frame(&subscription, deadline)?.into_bars()?;
+        // Only the window frame proves the download is complete, so a close
+        // before it is an error.
+        let (start, end) = request_helpers::blocking::next_frame(&subscription, deadline)?.into_window()?;
+
+        Ok(HistoricalData { start, end, bars })
     })
 }
 
-// Builder-fed internal encoder seam, matching historical_data_once's flat arguments.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn historical_snapshot_subscription_once(
-    client: &Client,
-    contract: &Contract,
-    end_date: Option<OffsetDateTime>,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
-) -> Result<Subscription<HistoricalSnapshotUpdate>, Error> {
-    common::validate_historical_data(end_date, what_to_show)?;
-
-    let builder = client.request();
-    let request = encoders::encode_request_historical_data(
-        builder.request_id(),
-        contract,
-        end_date,
-        duration,
-        bar_size,
-        what_to_show,
-        trading_hours.use_rth(),
-        false,
-    )?;
-
-    builder.send::<HistoricalSnapshotUpdate>(request)
-}
-
-// Builder-fed wire seam: the public API already names optional inputs.
-pub(crate) fn historical_data_once(
-    client: &Client,
-    contract: &Contract,
-    end_date: Option<OffsetDateTime>,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
-) -> Result<HistoricalData, Error> {
-    common::validate_historical_data(end_date, what_to_show)?;
-
-    let builder = client.request();
-    let request = encoders::encode_request_historical_data(
-        builder.request_id(),
-        contract,
-        end_date,
-        duration,
-        bar_size,
-        what_to_show,
-        trading_hours.use_rth(),
-        false,
-    )?;
-
-    let subscription = builder.send_raw(request)?;
-
-    let message = subscription.next().ok_or(Error::UnexpectedEndOfStream)??;
-    let mut data = decoders::decode_historical_data(message.expect_type(IncomingMessages::HistoricalData)?)?;
-
-    // Only the broker end frame proves completion. Both fetch entry points share
-    // this read, while their connection-reset retry policies remain distinct.
-    let end_message = subscription.next().ok_or(Error::UnexpectedEndOfStream)??;
-    (data.start, data.end) = decoders::decode_historical_data_end(end_message.expect_type(IncomingMessages::HistoricalDataEnd)?)?;
-
-    Ok(data)
-}
-
+/// `request.end_date` is `None`: IBKR requires it with `keep_up_to_date`.
 pub(crate) fn historical_data_stream(
     client: &Client,
-    contract: &Contract,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
+    request: BarRequest,
+    request_id: RequestId,
     buffer_limit: Option<usize>,
 ) -> Result<Subscription<HistoricalBarUpdate>, Error> {
-    let builder = client.request();
-    let request = encoders::encode_request_historical_data(
-        builder.request_id(),
-        contract,
-        None, // IBKR requires end_date=None when keep_up_to_date=true
-        duration,
-        bar_size,
-        what_to_show,
-        trading_hours.use_rth(),
-        true, // keep_up_to_date — the whole point of .stream()
-    )?;
+    let message = request.encode(request_id.raw(), true)?;
+    client.request_with_id(request_id).send_capped(message, buffer_limit)
+}
 
-    builder.send_capped::<HistoricalBarUpdate>(request, buffer_limit)
+/// Sent once, never resent: the caller owns the request. Reached through
+/// [`HistoricalDataBuilder::subscribe`](super::HistoricalDataBuilder::subscribe).
+pub(crate) fn historical_data_subscription(
+    client: &Client,
+    request: BarRequest,
+    request_id: RequestId,
+    buffer_limit: Option<usize>,
+) -> Result<Subscription<HistoricalDataFrame>, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    let message = request.encode(request_id.raw(), false)?;
+    client.request_with_id(request_id).send_capped(message, buffer_limit)
+}
+
+/// Fork: sent once with the builder's id; envelopes keep optional wire values.
+/// Reached through [`HistoricalDataBuilder::snapshot_once`](super::HistoricalDataBuilder::snapshot_once).
+pub(crate) fn historical_snapshot_subscription_once(
+    client: &Client,
+    request: BarRequest,
+    request_id: RequestId,
+) -> Result<Subscription<HistoricalSnapshotUpdate>, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    let message = request.encode(request_id.raw(), false)?;
+    client.request_with_id(request_id).send::<HistoricalSnapshotUpdate>(message)
+}
+
+/// Fork: one attempt of [`historical_data`], never resent after a connection
+/// reset, so applications that own reconnect policy see the reset. Shares its
+/// deadline and completion checks.
+pub(crate) fn historical_data_once(client: &Client, request: BarRequest, request_id: RequestId) -> Result<HistoricalData, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    let deadline = request_helpers::blocking::one_shot_deadline(client);
+    let builder = client.request_with_id(request_id);
+    let message = request.encode(builder.request_id(), false)?;
+
+    // Dropping the subscription before the window frame sends TWS's cancel.
+    let subscription = builder.send::<HistoricalDataFrame>(message)?;
+    let bars = request_helpers::blocking::next_frame(&subscription, deadline)?.into_bars()?;
+    // Only the window frame proves completion; a close before it is an error.
+    let (start, end) = request_helpers::blocking::next_frame(&subscription, deadline)?.into_window()?;
+
+    Ok(HistoricalData { start, end, bars })
 }
 
 // pub(crate) internal plumbing called from `HistoricalTicksBuilder`; the
 // public API is already a builder, so flat args here are the deliberate
-// seam between the typed builder and the wire encoder (the builder-fed exception in
-// docs/rules/style/param-budget.md).
+// seam between the typed builder and the wire encoder. Internal, so the param
+// budget doesn't apply; the allow is for clippy's 8-arg lint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn historical_ticks<T: TickDecoder<T>>(
     client: &Client,
@@ -390,14 +375,20 @@ pub(crate) fn historical_schedule(
     contract: &Contract,
     end_date: Option<OffsetDateTime>,
     duration: Duration,
+    trading_hours: TradingHours,
 ) -> Result<Schedule, Error> {
-    request_helpers::blocking::one_shot_by_request_id(
-        client,
-        |request_id| {
-            encoders::encode_request_historical_data(request_id, contract, end_date, duration, BarSize::Day, WhatToShow::Schedule, true, false)
-        },
-        expect_proto(decoders::decode_historical_schedule_proto),
-    )
+    request_helpers::blocking::one_shot_cancelling::<ScheduleRequest>(client, |request_id| {
+        encoders::encode_request_historical_data(
+            request_id,
+            contract,
+            end_date,
+            duration,
+            BarSize::Day,
+            WhatToShow::Schedule,
+            trading_hours.use_rth(),
+            false,
+        )
+    })
 }
 
 // TickSubscription and related types
@@ -447,6 +438,17 @@ impl<T: TickDecoder<T>> TickSubscription<T> {
     /// from code that does not hold the subscription, or to match it in logs.
     pub fn request_id(&self) -> i32 {
         self.request_id
+    }
+
+    /// Whether the stream has terminated and every later `next`, `try_next` or
+    /// `next_timeout` returns `None`: the last batch was read and its ticks
+    /// drained, or a terminal error or `Err(Error::Cancelled)` after
+    /// [`cancel`](Self::cancel) was returned. Distinguishes between the `None`
+    /// that [`try_next`](Self::try_next) and
+    /// [`next_timeout`](Self::next_timeout) return at the end and the one they
+    /// return while nothing has arrived yet.
+    pub fn is_terminated(&self) -> bool {
+        (self.done.load(Ordering::Relaxed) || self.stream_ended.load(Ordering::Relaxed)) && self.buffer.lock().unwrap().is_empty()
     }
 
     /// Cancel the historical-ticks request. After completion nothing is written.
@@ -613,8 +615,9 @@ impl<T: TickDecoder<T>> TickSubscription<T> {
 
     /// Attempt to fetch the next item without blocking.
     ///
-    /// Same `SubscriptionItem<T>` shape as [`next`](Self::next); returns `None`
-    /// if nothing is queued right now.
+    /// Same `SubscriptionItem<T>` shape as [`next`](Self::next). `None` means
+    /// either that nothing is queued right now or that the stream ended;
+    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
     ///
     /// # Examples
     ///
@@ -636,8 +639,9 @@ impl<T: TickDecoder<T>> TickSubscription<T> {
     /// Wait up to `duration` for the next item to arrive.
     ///
     /// Same `SubscriptionItem<T>` shape as [`next`](Self::next). `None` means
-    /// either that `duration` passed or that the stream ended; terminal errors
-    /// come as `Some(Err(_))`.
+    /// either that `duration` passed or that the stream ended;
+    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
+    /// Terminal errors come as `Some(Err(_))`.
     ///
     /// # Examples
     ///

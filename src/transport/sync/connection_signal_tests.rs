@@ -10,7 +10,7 @@ fn wait_connected_returns_immediately_while_connected() {
     assert!(signal.is_connected());
 
     let start = Instant::now();
-    assert!(signal.wait_connected().is_ok());
+    assert!(signal.wait_connected(None).is_ok());
     assert!(start.elapsed() < Duration::from_secs(5), "connected wait must not block");
 }
 
@@ -27,7 +27,7 @@ fn wait_connected_returns_when_the_session_comes_back() {
     });
 
     let start = Instant::now();
-    assert!(signal.wait_connected().is_ok());
+    assert!(signal.wait_connected(None).is_ok());
     assert!(signal.is_connected());
     assert!(start.elapsed() < Duration::from_secs(5), "wait_connected did not return on reconnect");
 }
@@ -44,7 +44,7 @@ fn wait_connected_returns_shutdown_when_requested_during_the_wait() {
     });
 
     let start = Instant::now();
-    assert!(matches!(signal.wait_connected(), Err(Error::Shutdown)));
+    assert!(matches!(signal.wait_connected(None), Err(Error::Shutdown)));
     assert!(start.elapsed() < Duration::from_secs(5), "wait_connected did not return on shutdown");
 }
 
@@ -56,5 +56,79 @@ fn shutdown_is_terminal() {
     signal.set_connected();
 
     assert!(!signal.is_connected(), "a late reconnect must not revive a shut-down session");
-    assert!(matches!(signal.wait_connected(), Err(Error::Shutdown)));
+    assert!(matches!(signal.wait_connected(None), Err(Error::Shutdown)));
+}
+
+/// The signal tracks the session through a failed reconnect; which error
+/// each state maps to is `SessionState`'s, tested in `common_tests`.
+#[test]
+fn check_follows_the_session_through_a_failed_reconnect() {
+    let signal = ConnectionSignal::default();
+    assert!(signal.check().is_ok());
+    assert!(signal.check_ended().is_ok());
+
+    signal.set_disconnected();
+    assert!(matches!(signal.check(), Err(Error::ConnectionReset)));
+    assert!(signal.check_ended().is_ok(), "reconnecting is not ended");
+
+    signal.fail();
+    assert!(matches!(signal.check(), Err(Error::ConnectionFailed)));
+    assert!(matches!(signal.check_ended(), Err(Error::ConnectionFailed)));
+}
+
+#[test]
+fn wait_connected_returns_connection_failed_when_the_reconnect_gives_up() {
+    let signal = Arc::new(ConnectionSignal::default());
+    signal.set_disconnected();
+
+    let waker = Arc::clone(&signal);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        waker.fail();
+    });
+
+    let start = Instant::now();
+    assert!(matches!(signal.wait_connected(None), Err(Error::ConnectionFailed)));
+    assert!(start.elapsed() < Duration::from_secs(5), "wait_connected did not return on failure");
+}
+
+/// The dispatcher latches `Failed` and then shuts the bus down; the shutdown
+/// must not replace why the session ended.
+#[test]
+fn failed_survives_the_following_shutdown_and_a_late_reconnect() {
+    let signal = ConnectionSignal::default();
+    signal.set_disconnected();
+    signal.fail();
+
+    signal.shutdown();
+    signal.set_connected();
+
+    assert!(!signal.is_connected());
+    assert!(matches!(signal.wait_connected(None), Err(Error::ConnectionFailed)));
+}
+
+#[test]
+fn wait_connected_times_out_at_the_deadline() {
+    let signal = ConnectionSignal::default();
+    signal.set_disconnected();
+
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(20);
+    assert!(matches!(signal.wait_connected(Some(deadline)), Err(Error::Timeout)));
+    assert!(Instant::now() >= deadline, "returned before the deadline");
+    assert!(start.elapsed() < Duration::from_secs(5), "wait_connected outlasted its deadline");
+}
+
+#[test]
+fn wait_connected_returns_when_the_session_comes_back_before_the_deadline() {
+    let signal = Arc::new(ConnectionSignal::default());
+    signal.set_disconnected();
+
+    let waker = Arc::clone(&signal);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        waker.set_connected();
+    });
+
+    assert!(signal.wait_connected(Some(Instant::now() + Duration::from_secs(5))).is_ok());
 }

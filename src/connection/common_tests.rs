@@ -4,9 +4,13 @@ use crate::common::test_utils::helpers::assert_rejects_text_framing;
 use crate::common::test_utils::helpers::{binary_text, proto_error_response, proto_response, CapturingSink};
 use crate::messages::IncomingMessages;
 use crate::messages::{HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, MESSAGE_ID_LEN, UNKNOWN_MESSAGE_TYPE_CODE};
+use crate::testdata::builders::orders::next_valid_id;
+use crate::testdata::builders::ResponseProtoEncoder;
 use std::sync::{Arc, Mutex};
 use time::macros::datetime;
 use time_tz::TimeZone;
+
+const CLIENT_ID: i32 = 100;
 
 /// Test sink that drops every notice. Used when the test cares about the
 /// startup callback, not the notice fan-out.
@@ -19,6 +23,7 @@ impl NoticeSink for DiscardingSink {
 fn empty_ctx<'a>() -> StartupHandshakeContext<'a> {
     static SINK: DiscardingSink = DiscardingSink;
     StartupHandshakeContext {
+        client_id: CLIENT_ID,
         startup: None,
         notice_sink: &SINK,
     }
@@ -27,6 +32,7 @@ fn empty_ctx<'a>() -> StartupHandshakeContext<'a> {
 fn startup_ctx<'a>(cb: &'a (dyn Fn(StartupMessage) + Send + Sync)) -> StartupHandshakeContext<'a> {
     static SINK: DiscardingSink = DiscardingSink;
     StartupHandshakeContext {
+        client_id: CLIENT_ID,
         startup: Some(cb),
         notice_sink: &SINK,
     }
@@ -34,6 +40,7 @@ fn startup_ctx<'a>(cb: &'a (dyn Fn(StartupMessage) + Send + Sync)) -> StartupHan
 
 fn notice_sink_ctx(sink: &CapturingSink) -> StartupHandshakeContext<'_> {
     StartupHandshakeContext {
+        client_id: CLIENT_ID,
         startup: None,
         notice_sink: sink,
     }
@@ -44,22 +51,23 @@ fn notice_sink_ctx(sink: &CapturingSink) -> StartupHandshakeContext<'_> {
 /// receive the synthesized notice).
 fn full_ctx<'a>(cb: &'a (dyn Fn(StartupMessage) + Send + Sync), sink: &'a CapturingSink) -> StartupHandshakeContext<'a> {
     StartupHandshakeContext {
+        client_id: CLIENT_ID,
         startup: Some(cb),
         notice_sink: sink,
     }
 }
 
 #[test]
-fn test_dispatch_unsolicited_open_order_decode_failure_emits_notice() {
+fn dispatch_unsolicited_open_order_decode_failure_emits_notice() {
     // Sparse text-framed OpenOrder — decoder calls proto() and rejects.
-    let mut message = ResponseMessage::from("5\0123\0AAPL\0STK\0");
+    let message = ResponseMessage::from("5\0123\0AAPL\0STK\0");
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire on decode failure");
     let notice = sink.last().expect("notice sink should receive decode-failure notice");
@@ -72,15 +80,15 @@ fn test_dispatch_unsolicited_open_order_decode_failure_emits_notice() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_order_status_decode_failure_emits_notice() {
-    let mut message = ResponseMessage::from("3\0456\0Filled\0100\0");
+fn dispatch_unsolicited_order_status_decode_failure_emits_notice() {
+    let message = ResponseMessage::from("3\0456\0Filled\0100\0");
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire on decode failure");
     let notice = sink.last().expect("notice sink should receive decode-failure notice");
@@ -89,12 +97,12 @@ fn test_dispatch_unsolicited_order_status_decode_failure_emits_notice() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_account_value_typed() {
+fn dispatch_unsolicited_account_value_typed() {
     use crate::messages::IncomingMessages;
     use crate::testdata::builders::accounts::account_value;
     use crate::testdata::builders::ResponseProtoEncoder;
 
-    let mut message = proto_response(
+    let message = proto_response(
         IncomingMessages::AccountValue,
         account_value()
             .key("NetLiquidation")
@@ -114,7 +122,7 @@ fn test_dispatch_unsolicited_account_value_typed() {
         }
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     let got = captured_clone.lock().unwrap().take().expect("callback didn't fire");
     assert_eq!(got.key, "NetLiquidation");
     assert_eq!(got.value, "123456.78");
@@ -123,9 +131,9 @@ fn test_dispatch_unsolicited_account_value_typed() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_open_order_end_typed() {
+fn dispatch_unsolicited_open_order_end_typed() {
     // OpenOrderEnd: msg_type=53, version=1
-    let mut message = ResponseMessage::from("53\01\0");
+    let message = ResponseMessage::from("53\01\0");
 
     let captured: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let captured_clone = captured.clone();
@@ -137,14 +145,14 @@ fn test_dispatch_unsolicited_open_order_end_typed() {
         }
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     assert!(*captured_clone.lock().unwrap(), "OpenOrderEnd not delivered as typed variant");
 }
 
 #[test]
-fn test_dispatch_unsolicited_account_download_end_typed() {
+fn dispatch_unsolicited_account_download_end_typed() {
     // AccountDownloadEnd: msg_type=54, version=1, account
-    let mut message = ResponseMessage::from("54\01\0DU1234567\0");
+    let message = ResponseMessage::from("54\01\0DU1234567\0");
 
     let captured: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let captured_clone = captured.clone();
@@ -154,22 +162,22 @@ fn test_dispatch_unsolicited_account_download_end_typed() {
         }
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     assert!(*captured_clone.lock().unwrap(), "End variant not delivered");
 }
 
 #[test]
-fn test_dispatch_unsolicited_unknown_emits_notice() {
+fn dispatch_unsolicited_unknown_emits_notice() {
     // NewsBulletins (msg_type=14) — no typed variant in StartupMessage.
     // Catch-all fires the notice sink with HANDSHAKE_UNKNOWN_FRAME_CODE.
-    let mut message = ResponseMessage::from("14\0\0");
+    let message = ResponseMessage::from("14\0\0");
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire for unknown handshake frame");
     let notice = sink.last().expect("notice sink should receive unknown-frame notice");
@@ -183,33 +191,61 @@ fn test_dispatch_unsolicited_unknown_emits_notice() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_notice_warning_invokes_notice_sink() {
+fn dispatch_unsolicited_notice_warning_invokes_notice_sink() {
     // Error frame with code 2104 (farm-status warning), proto-framed.
-    let mut message = proto_error_response(-1, 2104, "Market data farm OK");
+    let message = proto_error_response(-1, 2104, "Market data farm OK");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
 
     let got = sink.last().expect("notice sink didn't receive notice");
     assert_eq!(got.code, 2104);
     assert_eq!(got.message, "Market data farm OK");
 }
 
+/// 326 ends the handshake with `ClientIdInUse`; any other handshake error
+/// is only a notice. Both reach the notice sink.
 #[test]
-fn test_dispatch_unsolicited_notice_hard_error_invokes_notice_sink() {
+fn parse_account_info_error_frames() {
+    // (name, code, client id in use)
+    let cases = [("client id in use", 326, true), ("farm warning", 2104, false), ("hard error", 504, false)];
+
+    for (name, code, in_use) in cases {
+        let message = proto_error_response(-1, code, "msg");
+        let sink = CapturingSink::default();
+
+        let result = ConnectionHandler::default().parse_account_info(&message, &notice_sink_ctx(&sink));
+
+        match result {
+            Err(Error::ClientIdInUse { client_id }) => {
+                assert!(in_use, "{name}: unexpected ClientIdInUse");
+                assert_eq!(client_id, CLIENT_ID, "{name}");
+            }
+            Ok(info) => {
+                assert!(!in_use, "{name}: expected ClientIdInUse");
+                assert_eq!(info.next_order_id, None, "{name}");
+            }
+            Err(e) => panic!("{name}: unexpected error {e:?}"),
+        }
+        assert_eq!(sink.last().map(|n| n.code), Some(code), "{name}: notice still delivered");
+    }
+}
+
+#[test]
+fn dispatch_unsolicited_notice_hard_error_invokes_notice_sink() {
     // Error frame with code 504 — non-warning, non-system message.
-    let mut message = proto_error_response(-1, 504, "Not connected");
+    let message = proto_error_response(-1, 504, "Not connected");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
 
     assert_eq!(sink.last().expect("sink missed").code, 504);
 }
 
 #[test]
-fn test_dispatch_unsolicited_notice_only_fires_notice_sink() {
+fn dispatch_unsolicited_notice_only_fires_notice_sink() {
     // Error frame should fire the notice sink, NOT the startup callback.
-    let mut message = proto_error_response(-1, 2104, "farm OK");
+    let message = proto_error_response(-1, 2104, "farm OK");
 
     let startup_fired = Arc::new(Mutex::new(false));
     let startup_fired_clone = startup_fired.clone();
@@ -219,8 +255,9 @@ fn test_dispatch_unsolicited_notice_only_fires_notice_sink() {
     let sink = CapturingSink::default();
 
     dispatch_unsolicited_message(
-        &mut message,
+        &message,
         &StartupHandshakeContext {
+            client_id: CLIENT_ID,
             startup: Some(&startup_cb),
             notice_sink: &sink,
         },
@@ -230,13 +267,11 @@ fn test_dispatch_unsolicited_notice_only_fires_notice_sink() {
 }
 
 #[test]
-fn test_parse_account_info_callback_not_invoked_for_next_valid_id() {
-    use prost::Message;
-
+fn parse_account_info_callback_not_invoked_for_next_valid_id() {
     // NextValidId is consumed internally — neither callback fires.
     let handler = ConnectionHandler::default();
-    let bytes = crate::proto::NextValidId { order_id: Some(1000) }.encode_to_vec();
-    let mut message = proto_response(IncomingMessages::NextValidId, bytes);
+    let bytes = next_valid_id().order_id(1000).encode_proto();
+    let message = proto_response(IncomingMessages::NextValidId, bytes);
 
     let fired = Arc::new(Mutex::new(false));
     let fired_clone = fired.clone();
@@ -244,13 +279,13 @@ fn test_parse_account_info_callback_not_invoked_for_next_valid_id() {
         *fired_clone.lock().unwrap() = true;
     };
 
-    let result = handler.parse_account_info(&mut message, &startup_ctx(&cb));
+    let result = handler.parse_account_info(&message, &startup_ctx(&cb));
     assert!(result.is_ok());
     assert!(!*fired.lock().unwrap(), "callback should NOT be invoked for NextValidId");
 }
 
 #[test]
-fn test_parse_account_info_callback_not_invoked_for_managed_accounts() {
+fn parse_account_info_callback_not_invoked_for_managed_accounts() {
     use prost::Message;
 
     let handler = ConnectionHandler::default();
@@ -258,7 +293,7 @@ fn test_parse_account_info_callback_not_invoked_for_managed_accounts() {
         accounts_list: Some("DU123".to_string()),
     }
     .encode_to_vec();
-    let mut message = proto_response(IncomingMessages::ManagedAccounts, bytes);
+    let message = proto_response(IncomingMessages::ManagedAccounts, bytes);
 
     let fired = Arc::new(Mutex::new(false));
     let fired_clone = fired.clone();
@@ -266,15 +301,13 @@ fn test_parse_account_info_callback_not_invoked_for_managed_accounts() {
         *fired_clone.lock().unwrap() = true;
     };
 
-    let result = handler.parse_account_info(&mut message, &startup_ctx(&cb));
+    let result = handler.parse_account_info(&message, &startup_ctx(&cb));
     assert!(result.is_ok());
     assert!(!*fired.lock().unwrap(), "callback should NOT be invoked for ManagedAccounts");
 }
 
 #[test]
-fn test_parse_account_info_multiple_messages_callback() {
-    use prost::Message;
-
+fn parse_account_info_multiple_messages_callback() {
     let handler = ConnectionHandler::default();
     let count = Arc::new(Mutex::new(0));
     let count_clone = count.clone();
@@ -284,52 +317,52 @@ fn test_parse_account_info_multiple_messages_callback() {
     let cbs = startup_ctx(&cb);
 
     // First message: OpenOrderEnd (unit marker — no decoder, callback fires).
-    let mut msg1 = ResponseMessage::from("53\01\0");
-    handler.parse_account_info(&mut msg1, &cbs).unwrap();
+    let msg1 = ResponseMessage::from("53\01\0");
+    handler.parse_account_info(&msg1, &cbs).unwrap();
 
     // Second message: CompletedOrdersEnd (unit marker — callback fires).
-    let mut msg2 = ResponseMessage::from("102\0");
-    handler.parse_account_info(&mut msg2, &cbs).unwrap();
+    let msg2 = ResponseMessage::from("102\0");
+    handler.parse_account_info(&msg2, &cbs).unwrap();
 
     // Third message: NextValidId (consumed internally — should NOT trigger callback)
-    let bytes = crate::proto::NextValidId { order_id: Some(1000) }.encode_to_vec();
-    let mut msg3 = proto_response(IncomingMessages::NextValidId, bytes);
-    handler.parse_account_info(&mut msg3, &cbs).unwrap();
+    let bytes = next_valid_id().order_id(1000).encode_proto();
+    let msg3 = proto_response(IncomingMessages::NextValidId, bytes);
+    handler.parse_account_info(&msg3, &cbs).unwrap();
 
     assert_eq!(*count.lock().unwrap(), 2, "callback should be invoked exactly twice");
 }
 
 #[test]
-fn test_parse_account_info_next_valid_id_rejects_text_framing() {
+fn parse_account_info_next_valid_id_rejects_text_framing() {
     // The handshake is the one reader still advancing a cursor, so it takes
     // `&mut` where every decoder takes `&` — hence the clone rather than a
     // direct hand-off to the shared assertion.
     let handler = ConnectionHandler::default();
     assert_rejects_text_framing(IncomingMessages::NextValidId, "9\01\01000\0", |message| {
-        handler.parse_account_info(&mut message.clone(), &empty_ctx())
+        handler.parse_account_info(&message.clone(), &empty_ctx())
     });
 }
 
 #[test]
-fn test_parse_account_info_managed_accounts_rejects_text_framing() {
+fn parse_account_info_managed_accounts_rejects_text_framing() {
     let handler = ConnectionHandler::default();
     assert_rejects_text_framing(IncomingMessages::ManagedAccounts, "15\01\0DU123,DU456\0", |message| {
-        handler.parse_account_info(&mut message.clone(), &empty_ctx())
+        handler.parse_account_info(&message.clone(), &empty_ctx())
     });
 }
 
 #[test]
-fn test_require_protobuf_support_accepts_minimum() {
+fn require_protobuf_support_accepts_minimum() {
     require_protobuf_support(server_versions::PROTOBUF_REST_MESSAGES_3).expect("floor version must be accepted");
 }
 
 #[test]
-fn test_require_protobuf_support_accepts_newer() {
+fn require_protobuf_support_accepts_newer() {
     require_protobuf_support(server_versions::PROTOBUF_REST_MESSAGES_3 + 5).expect("newer versions must be accepted");
 }
 
 #[test]
-fn test_require_protobuf_support_rejects_older() {
+fn require_protobuf_support_rejects_older() {
     let actual = server_versions::PROTOBUF_REST_MESSAGES_3 - 1;
     let err = require_protobuf_support(actual).expect_err("older versions must be rejected");
 
@@ -350,7 +383,7 @@ fn test_require_protobuf_support_rejects_older() {
 }
 
 #[test]
-fn test_require_protobuf_support_rejects_previous_scan_data_floor() {
+fn require_protobuf_support_rejects_previous_scan_data_floor() {
     // Servers in [210, 212] don't yet emit the REST_MESSAGES_1/2 families
     // (ExerciseOptions, calc, FA, SecDefOpt, FamilyCodes, MarketRule, …) in
     // protobuf and we no longer carry text-decode fallback, so the floor
@@ -367,7 +400,7 @@ fn test_require_protobuf_support_rejects_previous_scan_data_floor() {
 }
 
 #[test]
-fn test_parse_connection_time() {
+fn parse_connection_time_works() {
     // TWS sends the abbreviation in force on the date: PST in winter, PDT in summer.
     let (connection_time, timezone) = parse_connection_time("20230105 22:20:39 PST");
     assert_eq!(connection_time, Some(datetime!(2023-01-05 22:20:39 -08:00)));
@@ -379,7 +412,7 @@ fn test_parse_connection_time() {
 }
 
 #[test]
-fn test_parse_connection_time_china_standard_time() {
+fn parse_connection_time_china_standard_time() {
     let example = "20230405 22:20:39 China Standard Time";
     let (connection_time, timezone) = parse_connection_time(example);
 
@@ -389,7 +422,7 @@ fn test_parse_connection_time_china_standard_time() {
 }
 
 #[test]
-fn test_parse_connection_time_brasilia_standard_time() {
+fn parse_connection_time_brasilia_standard_time() {
     // As sent by a pt-BR 10.51 gateway (#964). Brazil has no DST since 2019.
     let (connection_time, timezone) = parse_connection_time("20261009 10:00:00 Brasilia Standard Time");
     assert_eq!(connection_time, Some(datetime!(2026-10-09 10:00:00 -03:00)));
@@ -397,7 +430,7 @@ fn test_parse_connection_time_brasilia_standard_time() {
 }
 
 #[test]
-fn test_parse_connection_time_chinese_utf8() {
+fn parse_connection_time_chinese_utf8() {
     let example = "20230405 22:20:39 中国标准时间";
     let (connection_time, timezone) = parse_connection_time(example);
 
@@ -407,7 +440,7 @@ fn test_parse_connection_time_chinese_utf8() {
 }
 
 #[test]
-fn test_parse_connection_time_mojibake() {
+fn parse_connection_time_mojibake() {
     // Simulate GB2312 timezone decoded as UTF-8 lossy
     let example = "20230405 22:20:39 \u{FFFD}\u{FFFD}\u{FFFD}";
     let (connection_time, timezone) = parse_connection_time(example);
@@ -418,7 +451,7 @@ fn test_parse_connection_time_mojibake() {
 }
 
 #[test]
-fn test_parse_connection_time_unknown_timezone_is_soft() {
+fn parse_connection_time_unknown_timezone_is_soft() {
     // Only `Client::time_zone` and `connection_time` depend on the zone, so an
     // unmatched name leaves them unset instead of failing the handshake. A
     // partial name is not guessed at either (#809).
@@ -430,7 +463,7 @@ fn test_parse_connection_time_unknown_timezone_is_soft() {
 }
 
 #[test]
-fn test_parse_connection_time_in_dst_fold_resolves() {
+fn parse_connection_time_in_dst_fold_resolves() {
     // Connecting during a fall-back hour: the reading is ambiguous. It used to
     // log "Error setting timezone" and yield None; it now takes the earlier
     // occurrence like every other wall-clock reading from TWS.
@@ -440,7 +473,7 @@ fn test_parse_connection_time_in_dst_fold_resolves() {
 }
 
 #[test]
-fn test_parse_connection_time_short_input_still_ok() {
+fn parse_connection_time_short_input_still_ok() {
     // Truncated wire data — preserve current tolerance, no error.
     let (time, tz) = parse_connection_time("20230405");
     assert!(time.is_none());
@@ -448,7 +481,7 @@ fn test_parse_connection_time_short_input_still_ok() {
 }
 
 #[test]
-fn test_parse_connection_time_unparseable_date_still_ok() {
+fn parse_connection_time_unparseable_date_still_ok() {
     // Timezone resolves; only the wall-clock fails. Preserve tolerance.
     let (time, tz) = parse_connection_time("BADDATE 99:99:99 PST");
     assert!(time.is_none());
@@ -456,7 +489,7 @@ fn test_parse_connection_time_unparseable_date_still_ok() {
 }
 
 #[test]
-fn test_connection_handler_handshake() {
+fn connection_handler_handshake() {
     let handler = ConnectionHandler::default();
     let handshake = handler.format_handshake();
 
@@ -469,7 +502,7 @@ fn test_connection_handler_handshake() {
 }
 
 #[test]
-fn test_connection_handler_start_api() {
+fn connection_handler_start_api() {
     use crate::messages::PROTOBUF_MSG_ID;
 
     let handler = ConnectionHandler::default();
@@ -485,7 +518,7 @@ fn test_connection_handler_start_api() {
 }
 
 #[test]
-fn test_connection_handler_start_api_protobuf() {
+fn connection_handler_start_api_protobuf() {
     let handler = ConnectionHandler::default();
     let data = handler.format_start_api(123);
 
@@ -500,7 +533,7 @@ fn test_connection_handler_start_api_protobuf() {
 }
 
 #[test]
-fn test_parse_raw_message_protobuf() {
+fn parse_raw_message_protobuf() {
     use crate::messages::PROTOBUF_MSG_ID;
 
     // Simulate a protobuf message: msg_id = 5 + 200 = 205, then some payload
@@ -516,7 +549,7 @@ fn test_parse_raw_message_protobuf() {
 }
 
 #[test]
-fn test_parse_raw_message_binary_id_text_payload() {
+fn parse_raw_message_binary_id_text_payload() {
     // Simulate a text message at server >= 201: binary msg_id=9, then NUL-delimited text
     let data = binary_text(IncomingMessages::NextValidId as i32, "1\01000\0");
 
@@ -532,7 +565,7 @@ fn test_parse_raw_message_binary_id_text_payload() {
 /// bounds: the len is 0 but the index is 0") — in sync it killed the
 /// dispatcher thread, in async the dispatcher task.
 #[test]
-fn test_parse_raw_message_rejects_body_shorter_than_message_id() {
+fn parse_raw_message_rejects_body_shorter_than_message_id() {
     for length in 0..MESSAGE_ID_LEN {
         let data = vec![0_u8; length];
         let err = parse_raw_message(&data).expect_err("a body too short for a message id must be rejected");
@@ -540,7 +573,7 @@ fn test_parse_raw_message_rejects_body_shorter_than_message_id() {
     }
 
     // A bare message id with no payload is the smallest legal frame.
-    let message = parse_raw_message(&9_i32.to_be_bytes()).expect("bare message id is a legal frame");
+    let message = parse_raw_message(&(IncomingMessages::NextValidId as i32).to_be_bytes()).expect("bare message id is a legal frame");
     assert_eq!(message.message_type(), IncomingMessages::NextValidId);
 }
 
@@ -549,7 +582,7 @@ fn test_parse_raw_message_rejects_body_shorter_than_message_id() {
 /// this the id an unroutable-frame diagnostic needs is gone by the time routing
 /// sees the message — and the protobuf path has no `fields[0]` to fall back on.
 #[test]
-fn test_parse_raw_message_retains_an_unrecognized_message_id() {
+fn parse_raw_message_retains_an_unrecognized_message_id() {
     // Protobuf framing: wire id carries the PROTOBUF_MSG_ID offset, and
     // message_id() reports the value actually looked up.
     let message = parse_raw_message(&helpers::unknown_message_frame()).expect("well-formed frame");
@@ -565,16 +598,16 @@ fn test_parse_raw_message_retains_an_unrecognized_message_id() {
     assert_eq!(message.message_id(), Some(150));
 
     // A recognized id reports itself too — the accessor is not unknown-only.
-    let message = parse_raw_message(&9_i32.to_be_bytes()).expect("bare message id is a legal frame");
+    let message = parse_raw_message(&(IncomingMessages::NextValidId as i32).to_be_bytes()).expect("bare message id is a legal frame");
     assert_eq!(message.message_type(), IncomingMessages::NextValidId);
-    assert_eq!(message.message_id(), Some(9));
+    assert_eq!(message.message_id(), Some(IncomingMessages::NextValidId as i32));
 }
 
 /// Test handling of non-UTF8 encoded data from IB Gateway (issue #352)
 /// Some IB Gateway installations send timezone names in GB2312/GBK encoding
 /// (e.g., Chinese "中国标准时间" for "China Standard Time")
 #[test]
-fn test_non_utf8_handshake_response() {
+fn non_utf8_handshake_response() {
     // Actual bytes from issue #352: "173\020251205 23:13:45 中国标准时间\0"
     // where the Chinese characters are GB2312 encoded, not UTF-8
     let gb2312_bytes: Vec<u8> = vec![
@@ -609,9 +642,9 @@ fn test_non_utf8_handshake_response() {
 }
 
 #[test]
-fn test_startup_message_message_type_typed_variants() {
+fn startup_message_message_type_typed_variants() {
     use crate::accounts::{AccountPortfolioValue, AccountUpdateTime, AccountValue};
-    use crate::orders::{CommissionReport, ExecutionData, OrderData, OrderStatus};
+    use crate::orders::{CommissionAndFeesReport, ExecutionData, OrderData, OrderStatus};
 
     assert_eq!(
         StartupMessage::OpenOrder(OrderData::default()).message_type(),
@@ -643,8 +676,8 @@ fn test_startup_message_message_type_typed_variants() {
         IncomingMessages::ExecutionData
     );
     assert_eq!(
-        StartupMessage::CommissionReport(CommissionReport::default()).message_type(),
-        IncomingMessages::CommissionsReport
+        StartupMessage::CommissionAndFeesReport(CommissionAndFeesReport::default()).message_type(),
+        IncomingMessages::CommissionsAndFeesReport
     );
     assert_eq!(
         StartupMessage::CompletedOrder(OrderData::default()).message_type(),
@@ -655,23 +688,20 @@ fn test_startup_message_message_type_typed_variants() {
 }
 
 #[test]
-fn test_parse_account_info_next_valid_id_protobuf() {
-    use prost::Message;
-
+fn parse_account_info_next_valid_id_protobuf() {
     let handler = ConnectionHandler::default();
-    let proto = crate::proto::NextValidId { order_id: Some(4242) };
-    let bytes = proto.encode_to_vec();
-    let mut message = proto_response(IncomingMessages::NextValidId, bytes);
+    let bytes = next_valid_id().order_id(4242).encode_proto();
+    let message = proto_response(IncomingMessages::NextValidId, bytes);
 
     let info = handler
-        .parse_account_info(&mut message, &empty_ctx())
+        .parse_account_info(&message, &empty_ctx())
         .expect("protobuf NextValidId must parse");
     assert_eq!(info.next_order_id, Some(4242));
     assert_eq!(info.managed_accounts, None);
 }
 
 #[test]
-fn test_parse_account_info_managed_accounts_protobuf() {
+fn parse_account_info_managed_accounts_protobuf() {
     use prost::Message;
 
     let handler = ConnectionHandler::default();
@@ -679,72 +709,72 @@ fn test_parse_account_info_managed_accounts_protobuf() {
         accounts_list: Some("DU111,DU222".to_string()),
     };
     let bytes = proto.encode_to_vec();
-    let mut message = proto_response(IncomingMessages::ManagedAccounts, bytes);
+    let message = proto_response(IncomingMessages::ManagedAccounts, bytes);
 
     let info = handler
-        .parse_account_info(&mut message, &empty_ctx())
+        .parse_account_info(&message, &empty_ctx())
         .expect("protobuf ManagedAccounts must parse");
     assert_eq!(info.next_order_id, None);
     assert_eq!(info.managed_accounts, Some("DU111,DU222".to_string()));
 }
 
 #[test]
-fn test_parse_account_info_next_valid_id_protobuf_decode_error() {
+fn parse_account_info_next_valid_id_protobuf_decode_error() {
     // Garbage bytes for the NextValidId proto envelope.
     let handler = ConnectionHandler::default();
-    let mut message = proto_response(IncomingMessages::NextValidId, vec![0xff, 0xff, 0xff]);
+    let message = proto_response(IncomingMessages::NextValidId, vec![0xff, 0xff, 0xff]);
 
     let err = handler
-        .parse_account_info(&mut message, &empty_ctx())
+        .parse_account_info(&message, &empty_ctx())
         .expect_err("garbage protobuf must error");
     assert!(matches!(err, Error::ProtobufDecode(_)), "got {err:?}");
 }
 
 #[test]
-fn test_parse_account_info_managed_accounts_protobuf_decode_error() {
+fn parse_account_info_managed_accounts_protobuf_decode_error() {
     let handler = ConnectionHandler::default();
-    let mut message = proto_response(IncomingMessages::ManagedAccounts, vec![0xff, 0xff, 0xff]);
+    let message = proto_response(IncomingMessages::ManagedAccounts, vec![0xff, 0xff, 0xff]);
 
     let err = handler
-        .parse_account_info(&mut message, &empty_ctx())
+        .parse_account_info(&message, &empty_ctx())
         .expect_err("garbage protobuf must error");
     assert!(matches!(err, Error::ProtobufDecode(_)), "got {err:?}");
 }
 
 #[test]
-fn test_dispatch_unsolicited_open_order_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("5\0123\0AAPL\0STK\0");
+fn dispatch_unsolicited_open_order_no_callback_is_noop() {
+    let message = ResponseMessage::from("5\0123\0AAPL\0STK\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0, "OpenOrder must not deliver to notice sink");
 }
 
 #[test]
-fn test_dispatch_unsolicited_order_status_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("3\0456\0Filled\0100\0");
+fn dispatch_unsolicited_order_status_no_callback_is_noop() {
+    let message = ResponseMessage::from("3\0456\0Filled\0100\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
 #[test]
-fn test_dispatch_unsolicited_open_order_end_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("53\01\0");
+fn dispatch_unsolicited_open_order_end_no_callback_is_noop() {
+    let message = ResponseMessage::from("53\01\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
 #[test]
-fn test_dispatch_unsolicited_account_update_no_callback_is_noop() {
+fn dispatch_unsolicited_account_update_no_callback_is_noop() {
     use crate::messages::IncomingMessages;
     use crate::testdata::builders::accounts::account_value;
     use crate::testdata::builders::ResponseProtoEncoder;
 
-    let mut message = proto_response(
+    let message = proto_response(
         IncomingMessages::AccountValue,
         account_value()
             .key("NetLiquidation")
@@ -755,23 +785,23 @@ fn test_dispatch_unsolicited_account_update_no_callback_is_noop() {
     );
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
 #[test]
-fn test_dispatch_unsolicited_account_value_decode_failure_emits_notice() {
+fn dispatch_unsolicited_account_value_decode_failure_emits_notice() {
     use crate::messages::IncomingMessages;
 
     // Garbage proto bytes for AccountValue: Error::ProtobufDecode surfaces as a synthesized notice.
-    let mut message = proto_response(IncomingMessages::AccountValue, vec![0xFF, 0xFF, 0xFF]);
+    let message = proto_response(IncomingMessages::AccountValue, vec![0xFF, 0xFF, 0xFF]);
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire on decode failure");
     let notice = sink.last().expect("notice sink should receive decode-failure notice");
@@ -789,11 +819,11 @@ fn proto_frame<B: crate::testdata::builders::ResponseProtoEncoder>(kind: Incomin
 }
 
 #[test]
-fn test_dispatch_unsolicited_execution_typed() {
+fn dispatch_unsolicited_execution_typed() {
     use crate::testdata::builders::orders::ExecutionDataResponse;
 
     let builder = ExecutionDataResponse::default().symbol("TSLA").shares(100.0).price(196.52);
-    let mut message = proto_frame(IncomingMessages::ExecutionData, &builder);
+    let message = proto_frame(IncomingMessages::ExecutionData, &builder);
 
     let captured: Arc<Mutex<Option<crate::orders::ExecutionData>>> = Arc::new(Mutex::new(None));
     let captured_clone = captured.clone();
@@ -802,7 +832,7 @@ fn test_dispatch_unsolicited_execution_typed() {
         other => panic!("expected Execution, got {other:?}"),
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     let got = captured_clone.lock().unwrap().take().expect("callback didn't fire");
     assert_eq!(got.contract.symbol.to_string(), "TSLA");
     assert_eq!(got.execution.shares, 100.0);
@@ -810,31 +840,31 @@ fn test_dispatch_unsolicited_execution_typed() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_commission_report_typed() {
-    use crate::testdata::builders::orders::CommissionReportResponse;
+fn dispatch_unsolicited_commission_and_fees_report_typed() {
+    use crate::testdata::builders::orders::CommissionAndFeesReportResponse;
 
-    let builder = CommissionReportResponse::default().commission(2.5).currency("USD");
-    let mut message = proto_frame(IncomingMessages::CommissionsReport, &builder);
+    let builder = CommissionAndFeesReportResponse::default().commission_and_fees(2.5).currency("USD");
+    let message = proto_frame(IncomingMessages::CommissionsAndFeesReport, &builder);
 
-    let captured: Arc<Mutex<Option<crate::orders::CommissionReport>>> = Arc::new(Mutex::new(None));
+    let captured: Arc<Mutex<Option<crate::orders::CommissionAndFeesReport>>> = Arc::new(Mutex::new(None));
     let captured_clone = captured.clone();
     let cb = move |msg: StartupMessage| match msg {
-        StartupMessage::CommissionReport(c) => *captured.lock().unwrap() = Some(c),
-        other => panic!("expected CommissionReport, got {other:?}"),
+        StartupMessage::CommissionAndFeesReport(c) => *captured.lock().unwrap() = Some(c),
+        other => panic!("expected CommissionAndFeesReport, got {other:?}"),
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     let got = captured_clone.lock().unwrap().take().expect("callback didn't fire");
-    assert_eq!(got.commission, 2.5);
+    assert_eq!(got.commission_and_fees, 2.5);
     assert_eq!(got.currency, "USD");
 }
 
 #[test]
-fn test_dispatch_unsolicited_completed_order_typed() {
+fn dispatch_unsolicited_completed_order_typed() {
     use crate::testdata::builders::orders::CompletedOrderResponse;
 
     let builder = CompletedOrderResponse::default();
-    let mut message = proto_frame(IncomingMessages::CompletedOrder, &builder);
+    let message = proto_frame(IncomingMessages::CompletedOrder, &builder);
 
     let captured: Arc<Mutex<Option<crate::orders::OrderData>>> = Arc::new(Mutex::new(None));
     let captured_clone = captured.clone();
@@ -843,16 +873,16 @@ fn test_dispatch_unsolicited_completed_order_typed() {
         other => panic!("expected CompletedOrder, got {other:?}"),
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     let got = captured_clone.lock().unwrap().take().expect("callback didn't fire");
     // Completed orders carry the sentinel order_id = -1 per decode_completed_order_proto.
     assert_eq!(got.order_id, -1);
 }
 
 #[test]
-fn test_dispatch_unsolicited_execution_data_end_typed() {
+fn dispatch_unsolicited_execution_data_end_typed() {
     // ExecutionDataEnd: msg_type=55, version=1, request_id=42
-    let mut message = ResponseMessage::from("55\01\042\0");
+    let message = ResponseMessage::from("55\01\042\0");
 
     let fired = Arc::new(Mutex::new(false));
     let fired_clone = fired.clone();
@@ -864,14 +894,14 @@ fn test_dispatch_unsolicited_execution_data_end_typed() {
         }
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     assert!(*fired_clone.lock().unwrap(), "ExecutionDataEnd not delivered as typed variant");
 }
 
 #[test]
-fn test_dispatch_unsolicited_completed_orders_end_typed() {
+fn dispatch_unsolicited_completed_orders_end_typed() {
     // CompletedOrdersEnd: msg_type=102, no payload
-    let mut message = ResponseMessage::from("102\0");
+    let message = ResponseMessage::from("102\0");
 
     let fired = Arc::new(Mutex::new(false));
     let fired_clone = fired.clone();
@@ -883,21 +913,21 @@ fn test_dispatch_unsolicited_completed_orders_end_typed() {
         }
     };
 
-    dispatch_unsolicited_message(&mut message, &startup_ctx(&cb));
+    dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     assert!(*fired_clone.lock().unwrap(), "CompletedOrdersEnd not delivered as typed variant");
 }
 
 #[test]
-fn test_dispatch_unsolicited_execution_decode_failure_emits_notice() {
+fn dispatch_unsolicited_execution_decode_failure_emits_notice() {
     // Text-framed ExecutionData — decoder calls require_proto() and rejects it.
-    let mut message = ResponseMessage::from("11\042\013\0AAPL\0");
+    let message = ResponseMessage::from("11\042\013\0AAPL\0");
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire on decode failure");
     let notice = sink.last().expect("notice sink should receive decode-failure notice");
@@ -906,32 +936,32 @@ fn test_dispatch_unsolicited_execution_decode_failure_emits_notice() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_commission_report_decode_failure_emits_notice() {
-    let mut message = ResponseMessage::from("59\01\0EXEC0001.01.01\0");
+fn dispatch_unsolicited_commission_and_fees_report_decode_failure_emits_notice() {
+    let message = ResponseMessage::from("59\01\0EXEC0001.01.01\0");
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire on decode failure");
     let notice = sink.last().expect("notice sink should receive decode-failure notice");
     assert_eq!(notice.code, HANDSHAKE_DECODE_FAILURE_CODE);
-    assert!(notice.message.contains("CommissionsReport"));
+    assert!(notice.message.contains("CommissionsAndFeesReport"));
 }
 
 #[test]
-fn test_dispatch_unsolicited_completed_order_decode_failure_emits_notice() {
-    let mut message = ResponseMessage::from("101\0\0");
+fn dispatch_unsolicited_completed_order_decode_failure_emits_notice() {
+    let message = ResponseMessage::from("101\0\0");
 
     let cb_fired = Arc::new(Mutex::new(false));
     let cb_fired_clone = cb_fired.clone();
     let cb = move |_msg: StartupMessage| *cb_fired_clone.lock().unwrap() = true;
     let sink = CapturingSink::default();
 
-    dispatch_unsolicited_message(&mut message, &full_ctx(&cb, &sink));
+    dispatch_unsolicited_message(&message, &full_ctx(&cb, &sink));
 
     assert!(!*cb_fired.lock().unwrap(), "callback must not fire on decode failure");
     let notice = sink.last().expect("notice sink should receive decode-failure notice");
@@ -940,47 +970,47 @@ fn test_dispatch_unsolicited_completed_order_decode_failure_emits_notice() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_execution_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("11\042\013\0AAPL\0");
+fn dispatch_unsolicited_execution_no_callback_is_noop() {
+    let message = ResponseMessage::from("11\042\013\0AAPL\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0, "ExecutionData must not deliver to notice sink");
 }
 
 #[test]
-fn test_dispatch_unsolicited_commission_report_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("59\01\0EXEC0001.01.01\0");
+fn dispatch_unsolicited_commission_and_fees_report_no_callback_is_noop() {
+    let message = ResponseMessage::from("59\01\0EXEC0001.01.01\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
 #[test]
-fn test_dispatch_unsolicited_completed_order_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("101\0\0");
+fn dispatch_unsolicited_completed_order_no_callback_is_noop() {
+    let message = ResponseMessage::from("101\0\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
 #[test]
-fn test_dispatch_unsolicited_execution_data_end_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("55\01\042\0");
+fn dispatch_unsolicited_execution_data_end_no_callback_is_noop() {
+    let message = ResponseMessage::from("55\01\042\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
 #[test]
-fn test_dispatch_unsolicited_completed_orders_end_no_callback_is_noop() {
-    let mut message = ResponseMessage::from("102\0");
+fn dispatch_unsolicited_completed_orders_end_no_callback_is_noop() {
+    let message = ResponseMessage::from("102\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     assert_eq!(sink.count(), 0);
 }
 
@@ -988,11 +1018,11 @@ fn test_dispatch_unsolicited_completed_orders_end_no_callback_is_noop() {
 /// handshake too, not HANDSHAKE_UNKNOWN_FRAME_CODE: one condition, one code,
 /// whether or not a reconnect is in flight.
 #[test]
-fn test_dispatch_unsolicited_unrecognized_id_raises_unknown_message_type() {
-    let mut message = parse_raw_message(&helpers::unknown_message_frame()).expect("well-formed frame");
+fn dispatch_unsolicited_unrecognized_id_raises_unknown_message_type() {
+    let message = parse_raw_message(&helpers::unknown_message_frame()).expect("well-formed frame");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
 
     let notice = sink.last().expect("an unrecognized id must raise a notice");
     assert_eq!(notice.code, UNKNOWN_MESSAGE_TYPE_CODE);
@@ -1005,21 +1035,21 @@ fn test_dispatch_unsolicited_unrecognized_id_raises_unknown_message_type() {
 }
 
 #[test]
-fn test_dispatch_unsolicited_unknown_no_callback_still_notices() {
+fn dispatch_unsolicited_unknown_no_callback_still_notices() {
     // NewsBulletins (14). Unknown handshake kind always fires the notice
     // sink regardless of callback presence — synthesized notices target
     // `Client::notice_stream()`, decoupled from the typed startup callback.
-    let mut message = ResponseMessage::from("14\0\0");
+    let message = ResponseMessage::from("14\0\0");
 
     let sink = CapturingSink::default();
-    dispatch_unsolicited_message(&mut message, &notice_sink_ctx(&sink));
+    dispatch_unsolicited_message(&message, &notice_sink_ctx(&sink));
     let notice = sink.last().expect("notice sink should receive unknown-frame notice");
     assert_eq!(notice.code, HANDSHAKE_UNKNOWN_FRAME_CODE);
     assert!(notice.is_handshake_synthetic());
 }
 
 #[test]
-fn test_account_info_merge() {
+fn account_info_merge() {
     let mut info = AccountInfo::default();
 
     let complete = info.merge(AccountInfo {
@@ -1042,7 +1072,7 @@ fn test_account_info_merge() {
 }
 
 #[test]
-fn test_connection_metadata_apply_account_info() {
+fn connection_metadata_apply_account_info() {
     let mut metadata = ConnectionMetadata {
         next_order_id: 1,
         managed_accounts: "OLD".to_owned(),
@@ -1062,7 +1092,7 @@ fn test_connection_metadata_apply_account_info() {
 }
 
 #[test]
-fn test_parse_handshake_ack() {
+fn parse_handshake_ack_works() {
     use std::io::ErrorKind;
 
     enum Expect {

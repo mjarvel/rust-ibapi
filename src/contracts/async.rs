@@ -1,5 +1,6 @@
 //! Asynchronous implementation of contract management functionality
 
+use super::common::stream_decoders::{ImpliedVolatilityRequest, OptionPriceRequest};
 use super::common::{decoders, encoders};
 use super::*;
 use crate::client::ids::RequestId;
@@ -7,7 +8,7 @@ use crate::client::ClientRequestBuilders;
 use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
 use crate::messages::OutgoingMessages;
 use crate::protocol::{check_version, Features};
-use crate::subscriptions::{StreamDecoder, Subscription};
+use crate::subscriptions::Subscription;
 use crate::{Client, Error};
 
 impl Client {
@@ -138,7 +139,7 @@ impl Client {
     /// * `market_rule_id` - The market rule ID to query
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -205,7 +206,7 @@ impl Client {
     ///
     /// # Arguments
     /// * `contract`   - The [Contract] object representing the option for which the calculation is being requested.
-    /// * `volatility` - Hypothetical volatility.
+    /// * `volatility` - Hypothetical annualized volatility as a fraction (`0.2` = 20%).
     /// * `underlying_price` - Hypothetical option's underlying price.
     ///
     /// # Examples
@@ -218,18 +219,16 @@ impl Client {
     ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
     ///     let contract = Contract::option("AAPL", "20251219", 150.0, OptionRight::Call);
     ///     let calculation = client
-    ///         .calculate_option_price(&contract, 100.0, 235.0)
+    ///         .calculate_option_price(&contract, 0.2, 235.0)
     ///         .await
     ///         .expect("request failed");
     ///     println!("calculation: {calculation:?}");
     /// }
     /// ```
     pub async fn calculate_option_price(&self, contract: &Contract, volatility: f64, underlying_price: f64) -> Result<OptionComputation, Error> {
-        request_helpers::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_calculate_option_price(request_id, contract, volatility, underlying_price),
-            |message| OptionComputation::decode(&self.decoder_context(), message),
-        )
+        request_helpers::one_shot_cancelling::<OptionPriceRequest>(self, |request_id| {
+            encoders::encode_calculate_option_price(request_id, contract, volatility, underlying_price)
+        })
         .await
     }
 
@@ -262,11 +261,9 @@ impl Client {
         option_price: f64,
         underlying_price: f64,
     ) -> Result<OptionComputation, Error> {
-        request_helpers::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_calculate_implied_volatility(request_id, contract, option_price, underlying_price),
-            |message| OptionComputation::decode(&self.decoder_context(), message),
-        )
+        request_helpers::one_shot_cancelling::<ImpliedVolatilityRequest>(self, |request_id| {
+            encoders::encode_calculate_implied_volatility(request_id, contract, option_price, underlying_price)
+        })
         .await
     }
 
@@ -332,8 +329,7 @@ impl Client {
 }
 
 /// Send a contract-details request with a pre-allocated id. Reached through
-/// [`ContractDetailsBuilder::subscribe`]; the flat arguments are the
-/// builder-fed param-budget exception.
+/// [`ContractDetailsBuilder::subscribe`].
 pub(in crate::contracts) async fn contract_details_stream(
     client: &Client,
     contract: &Contract,
@@ -345,8 +341,7 @@ pub(in crate::contracts) async fn contract_details_stream(
 }
 
 /// Request an underlying's option chain. Reached through
-/// [`OptionChainBuilder::subscribe`]; the flat arguments are the builder-fed
-/// param-budget exception.
+/// [`OptionChainBuilder::subscribe`].
 pub(in crate::contracts) async fn option_chain(
     client: &Client,
     symbol: &str,

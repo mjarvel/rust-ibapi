@@ -2,15 +2,11 @@
 
 use time::Date;
 
-use crate::{
-    client::ClientRequestBuilders,
-    common::request_helpers::{self, expect_proto},
-    subscriptions::Subscription,
-    Client, Error,
-};
+use crate::{client::ClientRequestBuilders, common::request_helpers, subscriptions::Subscription, Client, Error};
 
 use super::builder::{WshEventDataBuilder, WshEventFilterBuilder};
-use super::{common::decoders, encoders, AutoFill, WshEventData, WshMetadata};
+use super::common::stream_decoders::{WshEventDataRequest, WshMetadataRequest};
+use super::{encoders, AutoFill, WshEventData, WshMetadata};
 
 impl Client {
     /// Fetch Wall Street Horizon metadata table with retry semantics.
@@ -28,12 +24,7 @@ impl Client {
     /// }
     /// ```
     pub async fn wsh_metadata(&self) -> Result<WshMetadata, Error> {
-        request_helpers::one_shot_by_request_id(
-            self,
-            encoders::encode_request_wsh_metadata,
-            expect_proto(decoders::decode_wsh_metadata_proto),
-        )
-        .await
+        request_helpers::one_shot_cancelling::<WshMetadataRequest>(self, encoders::encode_request_wsh_metadata).await
     }
 
     /// Build a request for Wall Street Horizon events on one contract.
@@ -78,8 +69,7 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use ibapi::Client;
-    /// use ibapi::subscriptions::r#async::SubscriptionItemStreamExt;
+    /// use ibapi::prelude::*;
     /// use futures::StreamExt;
     ///
     /// #[tokio::main]
@@ -87,7 +77,7 @@ impl Client {
     ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
     ///
     ///     let filter = "{}"; // see https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-doc/#wsheventdata-object
-    ///     let mut subscription = client
+    ///     let subscription = client
     ///         .wsh_event_data_by_filter(filter)
     ///         .subscribe()
     ///         .await
@@ -114,11 +104,9 @@ pub(crate) async fn wsh_event_data_by_contract(
     limit: Option<i32>,
     auto_fill: Option<AutoFill>,
 ) -> Result<WshEventData, Error> {
-    request_helpers::one_shot_by_request_id(
-        client,
-        |request_id| encoders::encode_request_wsh_event_data(request_id, Some(contract_id), None, start_date, end_date, limit, auto_fill),
-        expect_proto(decoders::decode_wsh_event_data_proto),
-    )
+    request_helpers::one_shot_cancelling::<WshEventDataRequest>(client, |request_id| {
+        encoders::encode_request_wsh_event_data(request_id, Some(contract_id), None, start_date, end_date, limit, auto_fill)
+    })
     .await
 }
 

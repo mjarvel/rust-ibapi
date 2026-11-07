@@ -151,8 +151,30 @@ struct Fixture<T: StreamDecoder<T>> {
 
 /// Build a `Subscription<T>` over a fresh broadcast channel and a fresh stub bus.
 fn subscription_with<T: StreamDecoder<T>>(request_id: Option<i32>, order_id: Option<i32>, context: DecoderContext) -> Fixture<T> {
-    let bus = Arc::new(MessageBusStub::default());
-    let (tx, rx) = broadcast::channel(100);
+    subscription_with_capacity(100, request_id, order_id, context)
+}
+
+/// [`subscription_with`] over a broadcast channel of `capacity`: sending more
+/// than `capacity` unread items evicts the oldest, which is how a test lags.
+fn subscription_with_capacity<T: StreamDecoder<T>>(
+    capacity: usize,
+    request_id: Option<i32>,
+    order_id: Option<i32>,
+    context: DecoderContext,
+) -> Fixture<T> {
+    subscription_on(MessageBusStub::default(), capacity, request_id, order_id, context)
+}
+
+/// [`subscription_with_capacity`] over `bus`.
+fn subscription_on<T: StreamDecoder<T>>(
+    bus: MessageBusStub,
+    capacity: usize,
+    request_id: Option<i32>,
+    order_id: Option<i32>,
+    context: DecoderContext,
+) -> Fixture<T> {
+    let bus = Arc::new(bus);
+    let (tx, rx) = broadcast::channel(capacity);
     let internal = AsyncInternalSubscription::new(rx);
     Fixture {
         subscription: Subscription::new_from_internal(internal, bus.clone(), request_id, order_id, context),
@@ -171,7 +193,7 @@ fn subscription<T: StreamDecoder<T>>() -> (Subscription<T>, broadcast::Sender<Ro
 /// `Drop` spawns the cancel on the bus's runtime, so a drop on a thread with
 /// no runtime still sends it (#848).
 #[tokio::test]
-async fn test_drop_outside_runtime_sends_cancel() {
+async fn drop_outside_runtime_sends_cancel() {
     let f = subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default());
     let subscription = f.subscription;
     std::thread::spawn(move || drop(subscription))
@@ -188,7 +210,7 @@ async fn test_drop_outside_runtime_sends_cancel() {
 /// Once the bus's runtime has shut down there is nowhere for the cancel to
 /// run; `Drop` must still not panic.
 #[test]
-fn test_drop_after_runtime_shutdown_does_not_panic() {
+fn drop_after_runtime_shutdown_does_not_panic() {
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
     let f = runtime.block_on(async { subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default()) });
     drop(runtime);
@@ -203,7 +225,7 @@ fn test_drop_after_runtime_shutdown_does_not_panic() {
 // ---- Stream contract --------------------------------------------------------
 
 #[tokio::test]
-async fn test_subscription_decodes_through_stream_decoder() {
+async fn subscription_decodes_through_stream_decoder() {
     let (mut sub, tx) = subscription::<IntItem>();
 
     tx.send(int_frame(42)).unwrap();
@@ -215,20 +237,13 @@ async fn test_subscription_decodes_through_stream_decoder() {
 }
 
 #[tokio::test]
-async fn test_subscription_lag_yields_gap_notice_then_items() {
+async fn subscription_lag_yields_gap_notice_then_items() {
     // Regression test for #779: falling behind the broadcast channel yields a
     // synthesized gap notice naming the dropped count, then the retained
     // items — not a silent resume.
-    let message_bus = Arc::new(MessageBusStub::default());
-    let (tx, rx) = broadcast::channel(2);
-    for code in [2100, 2101, 2102, 2103] {
-        tx.send(RoutedItem::Notice(test_notice(code, "n"))).unwrap();
-    }
-
     // Capacity 2 with 4 sends: the 2 oldest frames were evicted.
-    let internal = AsyncInternalSubscription::new(rx);
-    let mut subscription: Subscription<NeverDecodes> =
-        Subscription::new_from_internal(internal, message_bus, Some(9000), None, DecoderContext::default());
+    let notices = [2100, 2101, 2102, 2103].map(|code| RoutedItem::Notice(test_notice(code, "n")));
+    let mut subscription = lagged_subscription::<NeverDecodes>(2, notices.into()).subscription;
 
     match subscription.next().await {
         Some(Ok(SubscriptionItem::Notice(n))) => assert_eq!(n, crate::messages::subscription_lag_notice(2)),
@@ -243,7 +258,7 @@ async fn test_subscription_lag_yields_gap_notice_then_items() {
 }
 
 #[tokio::test]
-async fn test_routed_item_error_surfaces_through_async_subscription() {
+async fn routed_item_error_surfaces_through_async_subscription() {
     // The channel emits a terminal RoutedItem::Error that the consumer must
     // surface directly without ever invoking the decoder.
     let (mut subscription, tx) = subscription::<NeverDecodes>();
@@ -255,7 +270,7 @@ async fn test_routed_item_error_surfaces_through_async_subscription() {
 }
 
 #[tokio::test]
-async fn test_routed_item_notice_skipped_then_response_delivered() {
+async fn routed_item_notice_skipped_then_response_delivered() {
     let (subscription, tx) = subscription::<IntItem>();
 
     // The receiver-side contract: notices are consumed by `filter_data` and
@@ -270,7 +285,7 @@ async fn test_routed_item_notice_skipped_then_response_delivered() {
 }
 
 #[tokio::test]
-async fn test_subscription_next_with_error() {
+async fn subscription_next_with_error() {
     let (mut subscription, tx) = subscription::<DecodeError>();
 
     // Send a message that will trigger the error
@@ -282,7 +297,7 @@ async fn test_subscription_next_with_error() {
 }
 
 #[tokio::test]
-async fn test_subscription_next_end_of_stream() {
+async fn subscription_next_end_of_stream() {
     let (mut subscription, tx) = subscription::<EndOfStreamItem>();
 
     // Send a message that will trigger end of stream
@@ -293,7 +308,7 @@ async fn test_subscription_next_end_of_stream() {
 }
 
 #[tokio::test]
-async fn test_subscription_no_retries_after_end_of_stream() {
+async fn subscription_no_retries_after_end_of_stream() {
     use std::sync::atomic::AtomicUsize;
 
     static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -335,7 +350,7 @@ async fn test_subscription_no_retries_after_end_of_stream() {
 }
 
 #[tokio::test]
-async fn test_subscription_skips_undeclared_messages_without_retry_limit() {
+async fn subscription_skips_undeclared_messages_without_retry_limit() {
     use std::sync::atomic::AtomicUsize;
 
     static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -378,7 +393,7 @@ async fn test_subscription_skips_undeclared_messages_without_retry_limit() {
 }
 
 #[tokio::test]
-async fn test_stream_yields_error_then_ends() {
+async fn stream_yields_error_then_ends() {
     // A terminal error flips `stream_ended`, so later polls return `None`
     // instead of re-polling the channel for the queued item behind it.
     let (mut subscription, tx) = subscription::<IntItem>();
@@ -398,7 +413,7 @@ async fn test_stream_yields_error_then_ends() {
 }
 
 #[tokio::test]
-async fn test_routed_end_of_stream_ends_without_error() {
+async fn routed_end_of_stream_ends_without_error() {
     // `EndOfStream` arriving as a routed error — not from the decoder — is a
     // graceful end: `None`, not `Some(Err(..))`. The historical-tick streams
     // read it this way (`market_data::historical::common::tick`), so the arm
@@ -443,7 +458,7 @@ async fn subscription_impls_stream() {
 // ---- Cancel, clone, drop ----------------------------------------------------
 
 #[tokio::test]
-async fn test_subscription_cancel() {
+async fn subscription_cancel() {
     let f = subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default());
 
     // Cancel the subscription: the decoder's cancel message goes to the bus.
@@ -456,8 +471,43 @@ async fn test_subscription_cancel() {
     assert_eq!(f.bus.request_messages().len(), 1);
 }
 
+/// A reconnect ended the request at TWS along with the old session; the new
+/// session never saw its id, so neither `cancel()` nor drop writes a cancel.
 #[tokio::test]
-async fn test_subscription_cancel_without_cancel_message_sends_nothing() {
+async fn cancel_after_reconnect_sends_nothing() {
+    let f = subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default());
+    f.bus.start_new_session();
+
+    f.subscription.cancel().await;
+    assert!(f.bus.request_messages().is_empty(), "cancel() wrote to the new session");
+
+    let g = subscription_with::<CancellableItem>(Some(124), None, DecoderContext::default());
+    g.bus.start_new_session();
+    drop(g.subscription);
+    // Drop spawns its cancel; give it the chance to run.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(g.bus.request_messages().is_empty(), "drop wrote to the new session");
+}
+
+/// A reset can land between the write and construction; the subscription
+/// takes the request's generation from the route, not the bus's at
+/// construction, so it still skips the cancel.
+#[tokio::test]
+async fn reset_before_construction_sends_nothing() {
+    let bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx).in_session(0);
+    bus.start_new_session();
+
+    let subscription: Subscription<CancellableItem> =
+        Subscription::new_from_internal(internal, bus.clone(), Some(123), None, DecoderContext::default());
+    subscription.cancel().await;
+
+    assert!(bus.request_messages().is_empty(), "cancel written to the new session");
+}
+
+#[tokio::test]
+async fn subscription_cancel_without_cancel_message_sends_nothing() {
     // `StreamDecoder::cancel_message` defaults to `Err(NotImplemented)`.
     let f = subscription_with::<IntItem>(Some(123), None, DecoderContext::default());
 
@@ -478,7 +528,7 @@ async fn next_after_cancel<T: StreamDecoder<T> + Send + 'static>(sub: &mut Subsc
 /// `Err(Cancelled)` once, skipping frames not yet read, then ends. Covers the
 /// paths that write nothing: no cancel message, and an order id.
 #[tokio::test]
-async fn test_cancel_stops_every_clone() {
+async fn cancel_stops_every_clone() {
     for (request_id, order_id) in [(Some(123), None), (None, Some(7))] {
         let Fixture { mut subscription, tx, bus } = subscription_with::<IntItem>(request_id, order_id, DecoderContext::default());
         let mut clone = subscription.clone();
@@ -500,7 +550,7 @@ async fn test_cancel_stops_every_clone() {
 /// open, so no frame would wake it (#1047). Covers the original waiting and
 /// a clone cancelling, and the reverse.
 #[tokio::test]
-async fn test_cancel_wakes_waiting_clones() {
+async fn cancel_wakes_waiting_clones() {
     for cancel_from_clone in [false, true] {
         let Fixture {
             subscription,
@@ -529,7 +579,7 @@ async fn test_cancel_wakes_waiting_clones() {
 /// Dropping a clone ends only that handle: the other clones keep reading, and
 /// the request is cancelled once, when the last clone goes (#1049).
 #[tokio::test]
-async fn test_only_the_last_clone_dropped_cancels() {
+async fn only_the_last_clone_dropped_cancels() {
     let Fixture { subscription, tx, bus } = subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default());
 
     let mut reader = subscription.clone();
@@ -549,7 +599,7 @@ async fn test_only_the_last_clone_dropped_cancels() {
 
 /// Clones dropped at once on many threads still write exactly one cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_clones_dropped_concurrently_cancel_once() {
+async fn clones_dropped_concurrently_cancel_once() {
     let f = subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default());
     let clones: Vec<_> = (0..16).map(|_| f.subscription.clone()).collect();
     drop(f.subscription);
@@ -590,7 +640,7 @@ async fn completed_snapshot() -> Fixture<CancellableSnapshotItem> {
 }
 
 #[tokio::test]
-async fn test_completed_snapshot_cancel_writes_nothing_and_stops() {
+async fn completed_snapshot_cancel_writes_nothing_and_stops() {
     let mut f = completed_snapshot().await;
 
     f.subscription.cancel().await;
@@ -600,7 +650,7 @@ async fn test_completed_snapshot_cancel_writes_nothing_and_stops() {
 }
 
 #[tokio::test]
-async fn test_completed_snapshot_skips_cancel_on_drop() {
+async fn completed_snapshot_skips_cancel_on_drop() {
     let f = completed_snapshot().await;
 
     drop(f.subscription);
@@ -612,7 +662,7 @@ async fn test_completed_snapshot_skips_cancel_on_drop() {
 }
 
 #[tokio::test]
-async fn test_subscription_clone() {
+async fn subscription_clone() {
     let Fixture { mut subscription, tx, .. } = subscription_with::<IntItem>(
         Some(456),
         Some(789),
@@ -633,7 +683,7 @@ async fn test_subscription_clone() {
 }
 
 #[tokio::test]
-async fn test_subscription_drop_with_cancel() {
+async fn subscription_drop_with_cancel() {
     let message_bus = Arc::new(MessageBusStub::default());
     let (_tx, rx) = broadcast::channel(100);
     let internal = AsyncInternalSubscription::new(rx);
@@ -650,7 +700,7 @@ async fn test_subscription_drop_with_cancel() {
 }
 
 #[tokio::test]
-async fn test_subscription_with_context() {
+async fn subscription_with_context() {
     let context = DecoderContext::default()
         .with_smart_depth(true)
         .with_request_type(OutgoingMessages::RequestMarketDepth);
@@ -661,7 +711,7 @@ async fn test_subscription_with_context() {
 }
 
 #[tokio::test]
-async fn test_subscription_new_from_internal_simple() {
+async fn subscription_new_from_internal_simple() {
     let message_bus = Arc::new(MessageBusStub::default());
     let (_tx, rx) = broadcast::channel(100);
     let internal = AsyncInternalSubscription::new(rx);
@@ -680,7 +730,7 @@ async fn test_subscription_new_from_internal_simple() {
 // ---- filter_data ------------------------------------------------------------
 
 #[tokio::test]
-async fn test_data_stream_collects_data_items() {
+async fn data_stream_collects_data_items() {
     let (subscription, tx) = subscription::<IntItem>();
 
     tx.send(int_frame(1)).unwrap();
@@ -694,7 +744,7 @@ async fn test_data_stream_collects_data_items() {
 }
 
 #[tokio::test]
-async fn test_data_stream_yields_error_then_ends() {
+async fn data_stream_yields_error_then_ends() {
     let (subscription, tx) = subscription::<IntItem>();
 
     tx.send(int_frame(1)).unwrap();
@@ -714,7 +764,7 @@ async fn test_data_stream_yields_error_then_ends() {
 }
 
 #[tokio::test]
-async fn test_data_stream_filters_notices() {
+async fn data_stream_filters_notices() {
     let (subscription, tx) = subscription::<IntItem>();
 
     tx.send(RoutedItem::Notice(test_notice(2104, "Market data farm OK"))).unwrap();
@@ -729,7 +779,7 @@ async fn test_data_stream_filters_notices() {
 /// The dispatcher emits `RoutedItem::Notice`; `Subscription<T>::next()`
 /// surfaces it as `SubscriptionItem::Notice` without terminating the stream.
 #[tokio::test]
-async fn test_routed_item_notice_surfaces_as_subscription_item() {
+async fn routed_item_notice_surfaces_as_subscription_item() {
     let (mut subscription, tx) = subscription::<IntItem>();
 
     tx.send(RoutedItem::Notice(test_notice(2104, "Market data farm OK"))).unwrap();
@@ -788,7 +838,7 @@ fn collect_subscription(items: Vec<RoutedItem>, keep_open: bool) -> (Subscriptio
 }
 
 #[tokio::test]
-async fn test_collect_for_stops_at_snapshot_end() {
+async fn collect_for_stops_at_snapshot_end() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(20), int_frame(-1), int_frame(30)], true);
 
     let collected = sub.collect_for(Duration::from_secs(30)).await;
@@ -798,7 +848,7 @@ async fn test_collect_for_stops_at_snapshot_end() {
 }
 
 #[tokio::test]
-async fn test_collect_until_stops_on_predicate() {
+async fn collect_until_stops_on_predicate() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(20), int_frame(30), int_frame(40)], true);
 
     let collected = sub.collect_until(Duration::from_secs(30), |items| items.len() >= 2).await;
@@ -807,7 +857,7 @@ async fn test_collect_until_stops_on_predicate() {
 }
 
 #[tokio::test]
-async fn test_collect_for_returns_prefix_on_terminal_error() {
+async fn collect_for_returns_prefix_on_terminal_error() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), RoutedItem::Error(Error::ConnectionReset), int_frame(20)], true);
 
     let collected = sub.collect_for(Duration::from_secs(30)).await;
@@ -816,7 +866,7 @@ async fn test_collect_for_returns_prefix_on_terminal_error() {
 }
 
 #[tokio::test]
-async fn test_collect_for_returns_empty_on_timeout() {
+async fn collect_for_returns_empty_on_timeout() {
     // Channel stays open with no data; the total timeout bounds the wait.
     let (mut sub, _keep) = collect_subscription(vec![], true);
 
@@ -826,7 +876,7 @@ async fn test_collect_for_returns_empty_on_timeout() {
 }
 
 #[tokio::test]
-async fn test_collect_for_drains_to_stream_end() {
+async fn collect_for_drains_to_stream_end() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(20), int_frame(30)], false);
 
     let collected = sub.collect_for(Duration::from_secs(30)).await;
@@ -835,7 +885,7 @@ async fn test_collect_for_drains_to_stream_end() {
 }
 
 #[tokio::test]
-async fn test_collect_for_filters_notices() {
+async fn collect_for_filters_notices() {
     let notice = RoutedItem::Notice(test_notice(2104, "Market data farm OK"));
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), notice, int_frame(20)], false);
 
@@ -852,7 +902,7 @@ async fn settle() {
 }
 
 #[tokio::test]
-async fn test_decoded_end_skips_cancel_on_cancel_and_drop() {
+async fn decoded_end_skips_cancel_on_cancel_and_drop() {
     let mut f = subscription_with::<CancellableEndItem>(Some(123), None, DecoderContext::default());
 
     f.tx.send(int_frame(1)).unwrap();
@@ -871,7 +921,7 @@ async fn test_decoded_end_skips_cancel_on_cancel_and_drop() {
 }
 
 #[tokio::test]
-async fn test_routed_end_skips_cancel_on_drop() {
+async fn routed_end_skips_cancel_on_drop() {
     let mut f = subscription_with::<CancellableItem>(Some(123), None, DecoderContext::default());
 
     f.tx.send(RoutedItem::Error(Error::EndOfStream)).unwrap();
@@ -884,7 +934,7 @@ async fn test_routed_end_skips_cancel_on_drop() {
 }
 
 #[tokio::test]
-async fn test_error_end_still_cancels() {
+async fn error_end_still_cancels() {
     // Only the end marker proves TWS finished; after an error the cancel goes out as before.
     let mut f = subscription_with::<CancellableEndItem>(Some(123), None, DecoderContext::default());
 
@@ -897,7 +947,7 @@ async fn test_error_end_still_cancels() {
 }
 
 #[tokio::test]
-async fn test_end_seen_by_one_clone_skips_cancel_from_another() {
+async fn end_seen_by_one_clone_skips_cancel_from_another() {
     // The flag is shared: once any clone has seen the end, TWS is done with the request.
     let mut f = subscription_with::<CancellableEndItem>(Some(123), None, DecoderContext::default());
     let other = f.subscription.clone();
@@ -913,7 +963,7 @@ async fn test_end_seen_by_one_clone_skips_cancel_from_another() {
 // ---- collect_to_end ---------------------------------------------------------
 
 #[tokio::test]
-async fn test_collect_to_end_returns_items_and_skips_notices() {
+async fn collect_to_end_returns_items_and_skips_notices() {
     let (mut sub, tx) = subscription::<IntItem>();
     tx.send(int_frame(10)).unwrap();
     tx.send(RoutedItem::Notice(test_notice(2104, "Market data farm OK"))).unwrap();
@@ -924,7 +974,7 @@ async fn test_collect_to_end_returns_items_and_skips_notices() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_returns_terminal_error() {
+async fn collect_to_end_returns_terminal_error() {
     let (mut sub, tx) = subscription::<IntItem>();
     tx.send(int_frame(10)).unwrap();
     tx.send(RoutedItem::Error(Error::ConnectionReset)).unwrap();
@@ -933,7 +983,7 @@ async fn test_collect_to_end_returns_terminal_error() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_without_end_marker_is_unexpected_end() {
+async fn collect_to_end_without_end_marker_is_unexpected_end() {
     // Sender dropped after the last item: the channel closes with no end marker.
     let (mut sub, tx) = subscription::<IntItem>();
     tx.send(int_frame(10)).unwrap();
@@ -942,10 +992,92 @@ async fn test_collect_to_end_without_end_marker_is_unexpected_end() {
     assert!(matches!(sub.collect_to_end().await, Err(Error::UnexpectedEndOfStream)));
 }
 
+// ---- broadcast lag (#1090) ---------------------------------------------------
+
+/// A request-id subscription over a broadcast channel of `capacity`, with
+/// `items` already sent: more items than `capacity` evicts the oldest, so the
+/// first read is a lag notice.
+fn lagged_subscription<T: StreamDecoder<T>>(capacity: usize, items: Vec<RoutedItem>) -> Fixture<T> {
+    let f = subscription_with_capacity(capacity, Some(1), None, DecoderContext::default());
+    for item in items {
+        f.tx.send(item).unwrap();
+    }
+    f
+}
+
+fn is_lag_error(result: &Result<Vec<impl std::fmt::Debug>, Error>) -> bool {
+    matches!(result, Err(Error::Notice(n)) if n.code == crate::messages::SUBSCRIPTION_LAG_CODE)
+}
+
+#[tokio::test]
+async fn collect_to_end_within_fails_on_lag() {
+    // Rows 10 and 20 are evicted; the end marker after the gap must not
+    // turn the remainder into a complete-looking result.
+    let mut f = lagged_subscription::<IntItem>(
+        2,
+        vec![int_frame(10), int_frame(20), int_frame(30), RoutedItem::Error(Error::EndOfStream)],
+    );
+
+    let result = f.subscription.collect_to_end_within(Duration::from_secs(30)).await;
+
+    assert!(is_lag_error(&result), "expected lag error, got {result:?}");
+}
+
+#[tokio::test]
+async fn collect_to_end_fails_on_lag() {
+    let mut f = lagged_subscription::<IntItem>(
+        2,
+        vec![int_frame(10), int_frame(20), int_frame(30), RoutedItem::Error(Error::EndOfStream)],
+    );
+
+    let result = f.subscription.collect_to_end().await;
+
+    assert!(is_lag_error(&result), "expected lag error, got {result:?}");
+}
+
+#[tokio::test]
+async fn collect_for_stops_at_lag() {
+    // The gap ends the window; nothing read after it is returned.
+    let mut f = lagged_subscription::<IntItem>(2, vec![int_frame(10), int_frame(20), int_frame(30)]);
+
+    assert!(f.subscription.collect_for(Duration::from_secs(30)).await.is_empty());
+}
+
+#[tokio::test]
+async fn next_batch_fails_on_lag_then_continues() {
+    let mut f = lagged_subscription::<IntItem>(2, vec![int_frame(10), int_frame(20), int_frame(0)]);
+
+    let gap = f.subscription.next_batch(Duration::from_secs(30)).await.unwrap();
+    assert!(is_lag_error(&gap), "expected lag error, got {gap:?}");
+
+    // Lag is not terminal for the stream: the retained rows form the next batch.
+    assert_eq!(
+        f.subscription.next_batch(Duration::from_secs(30)).await.unwrap().unwrap(),
+        vec![IntItem(20), IntItem(0)]
+    );
+}
+
+#[tokio::test]
+async fn drop_after_lag_error_sends_cancel() {
+    // A lag is our failure, not TWS ending the request: the cancel still goes out.
+    let f = lagged_subscription::<CancellableItem>(2, vec![int_frame(10), int_frame(20), int_frame(30)]);
+    let mut subscription = f.subscription;
+
+    let result = subscription.collect_to_end_within(Duration::from_secs(30)).await;
+    assert!(is_lag_error(&result), "expected lag error, got {result:?}");
+    drop(subscription);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while f.bus.request_messages().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(f.bus.request_messages(), vec![cancel_frame()]);
+}
+
 // ---- collect_to_end_within --------------------------------------------------
 
 #[tokio::test]
-async fn test_collect_to_end_within_returns_items_at_end_marker() {
+async fn collect_to_end_within_returns_items_at_end_marker() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(20), RoutedItem::Error(Error::EndOfStream)], true);
 
     assert_eq!(
@@ -955,7 +1087,7 @@ async fn test_collect_to_end_within_returns_items_at_end_marker() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_within_times_out_without_end_marker() {
+async fn collect_to_end_within_times_out_without_end_marker() {
     // Channel stays open with no end marker; rows read before the deadline are dropped.
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10)], true);
 
@@ -963,7 +1095,7 @@ async fn test_collect_to_end_within_times_out_without_end_marker() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_within_deadline_holds_while_items_are_ready() {
+async fn collect_to_end_within_deadline_holds_while_items_are_ready() {
     // The whole result is already queued, but the deadline has passed.
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(20), RoutedItem::Error(Error::EndOfStream)], true);
 
@@ -971,7 +1103,7 @@ async fn test_collect_to_end_within_deadline_holds_while_items_are_ready() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_within_returns_terminal_error() {
+async fn collect_to_end_within_returns_terminal_error() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), RoutedItem::Error(Error::ConnectionReset)], true);
 
     assert!(matches!(
@@ -981,7 +1113,7 @@ async fn test_collect_to_end_within_returns_terminal_error() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_within_closed_channel_is_unexpected_end() {
+async fn collect_to_end_within_closed_channel_is_unexpected_end() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10)], false);
 
     assert!(matches!(
@@ -991,7 +1123,7 @@ async fn test_collect_to_end_within_closed_channel_is_unexpected_end() {
 }
 
 #[tokio::test]
-async fn test_collect_to_end_within_stops_at_snapshot_end() {
+async fn collect_to_end_within_stops_at_snapshot_end() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(-1), int_frame(20)], true);
 
     assert_eq!(sub.collect_to_end_within(Duration::from_secs(30)).await.unwrap(), vec![IntItem(10)]);
@@ -1000,7 +1132,7 @@ async fn test_collect_to_end_within_stops_at_snapshot_end() {
 // ---- next_batch -------------------------------------------------------------
 
 #[tokio::test]
-async fn test_next_batch_closes_after_quiet_period() {
+async fn next_batch_closes_after_quiet_period() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(20)], true);
 
     assert_eq!(
@@ -1010,7 +1142,7 @@ async fn test_next_batch_closes_after_quiet_period() {
 }
 
 #[tokio::test]
-async fn test_next_batch_closes_at_batch_end_with_marker_last() {
+async fn next_batch_closes_at_batch_end_with_marker_last() {
     // A 30s quiet period would take in 30 if the marker didn't close the batch.
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), int_frame(0), int_frame(30)], true);
 
@@ -1021,7 +1153,7 @@ async fn test_next_batch_closes_at_batch_end_with_marker_last() {
 }
 
 #[tokio::test]
-async fn test_next_batch_waits_for_first_item() {
+async fn next_batch_waits_for_first_item() {
     let (mut sub, _keep) = collect_subscription(vec![], true);
 
     let waited = tokio::time::timeout(Duration::from_millis(150), sub.next_batch(Duration::from_millis(50))).await;
@@ -1030,7 +1162,7 @@ async fn test_next_batch_waits_for_first_item() {
 }
 
 #[tokio::test]
-async fn test_next_batch_at_stream_end() {
+async fn next_batch_at_stream_end() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10)], false);
     assert_eq!(sub.next_batch(Duration::from_secs(30)).await.unwrap().unwrap(), vec![IntItem(10)]);
     assert!(sub.next_batch(Duration::from_secs(30)).await.is_none());
@@ -1040,7 +1172,7 @@ async fn test_next_batch_at_stream_end() {
 }
 
 #[tokio::test]
-async fn test_next_batch_returns_terminal_error() {
+async fn next_batch_returns_terminal_error() {
     let (mut sub, _keep) = collect_subscription(vec![int_frame(10), RoutedItem::Error(Error::ConnectionReset)], true);
 
     assert!(matches!(sub.next_batch(Duration::from_secs(30)).await, Some(Err(Error::ConnectionReset))));
@@ -1056,8 +1188,13 @@ fn drain_fixture() -> Fixture<CancellableEndItem> {
     subscription_with::<CancellableEndItem>(Some(123), None, DecoderContext::default())
 }
 
+/// [`drain_fixture`] over `bus`.
+fn drain_fixture_on(bus: MessageBusStub) -> Fixture<CancellableEndItem> {
+    subscription_on(bus, 100, Some(123), None, DecoderContext::default())
+}
+
 #[tokio::test]
-async fn test_drain_after_end_writes_nothing() {
+async fn drain_after_end_writes_nothing() {
     let mut f = drain_fixture();
     f.tx.send(int_frame(1)).unwrap();
     f.tx.send(int_frame(-1)).unwrap();
@@ -1069,7 +1206,7 @@ async fn test_drain_after_end_writes_nothing() {
 }
 
 #[tokio::test]
-async fn test_drain_cancels_then_sees_end() {
+async fn drain_cancels_then_sees_end() {
     let f = drain_fixture();
     f.tx.send(int_frame(1)).unwrap();
     f.tx.send(int_frame(-1)).unwrap();
@@ -1080,7 +1217,7 @@ async fn test_drain_cancels_then_sees_end() {
 }
 
 #[tokio::test]
-async fn test_drain_after_collect_timeout() {
+async fn drain_after_collect_timeout() {
     // `collect_to_end_within` borrows, so a timeout can chain into the drain.
     let mut f = drain_fixture();
     f.tx.send(int_frame(1)).unwrap();
@@ -1096,7 +1233,7 @@ async fn test_drain_after_collect_timeout() {
 }
 
 #[tokio::test]
-async fn test_drain_reports_tws_error() {
+async fn drain_reports_tws_error() {
     let f = drain_fixture();
     f.tx.send(RoutedItem::Error(Error::Notice(crate::messages::Notice::synthesized(
         200,
@@ -1111,7 +1248,7 @@ async fn test_drain_reports_tws_error() {
 }
 
 #[tokio::test]
-async fn test_drain_deadline_is_unconfirmed() {
+async fn drain_deadline_is_unconfirmed() {
     let f = drain_fixture();
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
@@ -1121,7 +1258,7 @@ async fn test_drain_deadline_is_unconfirmed() {
 }
 
 #[tokio::test]
-async fn test_drain_after_error_is_unconfirmed_and_cancels_on_drop() {
+async fn drain_after_error_is_unconfirmed_and_writes_cancel() {
     let mut f = drain_fixture();
     f.tx.send(RoutedItem::Error(Error::BufferLimitExceeded { limit: 1 })).unwrap();
     assert!(matches!(f.subscription.next().await, Some(Err(Error::BufferLimitExceeded { .. }))));
@@ -1130,11 +1267,81 @@ async fn test_drain_after_error_is_unconfirmed_and_cancels_on_drop() {
     assert_eq!(f.subscription.cancel_and_drain(drain_deadline()).await.unwrap(), Drained::Unconfirmed);
     assert!(started.elapsed() < Duration::from_secs(1), "no wait for evidence that can't arrive");
     settle().await;
-    assert_eq!(f.bus.request_messages(), vec![cancel_frame()], "the drop writes the cancel");
+    assert_eq!(f.bus.request_messages(), vec![cancel_frame()], "one cancel, not repeated on drop");
 }
 
 #[tokio::test]
-async fn test_drain_session_error_is_err() {
+async fn drain_returns_cancel_write_error() {
+    let f = drain_fixture_on(MessageBusStub::default().with_failing_sends());
+
+    assert!(matches!(
+        f.subscription.cancel_and_drain(drain_deadline()).await,
+        Err(Error::ConnectionReset)
+    ));
+    settle().await;
+    assert_eq!(f.bus.request_messages().len(), 1, "no second write on drop");
+}
+
+/// A local error doesn't end the request at TWS: the cancel is still due, and
+/// its failure reaches the caller rather than the drop's log.
+#[tokio::test]
+async fn drain_after_error_returns_cancel_write_error() {
+    let mut f = drain_fixture_on(MessageBusStub::default().with_failing_sends());
+    f.tx.send(RoutedItem::Error(Error::BufferLimitExceeded { limit: 1 })).unwrap();
+    assert!(matches!(f.subscription.next().await, Some(Err(Error::BufferLimitExceeded { .. }))));
+
+    assert!(matches!(
+        f.subscription.cancel_and_drain(drain_deadline()).await,
+        Err(Error::ConnectionReset)
+    ));
+    settle().await;
+    assert_eq!(f.bus.request_messages().len(), 1, "no second write on drop");
+}
+
+/// The deadline bounds a stuck cancel write too.
+#[tokio::test]
+async fn drain_deadline_bounds_cancel_write() {
+    let f = drain_fixture_on(MessageBusStub::default().with_stalled_sends());
+
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    assert_eq!(f.subscription.cancel_and_drain(deadline).await.unwrap(), Drained::Unconfirmed);
+    assert!(started.elapsed() < Duration::from_secs(1), "no wait past the deadline");
+    settle().await;
+    assert_eq!(f.bus.request_messages().len(), 1, "no second write on drop");
+}
+
+/// A rejection read before the drain is still TWS's answer; the decoder
+/// doesn't opt into `rejection_ends_request`, so the cancel is written.
+#[tokio::test]
+async fn drain_after_read_rejection_is_rejected() {
+    let mut f = drain_fixture();
+    let notice = crate::messages::Notice::synthesized(200, "No security definition".to_string());
+    f.tx.send(RoutedItem::Error(Error::Notice(notice.clone()))).unwrap();
+    assert!(matches!(f.subscription.next().await, Some(Err(Error::Notice(_)))));
+
+    assert_eq!(
+        f.subscription.cancel_and_drain(drain_deadline()).await.unwrap(),
+        Drained::Rejected(notice)
+    );
+    settle().await;
+    assert_eq!(f.bus.request_messages(), vec![cancel_frame()], "one cancel, not repeated on drop");
+}
+
+/// Without a request id the error may be a request-less one fanned out to
+/// every shared stream, so it isn't recorded as this request's rejection.
+#[tokio::test]
+async fn drain_after_error_without_request_id_is_unconfirmed() {
+    let mut f = subscription_with::<CancellableEndItem>(None, None, DecoderContext::default());
+    let notice = crate::messages::Notice::synthesized(200, "No security definition".to_string());
+    f.tx.send(RoutedItem::Error(Error::Notice(notice))).unwrap();
+    assert!(matches!(f.subscription.next().await, Some(Err(Error::Notice(_)))));
+
+    assert_eq!(f.subscription.cancel_and_drain(drain_deadline()).await.unwrap(), Drained::Unconfirmed);
+}
+
+#[tokio::test]
+async fn drain_session_error_is_err() {
     let f = drain_fixture();
     f.tx.send(RoutedItem::Error(Error::ConnectionReset)).unwrap();
 
@@ -1145,7 +1352,7 @@ async fn test_drain_session_error_is_err() {
 }
 
 #[tokio::test]
-async fn test_drain_closed_channel_is_unconfirmed() {
+async fn drain_closed_channel_is_unconfirmed() {
     let f = drain_fixture();
     drop(f.tx);
 
@@ -1153,7 +1360,7 @@ async fn test_drain_closed_channel_is_unconfirmed() {
 }
 
 #[tokio::test]
-async fn test_drain_future_dropped_mid_wait_cancels_once() {
+async fn drain_future_dropped_mid_wait_cancels_once() {
     let f = drain_fixture();
 
     let far = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -1165,7 +1372,7 @@ async fn test_drain_future_dropped_mid_wait_cancels_once() {
 }
 
 #[tokio::test]
-async fn test_drain_on_one_clone_leaves_others_reading() {
+async fn drain_on_one_clone_leaves_others_reading() {
     let f = drain_fixture();
     let mut other = f.subscription.clone();
     f.tx.send(int_frame(1)).unwrap();
@@ -1181,7 +1388,7 @@ async fn test_drain_on_one_clone_leaves_others_reading() {
 }
 
 #[tokio::test]
-async fn test_drain_after_snapshot_end_writes_nothing() {
+async fn drain_after_snapshot_end_writes_nothing() {
     let mut f = subscription_with::<CancellableSnapshotItem>(Some(123), None, DecoderContext::default());
     f.tx.send(int_frame(-1)).unwrap();
     assert!(matches!(
@@ -1196,8 +1403,39 @@ async fn test_drain_after_snapshot_end_writes_nothing() {
     assert!(f.bus.request_messages().is_empty());
 }
 
+/// A snapshot end queued before the drain, but unread, settles it.
 #[tokio::test]
-async fn test_drain_without_request_id_returns_unconfirmed() {
+async fn drain_sees_queued_snapshot_end() {
+    let f = subscription_with::<CancellableSnapshotItem>(Some(123), None, DecoderContext::default());
+    f.tx.send(int_frame(1)).unwrap();
+    f.tx.send(int_frame(-1)).unwrap();
+
+    let started = std::time::Instant::now();
+    assert_eq!(f.subscription.cancel_and_drain(drain_deadline()).await.unwrap(), Drained::Ended);
+    assert!(started.elapsed() < Duration::from_secs(1), "no wait past the snapshot end");
+    settle().await;
+    assert_eq!(f.bus.request_messages(), vec![cancel_frame()], "one cancel, not repeated on drop");
+}
+
+/// A snapshot end arriving after the cancel settles the drain.
+#[tokio::test]
+async fn drain_sees_snapshot_end_after_cancel() {
+    let f = subscription_with::<CancellableSnapshotItem>(Some(123), None, DecoderContext::default());
+    let tx = f.tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(int_frame(-1)).unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    assert_eq!(f.subscription.cancel_and_drain(drain_deadline()).await.unwrap(), Drained::Ended);
+    assert!(started.elapsed() < Duration::from_secs(1), "no wait past the snapshot end");
+    settle().await;
+    assert_eq!(f.bus.request_messages(), vec![cancel_frame()], "one cancel, not repeated on drop");
+}
+
+#[tokio::test]
+async fn drain_without_request_id_returns_unconfirmed() {
     let f = subscription_with::<CancellableEndItem>(None, None, DecoderContext::default());
 
     assert_eq!(f.subscription.cancel_and_drain(drain_deadline()).await.unwrap(), Drained::Unconfirmed);

@@ -25,7 +25,7 @@ pub(crate) trait ProtoPayload: prost::Message + Default {
     const MESSAGE_ID: IncomingMessages;
 }
 
-/// One impl per payload. Twenty-five identical shapes with nothing but the two
+/// One impl per payload. Twenty-seven identical shapes with nothing but the two
 /// names varying is the case [macros last resort](../../docs/rules/style/macros-last-resort.md)
 /// allows — and unlike the roster it replaces, a line here is *load-bearing*:
 /// `expect_proto` will not compile for a payload that lacks one.
@@ -40,12 +40,13 @@ macro_rules! impl_proto_payload {
 }
 
 // Left: the generated `prost` type. Right: the wire message it arrives under.
-// Most read as the same name twice; the three that do not are real — TWS
+// Most read as the same name twice; the four that do not are real — TWS
 // abbreviates the message where the `.proto` file spells it out.
 impl_proto_payload! {
     ConfigResponse => ConfigResponse,
     CurrentTime => CurrentTime,
     CurrentTimeInMillis => CurrentTimeInMillis,
+    DisplayGroupList => DisplayGroupList,
     FamilyCodes => FamilyCodes,
     HeadTimestamp => HeadTimestamp,
     HistogramData => HistogramData,
@@ -62,6 +63,7 @@ impl_proto_payload! {
     SmartComponents => SmartComponents,
     SoftDollarTiers => SoftDollarTier,
     SymbolSamples => SymbolSamples,
+    TickOptionComputation => TickOptionComputation,
     UpdateConfigResponse => UpdateConfigResponse,
     UserInfo => UserInfo,
     VerifyCompleted => VerifyCompleted,

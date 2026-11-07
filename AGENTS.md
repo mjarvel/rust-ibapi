@@ -16,9 +16,9 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## Quick Start
 
-The rust-ibapi crate is a Rust implementation of the Interactive Brokers TWS API with both synchronous and asynchronous support.
+rust-ibapi is an unofficial Rust client for the IBKR TWS API, with async and blocking clients.
 
-**Important:** The async client is enabled by default. You can opt into the blocking client with `--features sync`, and the two features may be combined:
+The async client is on by default; features are additive:
 - `cargo build` (default features) exposes the async client as `client::Client`
 - `cargo build --no-default-features --features sync` enables only the blocking client
 - `cargo build --no-default-features --features "sync async"` enables both; the blocking API lives under `client::blocking::Client`
@@ -42,24 +42,24 @@ The rust-ibapi crate is a Rust implementation of the Interactive Brokers TWS API
 - [**Testing Patterns**](docs/testing-patterns.md) - Test fixture stratification: `MessageBusStub` / `MemoryStream` / handshake-replay listener
 - [**Integration Tests**](docs/integration-tests.md) - Writing tests against a live gateway
 - [**Extending the API**](docs/extending-api.md) - Adding new TWS API functionality
+- [**Wire Facts**](docs/wire-facts/README.md) - Live-verified TWS behavior: what the gateway sends, accepts and rejects
 - [**Blocked Issues**](docs/block-issues.md) - Work waiting on a gateway capture or paper-account setup
 
-## Version 3.0 Philosophy
+## Versioning and branches
 
-Version 3.0 is a breaking release. Fix API inconsistencies even when it means breaking changes — consistent naming, idiomatic Rust patterns, and a clean public API take priority over backward compatibility.
+- **`main`** — 6.0 development (`6.0.0-dev`), the only maintained branch. 5.6.0 was the
+  last 5.x release from `main`. Breaking changes (consistent naming, idiomatic API, cleanup;
+  see the 6.0 milestone) land here, each with its section in `docs/migration-6.0.md`.
+  `docs/migration-5.0.md` is frozen.
+- **`v2-stable`** — frozen. Touch it only to backport a specific named bug on explicit request.
 
-## Branches
-
-- **`main`** — 3.x development and releases. **This is the only actively maintained branch.**
-- **`v2-stable`** — 2.x maintenance, frozen. Only touch it when a **specific bug** must be backported there, and only when explicitly asked.
-
-Default all work — features and fixes — to `main` alone. Do **not** open v2-stable PRs by default; only backport a specific named bug on explicit request. Changes to either branch go through pull requests.
+All changes go through pull requests.
 
 ## Rule index
 
 Detail lives in [`docs/rules/`](docs/rules/README.md), one directive per file. Follow the
 link when the situation matches — the node carries the mechanics, the bug class, and the
-precedents. Every rule now lives in a node; nothing is inline.
+precedents.
 
 ### Wire protocol — protobuf-only at `server_versions::PROTOBUF_REST_MESSAGES_3` (213)
 
@@ -67,6 +67,12 @@ precedents. Every rule now lives in a node; nothing is inline.
 - **Adding a `ResponseMessage` accessor, or a public API on a proto inbound message type** →
   [proto-aware accessors](docs/rules/wire/proto-aware-accessors.md)
 - **Typing a `String` field as an enum** → [wire enum typing](docs/rules/wire/enum-typing.md)
+- **Parsing or formatting a date/time, or adding a request option that changes TWS's date
+  rendering** → [timezone-free timestamps](docs/rules/wire/timezone-free-timestamps.md): send
+  UTC in a fixed format and parse zone-free forms (epoch, `YYYYMMDD`, explicit UTC). Pass
+  zoned text through as a `String`, and never resolve a zone or assume one
+- **Fixtures and C# don't settle what TWS sends or accepts** (a rejection code, an absent-field
+  default, units) → the `/live-probe` skill ([`.claude/skills/live-probe`](.claude/skills/live-probe/SKILL.md))
 - **Accepting an order id, minting a request id, or routing by an inbound id** →
   [id partition](docs/rules/wire/id-partition.md)
 - **Adding a one-shot client method, or passing a processor to a `one_shot_*` helper** →
@@ -76,8 +82,10 @@ precedents. Every rule now lives in a node; nothing is inline.
 ### Code structure and style
 
 - **Adding a client method, or creating a domain module** →
-  [domain module layout](docs/rules/style/domain-module-layout.md)
-- **Writing a function that takes four or more parameters** →
+  [domain module layout](docs/rules/style/domain-module-layout.md); porting a request or field
+  from the C# client end to end is the `/add-tws-feature` skill
+  ([`.claude/skills/add-tws-feature`](.claude/skills/add-tws-feature/SKILL.md))
+- **Writing a public function that takes four or more parameters** →
   [param budget](docs/rules/style/param-budget.md) — clippy's `too_many_arguments` only fires
   at eight, so nothing gates this
 - **Exposing one or two items from an otherwise-private module** →
@@ -91,7 +99,8 @@ precedents. Every rule now lives in a node; nothing is inline.
 ### Testing
 
 - **Adding a `pub` / `pub(crate)` fn, or checking coverage before opening a PR** →
-  [coverage floor](docs/rules/testing/coverage-floor.md)
+  [coverage floor](docs/rules/testing/coverage-floor.md); measuring or raising it is the `/coverage`
+  skill ([`.claude/skills/coverage`](.claude/skills/coverage/SKILL.md))
 - **Reviewing a new test, or asserting on captured request bytes** →
   [exercise production code](docs/rules/testing/exercise-production-code.md)
 - **Building a response test fixture** → [fixture builders](docs/rules/testing/fixture-builders.md)
@@ -104,7 +113,7 @@ precedents. Every rule now lives in a node; nothing is inline.
 
 - **Touching feature-gated code, or adding a `lib.rs` doctest** →
   [feature matrix](docs/rules/parity/feature-matrix.md) — note `--features sync` is *not* the
-  sync-only build, and no PR gate covers sync-only
+  sync-only build; CI's `sync` leg passes `--no-default-features`
 - **Reaching for `block_on`, or needing a lock inside an `async fn`** →
   [no block_on](docs/rules/parity/no-block-on.md)
 - **Adding a public type with distinct sync/async impls** →
@@ -118,14 +127,18 @@ precedents. Every rule now lives in a node; nothing is inline.
 
 - **Working in this fork or updating upstream** → [local fork checkout routing](docs/rules/workflow/local-fork-workflow.md) — shared branch rules and frozen consumer pins
 
-
-- **About to commit or open a PR** → [pre-PR checks](docs/rules/workflow/pre-pr-checks.md) —
-  the rustdoc trio is a local-only gate; CI does not fail on broken intra-doc links
+- **About to commit, open, or merge a PR** → [pre-PR checks](docs/rules/workflow/pre-pr-checks.md) —
+  the integration crate builds are the one local-only gate; CI covers the rest. The full flow
+  through merge (stacked and fork PRs, CI quirks, merge strategy) is the `/ship` skill
+  ([`.claude/skills/ship`](.claude/skills/ship/SKILL.md))
+- **Reviewing a PR, or about to report a bug, motivation or precedent from reading code** →
+  [review claims](docs/rules/workflow/review-claims.md): trace it to a production constructor
+  or check it live first. Fixtures reach states production can't
 - **Touching `Subscription`, a proto encoder/decoder, or any public API shape** →
   [integration crate builds](docs/rules/workflow/integration-crate-builds.md) — those crates are
   outside `default-members`, so every automated gate skips them
-- **Editing a module that still carries old idioms** →
-  [modernize touched modules](docs/rules/workflow/modernize-touched-modules.md)
+- **Editing a module that still carries old idioms, or a feature needs a shared helper's
+  signature changed** → [modernize touched modules](docs/rules/workflow/modernize-touched-modules.md)
 - **Adding `#[non_exhaustive]` / `#[must_use]`, removing a `pub` field, or narrowing to
   `pub(crate)`** → [restrict after callers](docs/rules/workflow/restrict-after-callers.md)
 - **A clippy lint fires locally but not in CI, or you are upgrading Rust** →
@@ -144,24 +157,26 @@ precedents. Every rule now lives in a node; nothing is inline.
 - **Opening a PR that changes public behavior** →
   [changelog entry](docs/rules/docs/changelog-entry.md) — same PR, under `## [Unreleased]`
 - **Removing or renaming anything public** →
-  [user docs sync](docs/rules/docs/user-docs-sync.md) — `README.md` and `docs/migration-5.0.md`
-  ship with the change; their fenced Rust snippets are compiled by nothing
-- **Drafting GitHub release notes** → [release notes](docs/rules/docs/release-notes.md)
+  [user docs sync](docs/rules/docs/user-docs-sync.md) — `README.md` and the next major's
+  migration guide ship with the change; their fenced Rust snippets are compiled by nothing
+- **A multi-PR arc concludes** (floor reached, major version, sweep finished) →
+  [end-of-arc sweep](docs/rules/docs/user-docs-sync.md#at-the-end-of-an-arc) — one docs-only PR
+  over `AGENTS.md`, `docs/rules/`, `README.md` and `docs/`
+- **Cutting a release or drafting release notes** → the `/release` skill
+  ([`.claude/skills/release`](.claude/skills/release/SKILL.md))
 - **Establishing, changing, or retiring a project convention** →
   [maintaining the rule graph](#maintaining-the-rule-graph), below
 
-Rule numbers are retired. All 27 are nodes now, addressed by name; a "rule N" citation found in
-an old comment, plan, or memory has to be resolved against the `CLAUDE.md` of its own date, not
-against this file — the numbering shifted at least once while it was in use. The mapping as of
-the final numbered revision is in
+Rule numbers are retired; resolve an old "rule N" citation via
 [retired rule numbers](docs/rules/README.md#retired-rule-numbers).
 
 ## Maintaining the rule graph
 
 Nodes ship in the PR that makes their claim true, not afterwards. Mechanics — frontmatter,
 trigger phrasing, clusters, `status` — are in the [rules README](docs/rules/README.md). These
-have to fire without opening it, because **`just rules-check` validates structure only** (links,
-ids, `related`, no `@`-imports, no `file.rs:NNN`) and cannot tell whether a node is still true.
+have to fire without opening it, because **`just rules-check` validates structure only** (the
+checks are listed in the header of `tools/check-rules-graph.sh`) and cannot tell whether a node
+is still true.
 
 - **Establishing, changing, or retiring a convention** → it gets a node and one index line
   above, or it is not a convention. Changed: rewrite the directive, extend `precedents`.
@@ -200,8 +215,7 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features --features sync -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Rustdoc intra-doc links — local-only gate; `cargo test --doc` misses these
-# and CI's `cargo doc` runs without RUSTDOCFLAGS.
+# Rustdoc intra-doc links — `cargo test --doc` misses these (CI also runs them).
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features sync
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
@@ -212,6 +226,7 @@ just test
 # Examples are a caller surface `just test` never compiles
 cargo build --examples
 cargo build --examples --no-default-features --features sync
+cargo build --examples --all-features
 ```
 
 Situational — run when the change touches the matching surface:
@@ -221,6 +236,8 @@ Situational — run when the change touches the matching surface:
 # other gate skips them. See docs/rules/workflow/integration-crate-builds.md.
 cargo build -p ibapi-integration-sync  --tests
 cargo build -p ibapi-integration-async --tests
+cargo clippy -p ibapi-integration-sync  --tests -- -D warnings
+cargo clippy -p ibapi-integration-async --tests -- -D warnings
 
 # AGENTS.md or docs/rules/ — validates the rule graph and its index
 just rules-check
@@ -254,9 +271,7 @@ IBAPI_RAW_CAPTURE_DIR=/tmp/tws-raw cargo run --example <example_name>
 
 ## Git Commit Guidelines
 
-- DO NOT include "Generated with Claude Code" or similar attribution in commit messages
-- Keep commit messages focused on the technical changes and their purpose
-- Choose the merge strategy by what the branch holds:
-  - **Merge commit** (`gh pr merge N --merge`) for stacked PRs (a squashed parent leaves the child with duplicate commits) and for multi-commit branches whose commits form one change (revert with `-m 1`, bisect with `--first-parent` as a unit); every commit must build
-  - **Rebase** (`gh pr merge N --rebase`) for multi-commit branches of independent small changes (no commit depends on another), with no PR stacked on top (rebase rewrites SHAs, so a child would carry duplicates); linear history, no merge bubble
-  - **Squash** (`gh pr merge N --squash`) for single-commit PRs (no merge bubble), fork PRs, and branches carrying fixup, review-response or merge-from-main commits; pass `--body-file` summarizing the final design when the branch holds an abandoned approach
+- No "Generated with Claude Code" or similar attribution in commits or PRs
+- Messages describe the technical change and its purpose
+- Merge strategy follows what the branch holds; the table and the stacked-PR order are in the
+  `/ship` skill ([`.claude/skills/ship`](.claude/skills/ship/SKILL.md))

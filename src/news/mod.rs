@@ -17,6 +17,10 @@ mod sync;
 #[cfg(feature = "async")]
 mod r#async;
 
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
+
 // Public types - always available regardless of feature flags
 
 /// News provider information including code and name.
@@ -35,25 +39,41 @@ pub struct NewsProvider {
 pub struct NewsBulletin {
     /// The unique identifier of the news bulletin.
     pub message_id: i32,
-    /// The type of the news bulletin.
-    ///
-    /// Valid values are:
-    /// - `1` - Regular news bulletin
-    /// - `2` - Exchange no longer available for trading
-    /// - `3` - Exchange is available for trading
-    pub message_type: i32,
+    /// The bulletin's type.
+    pub message_type: BulletinType,
     /// The text of the news bulletin.
     pub message: String,
     /// The exchange from which this news bulletin originated.
     pub exchange: String,
 }
 
+/// The type of a [`NewsBulletin`].
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BulletinType {
+    /// Regular news bulletin. Wire code `1`.
+    Regular,
+    /// Exchange no longer available for trading. Wire code `2`.
+    ExchangeUnavailable,
+    /// Exchange available for trading. Wire code `3`.
+    ExchangeAvailable,
+    /// Bulletin type code not modeled by this version of the API. `Unknown(0)` when TWS omits the field.
+    Unknown(i32),
+}
+
+impl_wire_code!(BulletinType {
+    Regular = 1,
+    ExchangeUnavailable = 2,
+    ExchangeAvailable = 3,
+});
+
 /// Returns news headlines for requested contracts.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NewsArticle {
-    /// The article's published time.
-    pub time: OffsetDateTime,
+    /// The article's published time, in UTC. `None` when TWS sends no time, or one this
+    /// client can't parse (logged as a warning).
+    pub time: Option<OffsetDateTime>,
     /// The provider code for the news article.
     pub provider_code: String,
     /// Identifier used to track the particular article.
@@ -73,16 +93,6 @@ pub enum ArticleType {
     Text = 0,
     /// binary data / pdf
     Binary = 1,
-}
-
-impl From<i32> for ArticleType {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => ArticleType::Text,
-            1 => ArticleType::Binary,
-            _ => ArticleType::Text,
-        }
-    }
 }
 
 /// News article body containing the full article content.

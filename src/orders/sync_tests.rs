@@ -11,15 +11,16 @@ use crate::proto;
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
 use crate::testdata::builders::orders::{
-    all_open_orders_request, auto_open_orders_request, cancel_order_request, commission_report, completed_order, completed_orders_end,
-    completed_orders_request, execution_data, execution_data_end, executions_request, global_cancel_request, next_valid_order_id_request, open_order,
-    open_order_end, open_orders_request, order_bound, order_status, place_order_request, CancelOrderRequestBuilder,
+    all_open_orders_request, auto_open_orders_request, cancel_order_request, commission_and_fees_report, completed_order, completed_orders_end,
+    completed_orders_request, execution_data, execution_data_end, executions_request, global_cancel_request, next_valid_id,
+    next_valid_order_id_request, open_order, open_order_end, open_orders_request, order_bound, order_status, place_order_request,
+    CancelOrderRequestBuilder,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
 
 use super::*;
 use crate::client::ids::{OrderId, REQUEST_ID_FLOOR};
-use crate::orders::builder::{BracketPrices, TrailBy};
+use crate::orders::builder::{BracketPrices, TrailBy, ValidationError};
 use crate::orders::common::order_builder;
 
 #[test]
@@ -46,7 +47,7 @@ fn place_order() {
                 .encode_proto(),
         ),
         proto_response(IncomingMessages::OpenOrder, open_order().status(OrderStatusKind::Filled).encode_proto()),
-        proto_response(IncomingMessages::CommissionsReport, commission_report().encode_proto()),
+        proto_response(IncomingMessages::CommissionsAndFeesReport, commission_and_fees_report().encode_proto()),
     ]));
 
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
@@ -125,9 +126,9 @@ fn place_order() {
         "message[5] expected an open order notification"
     );
 
-    if let Some(Ok(PlaceOrder::CommissionReport(report))) = notifications.next_data() {
+    if let Some(Ok(PlaceOrder::CommissionAndFeesReport(report))) = notifications.next_data() {
         assert_eq!(report.execution_id, "00025b46.63f8f39c.01.01", "report.execution_id");
-        assert_eq!(report.commission, 1.0, "report.commission");
+        assert_eq!(report.commission_and_fees, 1.0, "report.commission_and_fees");
         assert_eq!(report.currency, "USD", "report.currency");
     } else {
         assert!(false, "message[6] expected a commission report notification");
@@ -153,31 +154,12 @@ fn place_order_encodes_hedge_max_size() {
     assert_eq!(proto_order.hedge_max_size, Some(500));
 }
 
-// Placing an order with hedge_max_size against a server below the gate is rejected
-// before anything is sent (docs/rules/testing/exercise-production-code.md — real verify path).
-#[test]
-fn place_order_rejects_hedge_max_size_below_gate() {
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
-    let client = Client::stubbed(message_bus.clone(), server_versions::HEDGE_MAX_SIZE - 1);
-
-    let contract = Contract::stock("TSLA").build();
-    let mut order = order_builder::market_order(Action::Buy, 100.0);
-    order.hedge_max_size = Some(500);
-
-    match client.place_order(20, &contract, &order) {
-        Err(Error::ServerVersion(required, _, _)) => assert_eq!(required, server_versions::HEDGE_MAX_SIZE),
-        Err(other) => panic!("expected ServerVersion error, got {other:?}"),
-        Ok(_) => panic!("expected place_order to be rejected below the hedge_max_size gate"),
-    }
-    assert_eq!(request_message_count(&message_bus), 0);
-}
-
 // Each flag is rejected below its gate before anything is sent, and sent at it.
 #[test]
-fn place_order_gates_additional_order_params() {
-    use crate::orders::common::test_tables::ADDITIONAL_PARAM_GATES;
+fn place_order_gates_order_params() {
+    use crate::orders::common::test_tables::ORDER_PARAM_GATES;
 
-    for gate in ADDITIONAL_PARAM_GATES {
+    for gate in ORDER_PARAM_GATES {
         let name = gate.name;
         let contract = Contract::stock("TSLA").build();
         let mut order = order_builder::market_order(Action::Buy, 100.0);
@@ -317,10 +299,9 @@ fn global_cancel_cme_tagging() {
 
 #[test]
 fn next_valid_order_id() {
-    let next_valid_id_proto = crate::proto::NextValidId { order_id: Some(43) };
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::NextValidId,
-        prost::Message::encode_to_vec(&next_valid_id_proto),
+        next_valid_id().order_id(43).encode_proto(),
     )]));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -339,7 +320,7 @@ fn next_valid_order_id() {
 fn next_valid_order_id_below_allocated_mark_does_not_rewind() {
     let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![proto_response(
         IncomingMessages::NextValidId,
-        prost::Message::encode_to_vec(&crate::proto::NextValidId { order_id: Some(5) }),
+        next_valid_id().order_id(5).encode_proto(),
     )]);
 
     let allocated = client.next_order_id();
@@ -375,7 +356,7 @@ fn completed_orders() {
         assert_eq!(order_data.contract.symbol, Symbol::from("AAPL"), "contract.symbol");
         assert_eq!(order_data.contract.security_type, SecurityType::Stock, "contract.security_type");
         assert_eq!(order_data.order.action, Action::Buy, "order.action");
-        assert_eq!(order_data.order.total_quantity, 100.0, "order.total_quantity");
+        assert_eq!(order_data.order.total_quantity, 0.0, "order.total_quantity");
         assert_eq!(order_data.order.trail_stop_price, Some(150.25), "order.trail_stop_price");
         assert_eq!(
             order_data.order.shareholder, "Not an insider or substantial shareholder",
@@ -403,7 +384,8 @@ fn open_orders() {
     let results = client.open_orders();
 
     assert_request(&message_bus, 0, &open_orders_request());
-    assert!(results.is_ok(), "failed to request open orders: {}", results.err().unwrap());
+    let subscription = results.expect("open_orders");
+    assert!(subscription.next().is_none(), "OpenOrderEnd alone must end the stream with no orders");
 }
 
 #[test]
@@ -417,7 +399,8 @@ fn all_open_orders() {
     let results = client.all_open_orders();
 
     assert_request(&message_bus, 0, &all_open_orders_request());
-    assert!(results.is_ok(), "failed to request all open orders: {}", results.err().unwrap());
+    let subscription = results.expect("all_open_orders");
+    assert!(subscription.next().is_none(), "OpenOrderEnd alone must end the stream with no orders");
 }
 
 #[test]
@@ -432,7 +415,9 @@ fn auto_open_orders() {
     let results = client.auto_open_orders(api_only);
 
     assert_request(&message_bus, 0, &auto_open_orders_request().auto_bind(api_only));
-    assert!(results.is_ok(), "failed to request auto open orders: {}", results.err().unwrap());
+    let subscription = results.expect("auto_open_orders");
+    // OpenOrderEnd is terminal for auto_open_orders too: the stream ends rather than waiting for binds.
+    assert!(subscription.next().is_none(), "OpenOrderEnd alone must end the stream with no orders");
 }
 
 #[test]
@@ -473,7 +458,11 @@ fn executions() {
             .filter(expected_filter),
     );
 
-    assert!(results.is_ok(), "failed to request executions: {}", results.err().unwrap());
+    let subscription = results.expect("executions");
+    assert!(
+        subscription.next().is_none(),
+        "ExecutionDataEnd alone must end the stream with no executions"
+    );
 }
 
 #[test]
@@ -633,8 +622,8 @@ fn order_update_stream() {
             IncomingMessages::OrderStatus,
             order_status().status(OrderStatusKind::PreSubmitted).remaining(100.0).encode_proto(),
         ),
-        proto_response(IncomingMessages::ExecutionData, execution_data().encode_proto()),
-        proto_response(IncomingMessages::CommissionsReport, commission_report().encode_proto()),
+        proto_response(IncomingMessages::ExecutionData, execution_data().option_exercise_type(102).encode_proto()),
+        proto_response(IncomingMessages::CommissionsAndFeesReport, commission_and_fees_report().encode_proto()),
     ]));
 
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
@@ -668,13 +657,18 @@ fn order_update_stream() {
         assert_eq!(exec_data.execution.shares, 100.0, "execution.shares");
         assert_eq!(exec_data.execution.price, 196.52, "execution.price");
         assert_eq!(exec_data.execution.side, ExecutionSide::Bought, "execution.side");
+        assert_eq!(
+            exec_data.execution.option_exercise_type,
+            crate::orders::OptionExerciseType::Expired,
+            "execution.option_exercise_type"
+        );
     } else {
         assert!(false, "expected execution data notification");
     }
 
-    if let Some(Ok(OrderUpdate::CommissionReport(report))) = notifications.next_data() {
+    if let Some(Ok(OrderUpdate::CommissionAndFeesReport(report))) = notifications.next_data() {
         assert_eq!(report.execution_id, "00025b46.63f8f39c.01.01", "report.execution_id");
-        assert_eq!(report.commission, 1.0, "report.commission");
+        assert_eq!(report.commission_and_fees, 1.0, "report.commission_and_fees");
         assert_eq!(report.currency, "USD", "report.currency");
     } else {
         assert!(false, "expected commission report notification");
@@ -969,7 +963,10 @@ fn submit_rejects_an_invalid_order_before_sending() {
         .market()
         .submit()
         .expect_err("a negative quantity is invalid");
-    assert!(err.to_string().contains("Invalid quantity"), "got {err}");
+    assert!(
+        matches!(err, Error::Validation(ValidationError::InvalidQuantity(q)) if q == -100.0),
+        "got {err:?}"
+    );
     assert_eq!(request_message_count(&bus), 0, "an invalid order must not reach the wire");
 }
 
@@ -1202,6 +1199,8 @@ fn order_entry_points_reject_request_range_ids() {
     rejected(client.place_order(1, &contract, &with_parent).map(|_| ()), "place_order parent_id");
     rejected(client.submit_order(floor, &contract, &order), "submit_order");
     rejected(client.cancel_order(floor, "").map(|_| ()), "cancel_order");
+    rejected(client.order_status_stream(floor).map(|_| ()), "order_status_stream");
+    rejected(client.wait_for_fill(floor, std::time::Duration::ZERO).map(|_| ()), "wait_for_fill");
 
     client.raise_next_order_id(OrderId::from(floor));
     rejected(client.exercise_options(&contract).exercise(1).submit().map(|_| ()), "exercise_options");
@@ -1215,9 +1214,7 @@ fn order_entry_points_reject_request_range_ids() {
 fn next_valid_order_id_rejects_request_range() {
     let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![proto_response(
         IncomingMessages::NextValidId,
-        prost::Message::encode_to_vec(&crate::proto::NextValidId {
-            order_id: Some(REQUEST_ID_FLOOR),
-        }),
+        next_valid_id().order_id(REQUEST_ID_FLOOR).encode_proto(),
     )]);
 
     let result = client.next_valid_order_id();

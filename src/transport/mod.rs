@@ -286,10 +286,18 @@ pub(crate) trait MessageBus: Send + Sync {
     fn ensure_shutdown(&self);
 
     /// Block until the session is connected again, returning
-    /// [`Error::Shutdown`] if the session will never reconnect.
-    fn wait_connected(&self) -> Result<(), Error>;
+    /// [`Error::ConnectionFailed`] if the reconnect gave up,
+    /// [`Error::Shutdown`] after a shutdown, or [`Error::Timeout`] if
+    /// `deadline` passes first.
+    fn wait_connected(&self, deadline: Option<std::time::Instant>) -> Result<(), Error>;
 
     fn is_connected(&self) -> bool;
+
+    /// Counts sessions: 0 at connect, bumped each time a reconnect resets
+    /// the bus. A subscription compares it with the generation its request
+    /// was sent in: once they differ, the request died with an earlier
+    /// session and a cancel would name an id the current session never saw.
+    fn session_generation(&self) -> u64;
 }
 
 // InternalSubscription - handles receiving messages for sync subscriptions
@@ -303,6 +311,7 @@ pub(crate) struct InternalSubscription {
     pub(crate) request_id: Option<RequestId>, // initiating request id
     pub(crate) order_id: Option<OrderId>,     // initiating order id
     pub(crate) shared: Option<SharedTicket>,  // shared-channel identity, when routed by message type
+    pub(crate) session: u64,                  // bus session generation the request was sent in
     order_status: Option<OrderId>,            // the order a status stream follows
 }
 
@@ -469,6 +478,7 @@ pub(crate) struct SubscriptionBuilder {
     order_id: Option<OrderId>,
     request_id: Option<RequestId>,
     shared: Option<SharedTicket>,
+    session: u64,
     order_status: Option<OrderId>,
 }
 
@@ -483,6 +493,7 @@ impl SubscriptionBuilder {
             order_id: None,
             request_id: None,
             shared: None,
+            session: 0,
             order_status: None,
         }
     }
@@ -522,6 +533,13 @@ impl SubscriptionBuilder {
         self
     }
 
+    /// The bus session generation the request was sent in; see
+    /// [`MessageBus::session_generation`].
+    pub(crate) fn session(mut self, session: u64) -> Self {
+        self.session = session;
+        self
+    }
+
     /// A status stream on `order_id` (`create_order_status_subscription`).
     pub(crate) fn order_status(mut self, order_id: OrderId) -> Self {
         self.order_status = Some(order_id);
@@ -540,6 +558,7 @@ impl SubscriptionBuilder {
             request_id: self.request_id,
             order_id: self.order_id,
             shared: self.shared,
+            session: self.session,
             order_status: self.order_status,
         }
     }

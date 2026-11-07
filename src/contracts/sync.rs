@@ -1,3 +1,4 @@
+use super::common::stream_decoders::{ImpliedVolatilityRequest, OptionPriceRequest};
 use super::common::{decoders, encoders};
 use super::*;
 use crate::client::blocking::{ClientRequestBuilders, Subscription};
@@ -5,7 +6,6 @@ use crate::client::ids::RequestId;
 use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
 use crate::messages::OutgoingMessages;
 use crate::protocol::{check_version, Features};
-use crate::subscriptions::StreamDecoder;
 use crate::{client::sync::Client, Error};
 
 impl Client {
@@ -104,7 +104,7 @@ impl Client {
     /// client.cancel_contract_details(request_id).expect("cancel failed");
     /// ```
     pub fn cancel_contract_details(&self, request_id: i32) -> Result<(), Error> {
-        check_version(self.server_version, Features::CANCEL_CONTRACT_DATA)?;
+        check_version(self.server_version(), Features::CANCEL_CONTRACT_DATA)?;
 
         let message = encoders::encode_cancel_contract_data(request_id)?;
         self.send_message(message)?;
@@ -118,7 +118,7 @@ impl Client {
     /// The returned market rule ID list will provide the market rule ID for the instrument in the correspond valid exchange list in [`crate::contracts::ContractDetails`].
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -220,7 +220,7 @@ impl Client {
     ///
     /// # Arguments
     /// * `contract`        - The [Contract] object representing the option for which the calculation is being requested.
-    /// * `volatility`      - Hypothetical volatility as a percentage (e.g., 20.0 for 20%).
+    /// * `volatility`      - Hypothetical annualized volatility as a fraction (`0.2` = 20%).
     /// * `underlying_price` - Hypothetical price of the underlying asset.
     ///
     /// # Examples
@@ -232,15 +232,13 @@ impl Client {
     /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
     ///
     /// let contract = Contract::option("AAPL", "20251219", 150.0, OptionRight::Call);
-    /// let calculation = client.calculate_option_price(&contract, 100.0, 235.0).expect("request failed");
+    /// let calculation = client.calculate_option_price(&contract, 0.2, 235.0).expect("request failed");
     /// println!("calculation: {calculation:?}");
     /// ```
     pub fn calculate_option_price(&self, contract: &Contract, volatility: f64, underlying_price: f64) -> Result<OptionComputation, Error> {
-        request_helpers::blocking::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_calculate_option_price(request_id, contract, volatility, underlying_price),
-            |message| OptionComputation::decode(&self.decoder_context(), message),
-        )
+        request_helpers::blocking::one_shot_cancelling::<OptionPriceRequest>(self, |request_id| {
+            encoders::encode_calculate_option_price(request_id, contract, volatility, underlying_price)
+        })
     }
 
     /// Calculates the implied volatility based on the hypothetical option price and underlying price.
@@ -263,11 +261,9 @@ impl Client {
     /// println!("calculation: {calculation:?}");
     /// ```
     pub fn calculate_implied_volatility(&self, contract: &Contract, option_price: f64, underlying_price: f64) -> Result<OptionComputation, Error> {
-        request_helpers::blocking::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_calculate_implied_volatility(request_id, contract, option_price, underlying_price),
-            |message| OptionComputation::decode(&self.decoder_context(), message),
-        )
+        request_helpers::blocking::one_shot_cancelling::<ImpliedVolatilityRequest>(self, |request_id| {
+            encoders::encode_calculate_implied_volatility(request_id, contract, option_price, underlying_price)
+        })
     }
 
     /// Build a request for an underlying's option chain: one [`OptionChain`] per
@@ -305,8 +301,7 @@ impl Client {
 }
 
 /// Send a contract-details request with a pre-allocated id. Reached through
-/// [`ContractDetailsBuilder::subscribe`]; the flat arguments are the
-/// builder-fed param-budget exception.
+/// [`ContractDetailsBuilder::subscribe`].
 pub(in crate::contracts) fn contract_details_stream(
     client: &Client,
     contract: &Contract,
@@ -318,8 +313,7 @@ pub(in crate::contracts) fn contract_details_stream(
 }
 
 /// Request an underlying's option chain. Reached through
-/// [`OptionChainBuilder::subscribe`]; the flat arguments are the builder-fed
-/// param-budget exception.
+/// [`OptionChainBuilder::subscribe`].
 pub(in crate::contracts) fn option_chain(
     client: &Client,
     symbol: &str,

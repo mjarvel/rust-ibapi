@@ -1,21 +1,23 @@
 use super::*;
+use crate::common::request_helpers::OneShot;
 use crate::common::test_utils::helpers::{
     assert_request, assert_tws_error_message, proto_error_response, proto_response, request_message_count, text_response, TEST_REQ_ID_FIRST,
 };
+use crate::contracts::common::stream_decoders::OptionPriceRequest;
 use crate::contracts::common::test_tables::*;
 use crate::messages::IncomingMessages;
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
 use crate::subscriptions::{DecoderContext, StreamDecoder, SubscriptionItem};
 use crate::testdata::builders::contracts::{
-    calculate_implied_volatility_request, calculate_option_price_request, cancel_contract_data_request, contract_data, contract_data_request,
-    market_rule_request, matching_symbols_request, option_chain_request, smart_components_request,
+    calculate_implied_volatility_request, calculate_option_price_request, cancel_contract_data_request, contract_data, contract_data_end,
+    contract_data_request, market_rule_request, matching_symbols_request, option_chain_request, smart_components_request,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
 use std::sync::Arc;
 
 #[test]
-fn test_contract_details() {
+fn contract_details() {
     for test_case in contract_details_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -38,7 +40,7 @@ fn test_contract_details() {
 }
 
 #[test]
-fn test_matching_symbols() {
+fn matching_symbols() {
     for test_case in matching_symbols_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -59,7 +61,7 @@ fn test_matching_symbols() {
 }
 
 #[test]
-fn test_market_rule() {
+fn market_rule() {
     for test_case in market_rule_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -81,7 +83,7 @@ fn test_market_rule() {
 }
 
 #[test]
-fn test_smart_components() {
+fn smart_components() {
     for test_case in smart_components_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -111,7 +113,7 @@ fn test_smart_components() {
 }
 
 #[test]
-fn test_option_calculations() {
+fn option_calculations() {
     for test_case in option_calculation_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -165,7 +167,7 @@ fn test_option_calculations() {
 }
 
 #[test]
-fn test_option_chain() {
+fn option_chain() {
     for test_case in option_chain_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -197,13 +199,14 @@ fn test_option_chain() {
 }
 
 #[test]
-fn test_stream_decoders() {
+fn stream_decoders() {
     for test_case in stream_decoder_test_cases() {
         let message = test_case.message.clone();
 
         match &test_case.expected_result {
             StreamDecoderResult::OptionComputation { price, delta } => {
-                let result = OptionComputation::decode(&DecoderContext::new(server_versions::SIZE_RULES), &message);
+                let result =
+                    OneShot::<OptionPriceRequest>::decode(&DecoderContext::new(server_versions::SIZE_RULES), &message).map(OneShot::into_inner);
                 assert!(result.is_ok(), "Test '{}' failed: {:?}", test_case.name, result.err());
                 let computation = result.unwrap();
                 assert_eq!(computation.option_price, Some(*price), "Test '{}' price mismatch", test_case.name);
@@ -230,7 +233,8 @@ fn test_stream_decoders() {
                         test_case.name
                     );
                 } else {
-                    let opt_result = OptionComputation::decode(&DecoderContext::new(server_versions::SIZE_RULES), &message.clone());
+                    let opt_result = OneShot::<OptionPriceRequest>::decode(&DecoderContext::new(server_versions::SIZE_RULES), &message.clone())
+                        .map(OneShot::into_inner);
                     let chain_result = OptionChain::decode(&DecoderContext::new(server_versions::SIZE_RULES), &message);
                     assert!(
                         opt_result.is_err() && chain_result.is_err(),
@@ -244,18 +248,9 @@ fn test_stream_decoders() {
 }
 
 #[test]
-fn test_cancel_messages() {
+fn cancel_messages() {
     for test_case in cancel_message_test_cases() {
-        let context = test_case.request_type.map(|rt| DecoderContext::default().with_request_type(rt));
-
-        let result = match test_case.decoder_type {
-            "OptionComputation" => OptionComputation::cancel_message(server_versions::SIZE_RULES, test_case.request_id, context.as_ref()),
-            "OptionChain" => {
-                // OptionChain doesn't implement cancel_message
-                Err(crate::Error::Simple("cancel not implemented".to_string()))
-            }
-            _ => panic!("Unknown decoder type"),
-        };
+        let result = (test_case.cancel)(test_case.request_id);
 
         match &test_case.expected_msg_id {
             Ok(expected_id) => {
@@ -280,7 +275,7 @@ fn test_cancel_messages() {
 }
 
 #[test]
-fn test_client_methods() {
+fn client_methods() {
     for test_case in client_method_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -351,7 +346,7 @@ fn test_client_methods() {
 }
 
 #[test]
-fn test_contract_details_errors() {
+fn contract_details_errors() {
     for test_case in contract_details_error_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
 
@@ -386,7 +381,7 @@ fn test_contract_details_errors() {
 }
 
 #[test]
-fn test_cancel_contract_details() {
+fn cancel_contract_details() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::CANCEL_CONTRACT_DATA);
 
@@ -398,7 +393,7 @@ fn test_cancel_contract_details() {
 }
 
 #[test]
-fn test_matching_symbols_returns_server_error() {
+fn matching_symbols_returns_server_error() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_error_response(
         9000,
         321,
@@ -415,7 +410,7 @@ fn test_matching_symbols_returns_server_error() {
 }
 
 #[test]
-fn test_matching_symbols_rejects_unexpected_message() {
+fn matching_symbols_rejects_unexpected_message() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![text_response("10|9000|")]));
     let client = Client::stubbed(message_bus, server_versions::BOND_ISSUERID);
 
@@ -426,7 +421,7 @@ fn test_matching_symbols_rejects_unexpected_message() {
 }
 
 #[test]
-fn test_matching_symbols_returns_empty_on_closed_stream() {
+fn matching_symbols_returns_empty_on_closed_stream() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
     let client = Client::stubbed(message_bus, server_versions::BOND_ISSUERID);
 
@@ -435,7 +430,7 @@ fn test_matching_symbols_returns_empty_on_closed_stream() {
 }
 
 #[test]
-fn test_market_rule_returns_eof_on_empty_stream() {
+fn market_rule_returns_eof_on_empty_stream() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
     let client = Client::stubbed(message_bus, server_versions::MARKET_RULES);
 
@@ -444,7 +439,7 @@ fn test_market_rule_returns_eof_on_empty_stream() {
 }
 
 #[test]
-fn test_market_rule_skips_another_rule_ids_frame() {
+fn market_rule_skips_another_rule_ids_frame() {
     use crate::testdata::builders::contracts::market_rule;
 
     // A concurrent market_rule(239) was answered first; every live
@@ -463,7 +458,7 @@ fn test_market_rule_skips_another_rule_ids_frame() {
 }
 
 #[test]
-fn test_calculate_option_price_returns_eof_on_empty_stream() {
+fn calculate_option_price_returns_eof_on_empty_stream() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
     let client = Client::stubbed(message_bus, server_versions::REQ_CALC_OPTION_PRICE);
     let contract = Contract::option("AAPL", "20231215", 150.0, OptionRight::Call);
@@ -473,7 +468,7 @@ fn test_calculate_option_price_returns_eof_on_empty_stream() {
 }
 
 #[test]
-fn test_calculate_implied_volatility_returns_eof_on_empty_stream() {
+fn calculate_implied_volatility_returns_eof_on_empty_stream() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
     let client = Client::stubbed(message_bus, server_versions::REQ_CALC_IMPLIED_VOLAT);
     let contract = Contract::option("AAPL", "20231215", 150.0, OptionRight::Call);
@@ -502,7 +497,13 @@ fn stream_client(responses: Vec<crate::messages::ResponseMessage>, server_versio
 
 #[test]
 fn contract_details_stream_request_id_known_before_send() {
-    let (client, message_bus) = stream_client(vec![contract_data_end(TEST_REQ_ID_FIRST)], server_versions::CANCEL_CONTRACT_DATA);
+    let (client, message_bus) = stream_client(
+        vec![proto_response(
+            IncomingMessages::ContractDataEnd,
+            contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+        )],
+        server_versions::CANCEL_CONTRACT_DATA,
+    );
     let contract = Contract::stock("AAPL").build();
 
     let request = client.contract_details_stream(&contract);
@@ -529,7 +530,14 @@ fn contract_details_stream_unsent_builder_sends_nothing() {
 #[test]
 fn contract_details_stream_yields_rows_then_ends_without_cancel() {
     let (client, message_bus) = stream_client(
-        vec![detail_row(1), detail_row(2), contract_data_end(TEST_REQ_ID_FIRST)],
+        vec![
+            detail_row(1),
+            detail_row(2),
+            proto_response(
+                IncomingMessages::ContractDataEnd,
+                contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+            ),
+        ],
         server_versions::CANCEL_CONTRACT_DATA,
     );
     let contract = Contract::stock("AAPL").build();
@@ -591,7 +599,13 @@ fn contract_details_stream_surfaces_no_definition_error() {
 #[test]
 fn contract_details_writes_no_cancel_after_end() {
     let (client, message_bus) = stream_client(
-        vec![detail_row(1), contract_data_end(TEST_REQ_ID_FIRST)],
+        vec![
+            detail_row(1),
+            proto_response(
+                IncomingMessages::ContractDataEnd,
+                contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+            ),
+        ],
         server_versions::CANCEL_CONTRACT_DATA,
     );
 
@@ -621,7 +635,13 @@ fn contract_details_cancels_after_tws_error() {
 
 #[test]
 fn contract_details_stream_buffer_limit_reaches_the_bus() {
-    let (client, message_bus) = stream_client(vec![contract_data_end(TEST_REQ_ID_FIRST)], server_versions::CANCEL_CONTRACT_DATA);
+    let (client, message_bus) = stream_client(
+        vec![proto_response(
+            IncomingMessages::ContractDataEnd,
+            contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+        )],
+        server_versions::CANCEL_CONTRACT_DATA,
+    );
     let contract = Contract::stock("AAPL").build();
 
     let _bounded = client.contract_details_stream(&contract).buffer_limit(64).subscribe().unwrap();

@@ -1,11 +1,12 @@
 use super::*;
 
-use crate::common::test_utils::helpers::{assert_missing_field, assert_rejects_text_framing};
+use crate::common::test_utils::helpers::{assert_decimal_parse_error, assert_missing_field, assert_rejects_text_framing};
+use crate::contracts::{FundAssetType, FundDistributionPolicyIndicator};
 use crate::messages::IncomingMessages;
 use prost::Message;
 
 #[test]
-fn test_decode_contract_data_proto() {
+fn decode_contract_data_proto_works() {
     let proto_msg = crate::proto::ContractData {
         req_id: Some(1),
         contract: Some(crate::proto::Contract {
@@ -43,7 +44,7 @@ fn test_decode_contract_data_proto() {
 }
 
 #[test]
-fn test_decode_contract_data_proto_rejects_missing_submessages() {
+fn decode_contract_data_proto_rejects_missing_submessages() {
     // EDecoder.cs drops a ContractData frame when either submessage is null
     // rather than synthesizing a default; this crate has no skip channel, so
     // it errors, as #829's OpenOrder / CompletedOrder / ExecutionDetails do.
@@ -78,7 +79,7 @@ fn test_decode_contract_data_proto_rejects_missing_submessages() {
 }
 
 #[test]
-fn test_decode_symbol_samples_proto() {
+fn decode_symbol_samples_proto_works() {
     let proto_msg = crate::proto::SymbolSamples {
         req_id: Some(1),
         contract_descriptions: vec![
@@ -116,7 +117,7 @@ fn test_decode_symbol_samples_proto() {
 }
 
 #[test]
-fn test_decode_market_rule_proto() {
+fn decode_market_rule_proto_works() {
     let proto_msg = crate::proto::MarketRule {
         market_rule_id: Some(26),
         price_increments: vec![
@@ -140,7 +141,7 @@ fn test_decode_market_rule_proto() {
 }
 
 #[test]
-fn test_decode_option_chain_proto() {
+fn decode_option_chain_proto_works() {
     let proto_msg = crate::proto::SecDefOptParameter {
         req_id: Some(1),
         exchange: Some("SMART".into()),
@@ -166,7 +167,7 @@ fn test_decode_option_chain_proto() {
 // it is not skippable. See docs/rules/wire/proto-only-decoding.md.
 
 #[test]
-fn test_decode_contract_details_rejects_text_framing() {
+fn decode_contract_details_rejects_text_framing() {
     assert_rejects_text_framing(
         IncomingMessages::ContractData,
         "10\09001\0AAPL\0STK\0\00\0\0SMART\0USD\0AAPL\0NMS\0NMS\0265598\00.01\0\0",
@@ -175,7 +176,7 @@ fn test_decode_contract_details_rejects_text_framing() {
 }
 
 #[test]
-fn test_decode_option_chain_rejects_text_framing() {
+fn decode_option_chain_rejects_text_framing() {
     assert_rejects_text_framing(
         IncomingMessages::SecurityDefinitionOptionParameter,
         "75\09000\0SMART\0265598\0AAPL\0100\01\020260619\01\0150.0\0",
@@ -201,7 +202,7 @@ fn bond_frame(last_trade_date_or_contract_month: &str) -> ResponseMessage {
 }
 
 #[test]
-fn test_decode_bond_contract_details_splits_last_trade_date() {
+fn decode_bond_contract_details_splits_last_trade_date() {
     // Mirrors C# EDecoderUtils.SetLastTradeDate(.., isBond: true).
     let cases = [
         ("20430504 16:00 Europe/London", "20430504", "16:00", "Europe/London"),
@@ -220,7 +221,26 @@ fn test_decode_bond_contract_details_splits_last_trade_date() {
 }
 
 #[test]
-fn test_decode_contract_details_leaves_maturity_unset() {
+fn decode_contract_details_reads_last_trade_date() {
+    use crate::common::test_utils::helpers::proto_response;
+    use crate::testdata::builders::contracts::contract_data;
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    let frame = proto_response(
+        IncomingMessages::ContractData,
+        contract_data()
+            .request_id(9000)
+            .security_type("FUT")
+            .last_trade_date_or_contract_month("20261218 08:30:00 US/Central")
+            .last_trade_date("20261218")
+            .encode_proto(),
+    );
+    let details = decode_contract_details(&frame).unwrap();
+    assert_eq!(details.contract.last_trade_date, Some(time::macros::date!(2026 - 12 - 18)));
+}
+
+#[test]
+fn decode_contract_details_leaves_maturity_unset() {
     // The split is bond-only: a ContractData frame keeps maturity empty.
     use crate::common::test_utils::helpers::proto_response;
     use crate::testdata::builders::contracts::contract_data;
@@ -239,12 +259,12 @@ fn test_decode_contract_details_leaves_maturity_unset() {
 }
 
 #[test]
-fn test_decode_bond_contract_details_rejects_text_framing() {
+fn decode_bond_contract_details_rejects_text_framing() {
     assert_rejects_text_framing(IncomingMessages::BondContractData, "18\09001\0\0BOND\0", decode_bond_contract_details);
 }
 
 #[test]
-fn test_decode_bond_contract_details_live_shape() {
+fn decode_bond_contract_details_live_shape() {
     // Shape of a live `BondContractData` frame (US-T, 2026-10-01, server 225):
     // no symbol, no last trade date, no coupon; identity in local symbol and cusip.
     let proto_msg = crate::proto::ContractData {
@@ -279,4 +299,110 @@ fn test_decode_bond_contract_details_live_shape() {
     assert_eq!(details.contract_month, "202611");
     assert_eq!(details.time_zone_id, "US/Eastern");
     assert_eq!(details.maturity, "", "no last trade date on the wire, so no maturity");
+}
+
+// === decode_contract_and_details ===
+
+/// A `proto::Contract` carrying a `sec_type`, for tests that are not about the
+/// `Other("")` fallback in `decode_contract`.
+fn stk_contract() -> crate::proto::Contract {
+    crate::proto::Contract {
+        sec_type: Some("STK".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn decode_contract_details_rejects_malformed_min_size() {
+    let details = proto::ContractDetails {
+        min_size: Some("abc".into()),
+        ..Default::default()
+    };
+    assert_decimal_parse_error(decode_contract_and_details(&stk_contract(), &details), "abc");
+}
+
+#[test]
+fn decode_contract_details_rejects_malformed_min_tick() {
+    let details = proto::ContractDetails {
+        min_tick: Some("abc".into()),
+        ..Default::default()
+    };
+    assert_decimal_parse_error(decode_contract_and_details(&stk_contract(), &details), "abc");
+}
+
+// === ContractDetails size rules are optional (issue #716) ===
+
+#[test]
+fn decode_contract_details_absent_size_rules_are_none() {
+    // Contracts without size rules omit these entirely; `0.0` would have been a
+    // nonsense size increment.
+    let details = decode_contract_and_details(&stk_contract(), &proto::ContractDetails::default()).unwrap();
+
+    assert_eq!(details.min_size, None);
+    assert_eq!(details.size_increment, None);
+    assert_eq!(details.suggested_size_increment, None);
+}
+
+#[test]
+fn decode_contract_details_preserves_fractional_size_increment() {
+    let details = proto::ContractDetails {
+        size_increment: Some("0.0001".into()),
+        ..Default::default()
+    };
+    let decoded = decode_contract_and_details(&stk_contract(), &details).unwrap();
+
+    assert_eq!(decoded.size_increment, Some(0.0001));
+}
+
+// === Fund enums: absent is unset, unknown keeps its code (#1071) ===
+
+#[test]
+fn decode_contract_details_fund_enums() {
+    struct Case {
+        name: &'static str,
+        policy: Option<&'static str>,
+        asset: Option<&'static str>,
+        want_policy: Option<FundDistributionPolicyIndicator>,
+        want_asset: Option<FundAssetType>,
+    }
+    let cases = [
+        Case {
+            name: "absent",
+            policy: None,
+            asset: None,
+            want_policy: None,
+            want_asset: None,
+        },
+        Case {
+            name: "empty",
+            policy: Some(""),
+            asset: Some(""),
+            want_policy: None,
+            want_asset: None,
+        },
+        Case {
+            name: "known",
+            policy: Some("Y"),
+            asset: Some("004"),
+            want_policy: Some(FundDistributionPolicyIndicator::IncomeFund),
+            want_asset: Some(FundAssetType::Equity),
+        },
+        Case {
+            name: "unknown",
+            policy: Some("Z"),
+            asset: Some("008"),
+            want_policy: Some(FundDistributionPolicyIndicator::Unknown("Z".into())),
+            want_asset: Some(FundAssetType::Unknown("008".into())),
+        },
+    ];
+    for case in cases {
+        let details = proto::ContractDetails {
+            fund_distribution_policy_indicator: case.policy.map(Into::into),
+            fund_asset_type: case.asset.map(Into::into),
+            ..Default::default()
+        };
+        let decoded = decode_contract_and_details(&stk_contract(), &details).unwrap();
+        assert_eq!(decoded.fund_distribution_policy_indicator, case.want_policy, "{}: policy", case.name);
+        assert_eq!(decoded.fund_asset_type, case.want_asset, "{}: asset", case.name);
+    }
 }

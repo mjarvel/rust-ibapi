@@ -2,8 +2,10 @@
 
 use std::time::Duration;
 
-use crate::messages::ResponseMessage;
+use crate::common::error_helpers;
+use crate::messages::{IncomingMessages, Notice, ResponseMessage};
 use crate::proto::payload::ProtoPayload;
+use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::Error;
 
 /// How long a one-shot on a shared channel waits for its frame before failing
@@ -88,7 +90,7 @@ pub(crate) fn empty_on_end_of_stream<R: Default>(error: Error) -> Result<R, Erro
 /// but not because a narrow there is redundant. `decode` still owes its
 /// `_ => Err(unexpected_response(..))` backstop, and a single-type decoder has
 /// no match to hang one on, so `message.expect_type(..)?` *is* its backstop:
-/// drop it and `test_response_message_ids_match_decode_arms` reads the decoder
+/// drop it and `response_message_ids_match_decode_arms` reads the decoder
 /// as claiming an arm for every message type. What `expect_proto` would add
 /// there is the payload decode, which `decode` already owns.
 pub(crate) fn expect_proto<P, R>(decode: impl Fn(P) -> Result<R, Error>) -> impl Fn(&ResponseMessage) -> Result<R, Error>
@@ -98,6 +100,57 @@ where
     move |message| decode(message.expect_type(P::MESSAGE_ID)?.proto()?)
 }
 
+/// A one-shot request answered by a single frame on its own request id,
+/// which TWS can cancel. Read with `one_shot_cancelling`, so a request
+/// dropped before its answer (a dropped future, a timeout, a local error) is
+/// cancelled at TWS instead of running on against pacing (#1107).
+pub(crate) trait CancellableOneShot: 'static {
+    /// The answer's payload; its message type is the only frame read.
+    type Proto: ProtoPayload;
+    type Output: Send + 'static;
+
+    fn decode(payload: Self::Proto) -> Result<Self::Output, Error>;
+
+    fn cancel(request_id: i32) -> Result<Vec<u8>, Error>;
+}
+
+/// The answer to a [`CancellableOneShot`], as a subscription reads it.
+///
+/// The answer ends the request (live: exactly one frame, then nothing), so it
+/// is a snapshot end: a subscription that got it sends no cancel. Nor does one
+/// a TWS error ended, since a one-shot has nothing left to cancel.
+///
+/// Not in the `response_message_ids_tests` roster: `RESPONSE_MESSAGE_IDS` and
+/// the one `decode` arm both come from `K::Proto`, so they cannot disagree.
+pub(crate) struct OneShot<K: CancellableOneShot>(K::Output);
+
+impl<K: CancellableOneShot> OneShot<K> {
+    pub(crate) fn into_inner(self) -> K::Output {
+        self.0
+    }
+}
+
+impl<K: CancellableOneShot> StreamDecoder<OneShot<K>> for OneShot<K> {
+    const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[K::Proto::MESSAGE_ID];
+
+    fn decode(_context: &DecoderContext, message: &ResponseMessage) -> Result<Self, Error> {
+        let payload = message.expect_type(K::Proto::MESSAGE_ID)?.proto()?;
+        K::decode(payload).map(Self)
+    }
+
+    fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
+        K::cancel(error_helpers::require_request_id_for(request_id, "cancel one-shot request")?)
+    }
+
+    fn is_snapshot_end(&self) -> bool {
+        true
+    }
+
+    fn rejection_ends_request(_notice: &Notice) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 #[path = "request_helpers_tests.rs"]
 mod tests;
@@ -105,60 +158,61 @@ mod tests;
 // Sync implementations
 #[cfg(feature = "sync")]
 mod sync_impl {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
+    use super::{CancellableOneShot, OneShot};
     use crate::client::blocking::ClientRequestBuilders;
     use crate::client::sync::Client;
     use crate::messages::{OutgoingMessages, ResponseMessage};
+    use crate::subscriptions::common::filter_notice;
+    use crate::subscriptions::sync::Subscription;
+    use crate::subscriptions::StreamDecoder;
     use crate::Error;
 
+    /// Deadline for a request-id one-shot starting now: `one_shot_timeout`
+    /// from now, if set. Taken once, before the retry, so the bound covers
+    /// every resend.
+    pub fn one_shot_deadline(client: &Client) -> Option<Instant> {
+        client.one_shot_timeout().map(|timeout| Instant::now() + timeout)
+    }
+
+    /// `Error::Timeout` once `deadline` has passed. Checked before each
+    /// attempt sends: a resend after a reconnect that outlasted the deadline
+    /// would leave TWS a request nobody reads.
+    pub fn check_deadline(deadline: Option<Instant>) -> Result<(), Error> {
+        match deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(Error::Timeout),
+            _ => Ok(()),
+        }
+    }
+
     /// One-shot request answered on the shared channel for its message type,
-    /// within [`ONE_SHOT_TIMEOUT`](super::ONE_SHOT_TIMEOUT).
+    /// within the client's `one_shot_timeout`, else
+    /// [`ONE_SHOT_TIMEOUT`](super::ONE_SHOT_TIMEOUT).
     pub fn one_shot_shared<R>(
         client: &Client,
         message_type: OutgoingMessages,
         encoder: impl Fn() -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        one_shot_shared_within(client, message_type, super::ONE_SHOT_TIMEOUT, encoder, processor)
-    }
-
-    /// [`one_shot_shared`] with the wait for the frame bounded by `timeout`.
-    pub fn one_shot_shared_within<R>(
-        client: &Client,
-        message_type: OutgoingMessages,
-        timeout: Duration,
-        encoder: impl Fn() -> Result<Vec<u8>, Error>,
-        processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
-    ) -> Result<R, Error> {
-        one_shot_shared_matching_within(client, message_type, timeout, encoder, |message| processor(message).map(Some))
+        one_shot_shared_matching(client, message_type, encoder, |message| processor(message).map(Some))
     }
 
     /// [`one_shot_shared`] for a response another caller's request of the same
     /// type can also produce: `processor` answers `Ok(None)` for a frame that is
-    /// not this request's, and the next frame is read, until
-    /// [`ONE_SHOT_TIMEOUT`](super::ONE_SHOT_TIMEOUT) passes.
+    /// not this request's, and the next frame is read, until the deadline.
     pub fn one_shot_shared_matching<R>(
         client: &Client,
         message_type: OutgoingMessages,
         encoder: impl Fn() -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<Option<R>, Error>,
     ) -> Result<R, Error> {
-        one_shot_shared_matching_within(client, message_type, super::ONE_SHOT_TIMEOUT, encoder, processor)
-    }
+        let deadline = Instant::now() + client.one_shot_timeout().unwrap_or(super::ONE_SHOT_TIMEOUT);
 
-    /// [`one_shot_shared_matching`] with the wait for the frame bounded by `timeout`.
-    pub fn one_shot_shared_matching_within<R>(
-        client: &Client,
-        message_type: OutgoingMessages,
-        timeout: Duration,
-        encoder: impl Fn() -> Result<Vec<u8>, Error>,
-        processor: impl Fn(&ResponseMessage) -> Result<Option<R>, Error>,
-    ) -> Result<R, Error> {
-        crate::common::retry::blocking::retry_on_connection_reset(client, || {
+        crate::common::retry::blocking::retry_on_connection_reset(client, Some(deadline), || {
+            check_deadline(Some(deadline))?;
             let request = encoder()?;
             let subscription = client.shared_request(message_type).send_raw(request)?;
-            let deadline = Instant::now() + timeout;
 
             loop {
                 // Checked before each read: a queued frame is returned even
@@ -179,74 +233,126 @@ mod sync_impl {
         encoder: impl Fn(i32) -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        crate::common::retry::blocking::retry_on_connection_reset(client, || {
+        let deadline = one_shot_deadline(client);
+
+        crate::common::retry::blocking::retry_on_connection_reset(client, deadline, || {
+            check_deadline(deadline)?;
             let request_id = client.mint_request_id();
             let request = encoder(request_id.raw())?;
             let subscription = client.send_request(request_id, request)?;
 
-            super::fold_one_shot(subscription.next(), &processor)
+            let response = match deadline {
+                None => subscription.next(),
+                // `next_before` returns a queued frame even past the deadline,
+                // so check the clock first.
+                Some(deadline) if Instant::now() >= deadline => return Err(Error::Timeout),
+                Some(deadline) => subscription.next_before(deadline)?,
+            };
+            super::fold_one_shot(response, &processor)
         })
+    }
+
+    /// [`one_shot_by_request_id`] for a request TWS can cancel: dropped before
+    /// its answer, the request is cancelled at TWS.
+    pub fn one_shot_cancelling<K: CancellableOneShot>(client: &Client, encoder: impl Fn(i32) -> Result<Vec<u8>, Error>) -> Result<K::Output, Error> {
+        let deadline = one_shot_deadline(client);
+
+        crate::common::retry::blocking::retry_on_connection_reset(client, deadline, || {
+            check_deadline(deadline)?;
+            let builder = client.request();
+            let request = encoder(builder.request_id())?;
+            let subscription = builder.send::<OneShot<K>>(request)?;
+
+            next_frame(&subscription, deadline).map(OneShot::into_inner)
+        })
+    }
+
+    /// The next frame of a request-id subscription, skipping notices. A close
+    /// before it is `Error::UnexpectedEndOfStream`; `deadline` passing first
+    /// is `Error::Timeout`.
+    pub fn next_frame<T: StreamDecoder<T>>(subscription: &Subscription<T>, deadline: Option<Instant>) -> Result<T, Error> {
+        loop {
+            let item = match deadline {
+                None => subscription.next(),
+                Some(deadline) => {
+                    // Checked before each read, so a run of notices can't overrun it.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Error::Timeout);
+                    }
+                    // `next_timeout` returns `None` for a timeout and for a
+                    // closed stream; only a timeout runs out the clock.
+                    match subscription.next_timeout(remaining) {
+                        None if Instant::now() >= deadline => return Err(Error::Timeout),
+                        item => item,
+                    }
+                }
+            };
+            if let Some(frame) = filter_notice(item.ok_or(Error::UnexpectedEndOfStream)?) {
+                return frame;
+            }
+        }
     }
 }
 
 // Async implementations
 #[cfg(feature = "async")]
 mod async_impl {
-    use std::time::Duration;
-
+    use futures::StreamExt;
     use tokio::time::Instant;
 
+    use super::{CancellableOneShot, OneShot};
     use crate::client::{Client, ClientRequestBuilders};
     use crate::messages::{OutgoingMessages, ResponseMessage};
+    use crate::subscriptions::common::{filter_notice, lag_as_error};
+    use crate::subscriptions::r#async::Subscription;
+    use crate::subscriptions::StreamDecoder;
     use crate::Error;
 
+    /// Deadline for a request-id one-shot starting now: `one_shot_timeout`
+    /// from now, if set. Taken once, before the retry, so the bound covers
+    /// every resend.
+    pub fn one_shot_deadline(client: &Client) -> Option<Instant> {
+        client.one_shot_timeout().map(|timeout| Instant::now() + timeout)
+    }
+
+    /// `Error::Timeout` once `deadline` has passed. Checked before each
+    /// attempt sends: a resend after a reconnect that outlasted the deadline
+    /// would leave TWS a request nobody reads.
+    pub fn check_deadline(deadline: Option<Instant>) -> Result<(), Error> {
+        match deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(Error::Timeout),
+            _ => Ok(()),
+        }
+    }
+
     /// One-shot request answered on the shared channel for its message type,
-    /// within [`ONE_SHOT_TIMEOUT`](super::ONE_SHOT_TIMEOUT).
+    /// within the client's `one_shot_timeout`, else
+    /// [`ONE_SHOT_TIMEOUT`](super::ONE_SHOT_TIMEOUT).
     pub async fn one_shot_shared<R>(
         client: &Client,
         message_type: OutgoingMessages,
         encoder: impl Fn() -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        one_shot_shared_within(client, message_type, super::ONE_SHOT_TIMEOUT, encoder, processor).await
-    }
-
-    /// [`one_shot_shared`] with the wait for the frame bounded by `timeout`.
-    pub async fn one_shot_shared_within<R>(
-        client: &Client,
-        message_type: OutgoingMessages,
-        timeout: Duration,
-        encoder: impl Fn() -> Result<Vec<u8>, Error>,
-        processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
-    ) -> Result<R, Error> {
-        one_shot_shared_matching_within(client, message_type, timeout, encoder, |message| processor(message).map(Some)).await
+        one_shot_shared_matching(client, message_type, encoder, |message| processor(message).map(Some)).await
     }
 
     /// [`one_shot_shared`] for a response another caller's request of the same
     /// type can also produce: `processor` answers `Ok(None)` for a frame that is
-    /// not this request's, and the next frame is read, until
-    /// [`ONE_SHOT_TIMEOUT`](super::ONE_SHOT_TIMEOUT) passes.
+    /// not this request's, and the next frame is read, until the deadline.
     pub async fn one_shot_shared_matching<R>(
         client: &Client,
         message_type: OutgoingMessages,
         encoder: impl Fn() -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<Option<R>, Error>,
     ) -> Result<R, Error> {
-        one_shot_shared_matching_within(client, message_type, super::ONE_SHOT_TIMEOUT, encoder, processor).await
-    }
+        let deadline = Instant::now() + client.one_shot_timeout().unwrap_or(super::ONE_SHOT_TIMEOUT);
 
-    /// [`one_shot_shared_matching`] with the wait for the frame bounded by `timeout`.
-    pub async fn one_shot_shared_matching_within<R>(
-        client: &Client,
-        message_type: OutgoingMessages,
-        timeout: Duration,
-        encoder: impl Fn() -> Result<Vec<u8>, Error>,
-        processor: impl Fn(&ResponseMessage) -> Result<Option<R>, Error>,
-    ) -> Result<R, Error> {
-        crate::common::retry::retry_on_connection_reset(client, || async {
+        crate::common::retry::retry_on_connection_reset(client, Some(deadline), || async {
+            check_deadline(Some(deadline))?;
             let request = encoder()?;
             let mut subscription = client.shared_request(message_type).send_raw(request).await?;
-            let deadline = Instant::now() + timeout;
 
             loop {
                 // Checked before each read: `timeout_at` polls the read first,
@@ -268,14 +374,63 @@ mod async_impl {
         encoder: impl Fn(i32) -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        crate::common::retry::retry_on_connection_reset(client, || async {
+        let deadline = one_shot_deadline(client);
+
+        crate::common::retry::retry_on_connection_reset(client, deadline, || async {
+            check_deadline(deadline)?;
             let request_id = client.mint_request_id();
             let request = encoder(request_id.raw())?;
             let mut subscription = client.send_request(request_id, request).await?;
 
-            super::fold_one_shot(subscription.next().await, &processor)
+            let response = match deadline {
+                None => subscription.next().await,
+                // Checked first: `timeout_at` polls the read before the clock.
+                Some(deadline) if Instant::now() >= deadline => return Err(Error::Timeout),
+                Some(deadline) => subscription.next_before(deadline).await?,
+            };
+            super::fold_one_shot(response, &processor)
         })
         .await
+    }
+
+    /// [`one_shot_by_request_id`] for a request TWS can cancel: dropped before
+    /// its answer, the request is cancelled at TWS.
+    pub async fn one_shot_cancelling<K: CancellableOneShot>(
+        client: &Client,
+        encoder: impl Fn(i32) -> Result<Vec<u8>, Error>,
+    ) -> Result<K::Output, Error> {
+        let deadline = one_shot_deadline(client);
+
+        crate::common::retry::retry_on_connection_reset(client, deadline, || async {
+            check_deadline(deadline)?;
+            let builder = client.request();
+            let request = encoder(builder.request_id())?;
+            let mut subscription = builder.send::<OneShot<K>>(request).await?;
+
+            next_frame(&mut subscription, deadline).await.map(OneShot::into_inner)
+        })
+        .await
+    }
+
+    /// The next frame of a request-id subscription, skipping notices. A close
+    /// before it is `Error::UnexpectedEndOfStream`; `deadline` passing first
+    /// is `Error::Timeout`; a broadcast lag fails the read, since the frame it
+    /// evicted can't be read.
+    pub async fn next_frame<T: StreamDecoder<T> + Send + 'static>(subscription: &mut Subscription<T>, deadline: Option<Instant>) -> Result<T, Error> {
+        loop {
+            let item = match deadline {
+                None => subscription.next().await,
+                // `timeout_at` polls `next()` first, so while items are ready it
+                // never looks at the clock; check it here.
+                Some(deadline) if Instant::now() >= deadline => return Err(Error::Timeout),
+                Some(deadline) => tokio::time::timeout_at(deadline, subscription.next())
+                    .await
+                    .map_err(|_elapsed| Error::Timeout)?,
+            };
+            if let Some(frame) = filter_notice(lag_as_error(item.ok_or(Error::UnexpectedEndOfStream)?)) {
+                return frame;
+            }
+        }
     }
 }
 

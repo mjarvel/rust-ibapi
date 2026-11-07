@@ -4,7 +4,7 @@ use crate::common::test_utils::helpers::{
 };
 use crate::contracts::Contract;
 use crate::messages::{IncomingMessages, OutgoingMessages};
-use crate::news::ArticleType;
+use crate::news::{ArticleType, BulletinType};
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
 use crate::testdata::builders::market_data::market_data_request;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use time::macros::datetime;
 
 #[test]
-fn test_news_providers() {
+fn news_providers_works() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::NewsProviders,
         news_providers()
@@ -43,7 +43,7 @@ fn test_news_providers() {
 }
 
 #[test]
-fn test_news_bulletins() {
+fn news_bulletins() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::NewsBulletins,
         news_bulletin()
@@ -62,13 +62,13 @@ fn test_news_bulletins() {
 
     let bulletin = subscription.next_data().expect("expected news bulletin").expect("subscription error");
     assert_eq!(bulletin.message_id, 1);
-    assert_eq!(bulletin.message_type, 2);
+    assert_eq!(bulletin.message_type, BulletinType::ExchangeUnavailable);
     assert_eq!(bulletin.message, "Message text");
     assert_eq!(bulletin.exchange, "NASDAQ");
 }
 
 #[test]
-fn test_historical_news() {
+fn historical_news_works() {
     let headline = "{A:800008,800008,800015:L:Chinese (Simplified and Traditional),Chinese (Simplified and Traditional),en:K:n/a:C:0.9882221817970276}These Stocks Are Moving the Most Today: Honda, Qualcomm, Broadcom, Lilly, ResMed, Tesla, Walmart, Rumble, and More -- Barrons.com";
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
@@ -93,7 +93,7 @@ fn test_historical_news() {
     let end_time = datetime!(2023-01-02 0:00 UTC);
 
     let subscription = client
-        .historical_news(TEST_CONTRACT_ID, &["BZ", "DJ"], start_time, end_time, 10)
+        .historical_news(TEST_CONTRACT_ID, &["BZ", "DJ"], start_time, end_time, 300)
         .expect("request historical news failed");
 
     assert_request(
@@ -104,7 +104,7 @@ fn test_historical_news() {
             .provider_codes(&["BZ", "DJ"])
             .start_time(start_time)
             .end_time(end_time)
-            .total_results(10),
+            .total_results(300),
     );
 
     let article = subscription.next_data().expect("expected news article").expect("subscription error");
@@ -112,11 +112,11 @@ fn test_historical_news() {
     assert_eq!(article.article_id, "DJ-N$19985fef");
     assert_eq!(article.headline, headline);
     assert_eq!(article.extra_data, "");
-    assert_eq!(article.time.unix_timestamp(), 1734983100);
+    assert_eq!(article.time.unwrap().unix_timestamp(), 1734983100);
 }
 
 #[test]
-fn test_news_article() {
+fn news_article_works() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::NewsArticle,
         news_article()
@@ -144,7 +144,7 @@ fn test_news_article() {
 }
 
 #[test]
-fn test_contract_news() {
+fn contract_news() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::TickNews,
         tick_news()
@@ -176,11 +176,11 @@ fn test_contract_news() {
     assert_eq!(article.article_id, "BZ$123");
     assert_eq!(article.headline, "Breaking news headline");
     assert_eq!(article.extra_data, "TSLA:123");
-    assert_eq!(article.time.unix_timestamp(), 1_672_531_200);
+    assert_eq!(article.time.unwrap().unix_timestamp(), 1_672_531_200);
 }
 
 #[test]
-fn test_broad_tape_news() {
+fn broad_tape_news() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::TickNews,
         tick_news()
@@ -212,11 +212,11 @@ fn test_broad_tape_news() {
     assert_eq!(article.article_id, "BZ$123");
     assert_eq!(article.headline, "Breaking news headline");
     assert_eq!(article.extra_data, "TSLA:123");
-    assert_eq!(article.time.unix_timestamp(), 1_672_531_200);
+    assert_eq!(article.time.unwrap().unix_timestamp(), 1_672_531_200);
 }
 
 #[test]
-fn test_contract_news_cancellation() {
+fn contract_news_cancellation() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -231,7 +231,7 @@ fn test_contract_news_cancellation() {
 }
 
 #[test]
-fn test_broad_tape_news_cancellation() {
+fn broad_tape_news_cancellation() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 

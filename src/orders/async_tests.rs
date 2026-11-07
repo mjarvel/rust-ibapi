@@ -7,15 +7,15 @@ use crate::common::test_utils::helpers::{
 use crate::contracts::{Contract, SecurityIdType, SecurityType};
 use crate::contracts::{Currency, Exchange, OptionRight, Symbol};
 use crate::messages::IncomingMessages;
-use crate::orders::builder::{BracketPrices, TrailBy};
+use crate::orders::builder::{BracketPrices, TrailBy, ValidationError};
 use crate::orders::{OcaType, OrderStatusKind, TimeInForce};
 use crate::proto;
 use crate::stubs::MessageBusStub;
 use crate::subscriptions::SubscriptionItem;
 use crate::testdata::builders::orders::{
-    cancel_order_request, commission_report, completed_order, completed_orders_end, completed_orders_request, execution_data, execution_data_end,
-    executions_request, global_cancel_request, next_valid_order_id_request, open_order, open_order_end, open_orders_request, order_bound,
-    order_status, place_order_request, CancelOrderRequestBuilder,
+    cancel_order_request, commission_and_fees_report, completed_order, completed_orders_end, completed_orders_request, execution_data,
+    execution_data_end, executions_request, global_cancel_request, next_valid_id, next_valid_order_id_request, open_order, open_order_end,
+    open_orders_request, order_bound, order_status, place_order_request, CancelOrderRequestBuilder,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
 use crate::{server_versions, Client};
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::time::Duration;
 
 #[tokio::test]
-async fn test_place_order() {
+async fn place_order() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::OpenOrder,
@@ -70,10 +70,10 @@ async fn test_place_order() {
                 .encode_proto(),
         ),
         proto_response(
-            IncomingMessages::CommissionsReport,
-            commission_report()
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
                 .execution_id("0001f4e5.58bbad52.01.01")
-                .commission(2.25)
+                .commission_and_fees(2.25)
                 .encode_proto(),
         ),
     ]));
@@ -114,11 +114,14 @@ async fn test_place_order() {
         execution_data
     );
 
-    let commission_report = subscription.next().await;
+    let commission_and_fees_report = subscription.next().await;
     assert!(
-        matches!(commission_report, Some(Ok(SubscriptionItem::Data(PlaceOrder::CommissionReport(_))))),
-        "Expected PlaceOrder::CommissionReport, got {:?}",
-        commission_report
+        matches!(
+            commission_and_fees_report,
+            Some(Ok(SubscriptionItem::Data(PlaceOrder::CommissionAndFeesReport(_))))
+        ),
+        "Expected PlaceOrder::CommissionAndFeesReport, got {:?}",
+        commission_and_fees_report
     );
 
     assert_eq!(request_message_count(&message_bus), 1);
@@ -144,31 +147,12 @@ async fn place_order_encodes_hedge_max_size() {
     assert_eq!(proto_order.hedge_max_size, Some(500));
 }
 
-// Placing an order with hedge_max_size against a server below the gate is rejected
-// before anything is sent (docs/rules/testing/exercise-production-code.md — real verify path).
-#[tokio::test]
-async fn place_order_rejects_hedge_max_size_below_gate() {
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
-    let client = Client::stubbed(message_bus.clone(), server_versions::HEDGE_MAX_SIZE - 1);
-
-    let contract = Contract::stock("TSLA").build();
-    let mut order = order_builder::market_order(Action::Buy, 100.0);
-    order.hedge_max_size = Some(500);
-
-    match client.place_order(20, &contract, &order).await {
-        Err(crate::Error::ServerVersion(required, _, _)) => assert_eq!(required, server_versions::HEDGE_MAX_SIZE),
-        Err(other) => panic!("expected ServerVersion error, got {other:?}"),
-        Ok(_) => panic!("expected place_order to be rejected below the hedge_max_size gate"),
-    }
-    assert_eq!(request_message_count(&message_bus), 0);
-}
-
 // Each flag is rejected below its gate before anything is sent, and sent at it.
 #[tokio::test]
-async fn place_order_gates_additional_order_params() {
-    use crate::orders::common::test_tables::ADDITIONAL_PARAM_GATES;
+async fn place_order_gates_order_params() {
+    use crate::orders::common::test_tables::ORDER_PARAM_GATES;
 
-    for gate in ADDITIONAL_PARAM_GATES {
+    for gate in ORDER_PARAM_GATES {
         let name = gate.name;
         let contract = Contract::stock("TSLA").build();
         let mut order = order_builder::market_order(Action::Buy, 100.0);
@@ -194,7 +178,7 @@ async fn place_order_gates_additional_order_params() {
 }
 
 #[tokio::test]
-async fn test_cancel_order() {
+async fn cancel_order() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::OrderStatus,
         order_status()
@@ -222,7 +206,7 @@ async fn test_cancel_order() {
 }
 
 #[tokio::test]
-async fn test_cancel_order_delivers_202_as_non_terminal_notice() {
+async fn cancel_order_delivers_202_as_non_terminal_notice() {
     // The cancellation confirmation (202) must arrive as a Notice and leave
     // the stream open: the OrderStatus frame queued behind it still arrives.
     let order_id = 1;
@@ -253,7 +237,7 @@ async fn test_cancel_order_delivers_202_as_non_terminal_notice() {
 }
 
 #[tokio::test]
-async fn test_open_orders() {
+async fn open_orders() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::OpenOrder,
@@ -312,7 +296,7 @@ async fn test_open_orders() {
 }
 
 #[tokio::test]
-async fn test_completed_orders() {
+async fn completed_orders() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::CompletedOrder,
@@ -356,7 +340,7 @@ async fn test_completed_orders() {
 }
 
 #[tokio::test]
-async fn test_executions() {
+async fn executions() {
     // All three responses are emitted only in response to RequestExecutions (gate 201)
     // or PlaceOrder (gate 203) — both ≤ floor 203, so the server always emits them as
     // proto and the text branch in the decoders is gone.
@@ -375,13 +359,14 @@ async fn test_executions() {
                 .price(5800.0)
                 .perm_id(2126726143)
                 .last_liquidity(1)
+                .option_exercise_type(100)
                 .encode_proto(),
         ),
         proto_response(
-            IncomingMessages::CommissionsReport,
-            commission_report()
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
                 .execution_id("0001f4e5.58bbad52.01.01")
-                .commission(2.25)
+                .commission_and_fees(2.25)
                 .encode_proto(),
         ),
         proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()),
@@ -398,16 +383,17 @@ async fn test_executions() {
     );
 
     let exec_data = subscription.next().await;
-    assert!(
-        matches!(exec_data, Some(Ok(SubscriptionItem::Data(Executions::ExecutionData(_))))),
-        "Expected Executions::ExecutionData, got {:?}",
-        exec_data
-    );
+    match exec_data {
+        Some(Ok(SubscriptionItem::Data(Executions::ExecutionData(data)))) => {
+            assert_eq!(data.execution.option_exercise_type, crate::orders::OptionExerciseType::Assigned);
+        }
+        other => panic!("Expected Executions::ExecutionData, got {other:?}"),
+    }
 
     let commission = subscription.next().await;
     assert!(
-        matches!(commission, Some(Ok(SubscriptionItem::Data(Executions::CommissionReport(_))))),
-        "Expected Executions::CommissionReport, got {:?}",
+        matches!(commission, Some(Ok(SubscriptionItem::Data(Executions::CommissionAndFeesReport(_))))),
+        "Expected Executions::CommissionAndFeesReport, got {:?}",
         commission
     );
 
@@ -423,7 +409,7 @@ async fn test_executions() {
 }
 
 #[tokio::test]
-async fn test_submit_order() {
+async fn submit_order() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -445,7 +431,7 @@ async fn test_submit_order() {
 }
 
 #[tokio::test]
-async fn test_exercise_options() {
+async fn exercise_options() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::OpenOrder,
         open_order()
@@ -493,11 +479,10 @@ async fn test_exercise_options() {
 }
 
 #[tokio::test]
-async fn test_next_valid_order_id() {
-    let next_valid_id_proto = crate::proto::NextValidId { order_id: Some(9123) };
+async fn next_valid_order_id() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::NextValidId,
-        prost::Message::encode_to_vec(&next_valid_id_proto),
+        next_valid_id().order_id(9123).encode_proto(),
     )]));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -520,7 +505,7 @@ async fn test_next_valid_order_id() {
 async fn next_valid_order_id_below_allocated_mark_does_not_rewind() {
     let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![proto_response(
         IncomingMessages::NextValidId,
-        prost::Message::encode_to_vec(&crate::proto::NextValidId { order_id: Some(5) }),
+        next_valid_id().order_id(5).encode_proto(),
     )]);
 
     let allocated = client.next_order_id();
@@ -531,7 +516,7 @@ async fn next_valid_order_id_below_allocated_mark_does_not_rewind() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream() {
+async fn order_update_stream() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::OrderStatus,
@@ -560,10 +545,10 @@ async fn test_order_update_stream() {
                 .encode_proto(),
         ),
         proto_response(
-            IncomingMessages::CommissionsReport,
-            commission_report()
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
                 .execution_id("0001f4e5.58bbad52.01.01")
-                .commission(2.25)
+                .commission_and_fees(2.25)
                 .encode_proto(),
         ),
     ]));
@@ -585,11 +570,11 @@ async fn test_order_update_stream() {
     let Some(Ok(SubscriptionItem::Data(update))) = stream.next().await else {
         panic!("expected Data");
     };
-    assert!(matches!(update, OrderUpdate::CommissionReport(_)));
+    assert!(matches!(update, OrderUpdate::CommissionAndFeesReport(_)));
 }
 
 #[tokio::test]
-async fn test_order_update_stream_survives_unknown_status() {
+async fn order_update_stream_survives_unknown_status() {
     // Regression test for #774: a status string this crate does not model
     // must arrive as OrderStatusKind::Unknown, not terminate the stream —
     // the frame queued behind it still arrives.
@@ -624,7 +609,7 @@ async fn test_order_update_stream_survives_unknown_status() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_survives_unknown_condition() {
+async fn order_update_stream_survives_unknown_condition() {
     // #827: an OpenOrder carrying a condition type this crate does not model
     // arrives as OrderCondition::Unknown and the frame queued behind it still arrives.
     let unknown = proto::OrderCondition {
@@ -656,7 +641,7 @@ async fn test_order_update_stream_survives_unknown_condition() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_survives_unknown_sec_type() {
+async fn order_update_stream_survives_unknown_sec_type() {
     // SecurityType is open: an OpenOrder frame whose contract carries a
     // sec_type this crate does not model arrives as SecurityType::Other and
     // the frame queued behind it still arrives.
@@ -685,7 +670,7 @@ async fn test_order_update_stream_survives_unknown_sec_type() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_survives_unknown_tif() {
+async fn order_update_stream_survives_unknown_tif() {
     // TimeInForce is open: an OpenOrder frame carrying a tif this crate
     // does not model arrives as TimeInForce::Unknown and the frame queued
     // behind it still arrives.
@@ -711,7 +696,7 @@ async fn test_order_update_stream_survives_unknown_tif() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_survives_unknown_security_id_type() {
+async fn order_update_stream_survives_unknown_security_id_type() {
     // SecurityIdType is open: a contract carrying an identifier scheme this
     // crate does not model arrives as SecurityIdType::Unknown and the frame
     // queued behind it still arrives (#840).
@@ -738,7 +723,7 @@ async fn test_order_update_stream_survives_unknown_security_id_type() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_ends_on_empty_action() {
+async fn order_update_stream_ends_on_empty_action() {
     // action is required: an OpenOrder frame with an empty action fails
     // decode with Error::Parse, which terminates the subscription — the
     // frame queued behind it is never delivered. The survives_unknown_tif
@@ -759,7 +744,7 @@ async fn test_order_update_stream_ends_on_empty_action() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_already_subscribed() {
+async fn order_update_stream_already_subscribed() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
 
@@ -775,7 +760,7 @@ async fn test_order_update_stream_already_subscribed() {
 }
 
 #[tokio::test]
-async fn test_order_update_stream_drop_releases_subscription() {
+async fn order_update_stream_drop_releases_subscription() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
 
@@ -789,7 +774,7 @@ async fn test_order_update_stream_drop_releases_subscription() {
 }
 
 #[tokio::test]
-async fn test_global_cancel() {
+async fn global_cancel() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::REQ_GLOBAL_CANCEL);
 
@@ -906,7 +891,10 @@ async fn submit_rejects_an_invalid_order_before_sending() {
         .submit()
         .await
         .expect_err("a negative quantity is invalid");
-    assert!(err.to_string().contains("Invalid quantity"), "got {err}");
+    assert!(
+        matches!(err, crate::Error::Validation(ValidationError::InvalidQuantity(q)) if q == -100.0),
+        "got {err:?}"
+    );
     assert_eq!(request_message_count(&bus), 0, "an invalid order must not reach the wire");
 }
 
@@ -1149,6 +1137,8 @@ async fn order_entry_points_reject_request_range_ids() {
     rejected(client.place_order(1, &contract, &with_parent).await.map(|_| ()), "place_order parent_id");
     rejected(client.submit_order(floor, &contract, &order).await, "submit_order");
     rejected(client.cancel_order(floor, "").await.map(|_| ()), "cancel_order");
+    rejected(client.order_status_stream(floor).await.map(|_| ()), "order_status_stream");
+    rejected(client.wait_for_fill(floor, std::time::Duration::ZERO).await.map(|_| ()), "wait_for_fill");
 
     client.raise_next_order_id(OrderId::from(floor));
     rejected(
@@ -1165,9 +1155,7 @@ async fn order_entry_points_reject_request_range_ids() {
 async fn next_valid_order_id_rejects_request_range() {
     let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![proto_response(
         IncomingMessages::NextValidId,
-        prost::Message::encode_to_vec(&crate::proto::NextValidId {
-            order_id: Some(REQUEST_ID_FLOOR),
-        }),
+        next_valid_id().order_id(REQUEST_ID_FLOOR).encode_proto(),
     )]);
 
     let result = client.next_valid_order_id().await;

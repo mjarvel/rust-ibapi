@@ -1,5 +1,7 @@
 //! Stream Retry example
 //!
+//! Streams realtime bars across reconnects with `Client::resubscribing`.
+//!
 //! # Usage
 //!
 //! ```bash
@@ -9,6 +11,8 @@
 use ibapi::client::blocking::Client;
 use ibapi::contracts::Contract;
 use ibapi::market_data::TradingHours;
+use ibapi::subscriptions::SubscriptionItem;
+use ibapi::TRANSPORT_RECONNECT_CODE;
 
 fn main() {
     env_logger::init();
@@ -18,30 +22,18 @@ fn main() {
 
     let contract = Contract::stock("AAPL").build();
 
-    'retry: loop {
-        // Request real-time bars data with 5-second intervals
-        let subscription = client
-            .realtime_bars(&contract)
-            .trading_hours(TradingHours::Extended)
-            .subscribe()
-            .expect("realtime bars request failed!");
+    // Resubscribes after each reconnect; ends on any other error, or once the
+    // client gave up reconnecting (ConnectionFailed) or was shut down (Shutdown).
+    let bars = client.resubscribing(|| client.realtime_bars(&contract).trading_hours(TradingHours::Extended).subscribe());
 
-        for bar in subscription.iter_data() {
-            match bar {
-                Ok(bar) => println!("bar: {bar:?}"),
-                Err(e) if e.is_connection_lost() => {
-                    eprintln!("Connection lost. Retrying stream...");
-                    continue 'retry;
-                }
-                // Everything else — including terminal ConnectionFailed (reconnect
-                // exhausted, client shut down) — is not recoverable here, so give up.
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    break 'retry;
-                }
+    for item in bars {
+        match item {
+            Ok(SubscriptionItem::Data(bar)) => println!("bar: {bar:?}"),
+            Ok(SubscriptionItem::Notice(notice)) if notice.code == TRANSPORT_RECONNECT_CODE => {
+                eprintln!("Resubscribed after a reconnect; bars from the outage are missing.")
             }
+            Ok(SubscriptionItem::Notice(notice)) => eprintln!("notice: {notice}"),
+            Err(e) => eprintln!("stream ended: {e}"),
         }
-
-        break;
     }
 }

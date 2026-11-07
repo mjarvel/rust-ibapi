@@ -1,7 +1,7 @@
 use time::OffsetDateTime;
 
 use crate::messages::ResponseMessage;
-use crate::proto::decoders::{parse_decimal_or_zero, required};
+use crate::proto::decoders::{required, required_decimal};
 use crate::{proto, Error};
 
 use super::super::{
@@ -54,13 +54,14 @@ pub(crate) fn decode_server_time_millis_proto(proto: crate::proto::CurrentTimeIn
 }
 
 pub(crate) fn decode_managed_accounts_proto(p: crate::proto::ManagedAccounts) -> Result<Vec<String>, Error> {
-    Ok(p.accounts_list
-        .as_deref()
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect())
+    Ok(split_account_list(p.accounts_list.as_deref().unwrap_or_default()))
+}
+
+/// Splits TWS's comma-separated account list, dropping empty entries (TWS
+/// may end the list with a comma). Shared with the handshake's copy on
+/// `Client`, so both read the same wire list the same way.
+pub(crate) fn split_account_list(list: &str) -> Vec<String> {
+    list.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
 pub(crate) fn decode_account_multi_value(message: &ResponseMessage) -> Result<AccountMultiValue, Error> {
@@ -74,7 +75,7 @@ pub(crate) fn decode_position_proto(p: crate::proto::Position) -> Result<Positio
     Ok(Position {
         account: p.account.unwrap_or_default(),
         contract,
-        position: parse_decimal_or_zero(p.position.as_deref())?,
+        position: required_decimal(p.position.as_deref(), "position", "Position")?,
         average_cost: p.avg_cost.unwrap_or_default(),
     })
 }
@@ -92,7 +93,7 @@ pub(crate) fn decode_account_portfolio_value_proto(p: crate::proto::PortfolioVal
     let contract = proto::decoders::decode_contract(required(p.contract.as_ref(), "contract", "PortfolioValue")?)?;
     Ok(AccountPortfolioValue {
         contract,
-        position: parse_decimal_or_zero(p.position.as_deref())?,
+        position: required_decimal(p.position.as_deref(), "position", "PortfolioValue")?,
         market_price: p.market_price.unwrap_or_default(),
         market_value: p.market_value.unwrap_or_default(),
         average_cost: p.average_cost.unwrap_or_default(),
@@ -104,7 +105,7 @@ pub(crate) fn decode_account_portfolio_value_proto(p: crate::proto::PortfolioVal
 
 pub(crate) fn decode_pnl_proto(p: crate::proto::PnL) -> Result<PnL, Error> {
     Ok(PnL {
-        daily_pnl: p.daily_pn_l.unwrap_or_default(),
+        daily_pnl: proto::decoders::optional_f64(p.daily_pn_l),
         unrealized_pnl: proto::decoders::optional_f64(p.unrealized_pn_l),
         realized_pnl: proto::decoders::optional_f64(p.realized_pn_l),
     })
@@ -112,11 +113,11 @@ pub(crate) fn decode_pnl_proto(p: crate::proto::PnL) -> Result<PnL, Error> {
 
 pub(crate) fn decode_pnl_single_proto(p: crate::proto::PnLSingle) -> Result<PnLSingle, Error> {
     Ok(PnLSingle {
-        position: parse_decimal_or_zero(p.position.as_deref())?,
-        daily_pnl: p.daily_pn_l.unwrap_or_default(),
-        unrealized_pnl: p.unrealized_pn_l.unwrap_or_default(),
-        realized_pnl: p.realized_pn_l.unwrap_or_default(),
-        value: p.value.unwrap_or_default(),
+        position: required_decimal(p.position.as_deref(), "position", "PnLSingle")?,
+        daily_pnl: proto::decoders::optional_f64(p.daily_pn_l),
+        unrealized_pnl: proto::decoders::optional_f64(p.unrealized_pn_l),
+        realized_pnl: proto::decoders::optional_f64(p.realized_pn_l),
+        value: proto::decoders::optional_f64(p.value),
     })
 }
 
@@ -140,7 +141,7 @@ pub(crate) fn decode_position_multi_proto(p: crate::proto::PositionMulti) -> Res
     Ok(PositionMulti {
         account: p.account.unwrap_or_default(),
         contract,
-        position: parse_decimal_or_zero(p.position.as_deref())?,
+        position: required_decimal(p.position.as_deref(), "position", "PositionMulti")?,
         average_cost: p.avg_cost.unwrap_or_default(),
         model_code: p.model_code.unwrap_or_default(),
     })

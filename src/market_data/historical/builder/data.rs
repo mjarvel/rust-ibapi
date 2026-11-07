@@ -1,7 +1,10 @@
 use time::OffsetDateTime;
 
+use crate::client::ids::RequestId;
 use crate::contracts::Contract;
-use crate::market_data::historical::{BarSize, BarTimestamp, Duration, HistoricalBarUpdate, HistoricalData, HistoricalSnapshotUpdate, WhatToShow};
+use crate::market_data::historical::{
+    BarRequest, BarSize, Duration, HistoricalBarUpdate, HistoricalData, HistoricalDataFrame, HistoricalSnapshotUpdate, WhatToShow,
+};
 use crate::market_data::TradingHours;
 use crate::Error;
 
@@ -14,10 +17,16 @@ mod tests;
 /// Required: one of [`duration`](Self::duration) (with optional [`ending`](Self::ending))
 /// or [`between`](Self::between) to specify the time range. Mixing the two styles
 /// errors at the terminal.
-#[must_use = "HistoricalDataBuilder does nothing until you call .fetch(), .fetch_once(), .snapshot_once() or .stream()"]
+///
+/// Three terminals: `fetch` collects the bars, retrying after a connection
+/// reset; `subscribe` sends once and hands back the frames; `stream` keeps the
+/// bars up to date. This fork adds `fetch_once` (strict, never resent) and
+/// `snapshot_once` (finite envelopes keeping optional wire values).
+#[must_use = "HistoricalDataBuilder does nothing until you call .fetch(), .fetch_once(), .snapshot_once(), .subscribe() or .stream()"]
 pub struct HistoricalDataBuilder<'a, C> {
     client: &'a C,
     contract: &'a Contract,
+    request_id: RequestId,
     bar_size: BarSize,
     what_to_show: WhatToShow,
     trading_hours: TradingHours,
@@ -28,10 +37,11 @@ pub struct HistoricalDataBuilder<'a, C> {
 }
 
 impl<'a, C> HistoricalDataBuilder<'a, C> {
-    pub(crate) fn new(client: &'a C, contract: &'a Contract, bar_size: BarSize) -> Self {
+    pub(crate) fn new(client: &'a C, contract: &'a Contract, bar_size: BarSize, request_id: RequestId) -> Self {
         Self {
             client,
             contract,
+            request_id,
             bar_size,
             what_to_show: WhatToShow::Trades,
             trading_hours: TradingHours::Regular,
@@ -40,6 +50,14 @@ impl<'a, C> HistoricalDataBuilder<'a, C> {
             between: None,
             buffer_limit: None,
         }
+    }
+
+    /// The request id the terminal will send. Allocated when the builder was
+    /// made; nothing has been written yet. A dropped builder skips the id.
+    /// `fetch` sends its first attempt under it, and a resend after a
+    /// connection reset under a new one.
+    pub fn request_id(&self) -> i32 {
+        self.request_id.raw()
     }
 
     /// Override the data type to retrieve (defaults to [`WhatToShow::Trades`]).
@@ -79,8 +97,8 @@ impl<'a, C> HistoricalDataBuilder<'a, C> {
         self
     }
 
-    /// Fail the [`stream`](Self::stream) instead of queueing more than `limit`
-    /// unread items.
+    /// Fail the subscription from `stream` or `subscribe` instead of queueing
+    /// more than `limit` unread items.
     ///
     /// When `limit` items are unread and another arrives, the subscription
     /// yields every queued item, then [`Error::BufferLimitExceeded`], then
@@ -89,6 +107,8 @@ impl<'a, C> HistoricalDataBuilder<'a, C> {
     /// with one difference: this stream has no end marker (the
     /// [`HistoricalBarUpdate::End`] after the initial bars is an item and
     /// counts), so a reader that stops reading always overflows eventually.
+    /// On `subscribe`, `Bars` and `End` are two items: with a `limit` of 1,
+    /// `End` overflows unless `Bars` was read first.
     /// `limit` must be `1..=`[`MAX_BUFFER_LIMIT`](crate::subscriptions::MAX_BUFFER_LIMIT).
     ///
     /// [`fetch`](Self::fetch) returns a single response, so it rejects a
@@ -179,7 +199,7 @@ async fn main() {
     fn resolve_for_fetch(&self) -> Result<(Option<OffsetDateTime>, Duration), Error> {
         if self.buffer_limit.is_some() {
             return Err(Error::InvalidArgument(
-                "historical_data().fetch(): buffer_limit applies to .stream() only".to_owned(),
+                "historical_data().fetch(): buffer_limit applies to .stream() and .subscribe() only".to_owned(),
             ));
         }
         self.resolve_date_spec()
@@ -204,6 +224,18 @@ async fn main() {
             (None, None, _) => Err(Error::InvalidArgument(
                 "historical_data: must set .duration() or .between(...)".to_owned(),
             )),
+        }
+    }
+
+    /// The request's parameters, with the resolved date spec.
+    fn bar_request(&self, end_date: Option<OffsetDateTime>, duration: Duration) -> BarRequest<'a> {
+        BarRequest {
+            contract: self.contract,
+            end_date,
+            duration,
+            bar_size: self.bar_size,
+            what_to_show: self.what_to_show,
+            trading_hours: self.trading_hours,
         }
     }
 
@@ -244,15 +276,11 @@ fn covering_duration(span: time::Duration) -> Duration {
 }
 
 /// Drop bars outside `[start, end)` when the request came from [`between`](HistoricalDataBuilder::between).
-fn trim_to_range(mut data: HistoricalData, range: Option<(OffsetDateTime, OffsetDateTime)>) -> HistoricalData {
-    let Some((start, end)) = range else {
-        return data;
-    };
-    let (first, last) = (BarTimestamp::from(start), BarTimestamp::from(end));
-    data.bars.retain(|bar| bar.date >= first && bar.date < last);
-    data.start = start;
-    data.end = end;
-    data
+fn trim_to_range(data: HistoricalData, range: Option<(OffsetDateTime, OffsetDateTime)>) -> HistoricalData {
+    match range {
+        Some((start, end)) => data.trim_to(start, end),
+        None => data,
+    }
 }
 
 #[cfg(feature = "sync")]
@@ -267,7 +295,12 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     /// - [`Error::Notice`] when TWS rejects the request (e.g. 162, no data).
     /// - [`Error::UnexpectedEndOfStream`] if the response closes before the end
     ///   marker, so a partial download is never returned as complete.
-    /// - [`Error::UnexpectedResponse`] if another message arrives in its place.
+    /// - [`Error::UnexpectedResponse`] if the bars and the end marker arrive out of order.
+    /// - [`Error::Timeout`] if the end marker hasn't arrived within the client's
+    ///   [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout).
+    ///
+    /// Without a `one_shot_timeout`, waits without a time limit. Any error
+    /// before the end marker cancels the request at TWS.
     ///
     /// # Examples
     ///
@@ -297,16 +330,90 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     /// ```
     pub fn fetch(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_for_fetch()?;
-        let data = crate::market_data::historical::sync::historical_data(
-            self.client,
-            self.contract,
-            end_date,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
-        )?;
+        let data = crate::market_data::historical::sync::historical_data(self.client, self.bar_request(end_date, duration), self.request_id)?;
         Ok(trim_to_range(data, self.between))
+    }
+
+    /// Send the request once and return a subscription of its
+    /// [`HistoricalDataFrame`]s: [`Bars`](HistoricalDataFrame::Bars), then
+    /// [`End`](HistoricalDataFrame::End), after which the stream ends.
+    ///
+    /// Unlike [`fetch`](Self::fetch), the caller owns the request: its id is
+    /// [`request_id`](Self::request_id), it is never resent (after a connection
+    /// reset, build a new request), and only the caller bounds the wait.
+    /// [`ending`](Self::ending), [`between`](Self::between) and
+    /// [`buffer_limit`](Self::buffer_limit) all apply. The bars come as TWS sent
+    /// them: after `between`, build a [`HistoricalData`] from them and the `End`
+    /// window and call [`trim_to`](HistoricalData::trim_to).
+    ///
+    /// Dropping the subscription before `End` sends `cancelHistoricalData`. To
+    /// know when TWS is done with the request, use `cancel_and_drain`. Any TWS
+    /// error ends a historical request, so after one it returns `Rejected`
+    /// without writing a cancel. Observed live (server 226), TWS answers a
+    /// cancel of a request still running with error 162 ("API historical data
+    /// query cancelled"), so `cancel_and_drain` returns `Rejected` with code
+    /// 162: the request is over at TWS.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`], with nothing sent, for an invalid date range,
+    /// [`WhatToShow::AdjustedLast`] with an end date, or a `buffer_limit`
+    /// outside `1..=`[`MAX_BUFFER_LIMIT`](crate::subscriptions::MAX_BUFFER_LIMIT).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::market_data::historical::{BarSize, HistoricalData, HistoricalDataFrame};
+    /// use ibapi::subscriptions::SubscriptionItem;
+    /// use std::time::{Duration, Instant};
+    /// use time::macros::datetime;
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// let contract = Contract::stock("AAPL").build();
+    /// let (start, end) = (datetime!(2023-04-10 0:00 UTC), datetime!(2023-04-15 0:00 UTC));
+    ///
+    /// let request = client.historical_data(&contract, BarSize::Hour).between(start, end);
+    /// println!("request id: {}", request.request_id());
+    /// let subscription = request.subscribe().expect("request failed");
+    ///
+    /// // Bars read before a timed-out wait are kept; the next read resumes.
+    /// let deadline = Instant::now() + Duration::from_secs(30);
+    /// let mut bars = None;
+    /// loop {
+    ///     let remaining = deadline.saturating_duration_since(Instant::now());
+    ///     match subscription.next_timeout(remaining) {
+    ///         Some(Ok(SubscriptionItem::Data(HistoricalDataFrame::Bars(received)))) => bars = Some(received),
+    ///         Some(Ok(SubscriptionItem::Data(HistoricalDataFrame::End { start: served_start, end: served_end }))) => {
+    ///             if let Some(bars) = bars.take() {
+    ///                 let data = HistoricalData { start: served_start, end: served_end, bars };
+    ///                 println!("{} bars", data.trim_to(start, end).bars.len());
+    ///             }
+    ///             break;
+    ///         }
+    ///         Some(Ok(SubscriptionItem::Notice(notice))) => eprintln!("notice: {notice}"),
+    ///         Some(Err(e)) => {
+    ///             eprintln!("error: {e}");
+    ///             break;
+    ///         }
+    ///         None if subscription.is_terminated() => break,
+    ///         None => {
+    ///             // Timed out: cancel, and wait a little to learn whether TWS is done.
+    ///             let outcome = subscription.cancel_and_drain(Instant::now() + Duration::from_secs(5));
+    ///             eprintln!("timed out: {outcome:?}");
+    ///             break;
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub fn subscribe(self) -> Result<crate::subscriptions::sync::Subscription<HistoricalDataFrame>, Error> {
+        let (end_date, duration) = self.resolve_date_spec()?;
+        crate::market_data::historical::sync::historical_data_subscription(
+            self.client,
+            self.bar_request(end_date, duration),
+            self.request_id,
+            self.buffer_limit,
+        )
     }
 
     /// Subscribe to one finite historical response, retaining request notices.
@@ -341,20 +448,17 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
         let (end_date, duration) = self.resolve_for_fetch()?;
         crate::market_data::historical::sync::historical_snapshot_subscription_once(
             self.client,
-            self.contract,
-            end_date,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
+            self.bar_request(end_date, duration),
+            self.request_id,
         )
     }
 
     /// Fetch one strictly completed response without replay on connection reset.
     ///
     /// Requires HistoricalDataEnd; missing completion is UnexpectedEndOfStream.
-    /// A stream-only buffer_limit is rejected before sending.
-    /// Applications owning reconnect/generation policy should use this method.
+    /// A stream-only buffer_limit is rejected before sending. Like
+    /// [`fetch`](Self::fetch), the wait is bounded by the client's `one_shot_timeout`
+    /// when one is set. Applications owning reconnect/generation policy should use this method.
     ///
     /// # Examples
     ///
@@ -367,15 +471,7 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     /// ```
     pub fn fetch_once(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_for_fetch()?;
-        let data = crate::market_data::historical::sync::historical_data_once(
-            self.client,
-            self.contract,
-            end_date,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
-        )?;
+        let data = crate::market_data::historical::sync::historical_data_once(self.client, self.bar_request(end_date, duration), self.request_id)?;
         Ok(trim_to_range(data, self.between))
     }
 
@@ -407,11 +503,8 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
         let duration = self.resolve_for_stream()?;
         crate::market_data::historical::sync::historical_data_stream(
             self.client,
-            self.contract,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
+            self.bar_request(None, duration),
+            self.request_id,
             self.buffer_limit,
         )
     }
@@ -429,7 +522,13 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// - [`Error::Notice`] when TWS rejects the request (e.g. 162, no data).
     /// - [`Error::UnexpectedEndOfStream`] if the response closes before the end
     ///   marker, so a partial download is never returned as complete.
-    /// - [`Error::UnexpectedResponse`] if another message arrives in its place.
+    /// - [`Error::UnexpectedResponse`] if the bars and the end marker arrive out of order.
+    /// - [`Error::Timeout`] if the end marker hasn't arrived within the client's
+    ///   [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout).
+    ///
+    /// Without a `one_shot_timeout`, waits without a time limit; to bound one
+    /// call, wrap the future in `tokio::time::timeout`. Dropping it, or any
+    /// error, before the end marker cancels the request at TWS.
     ///
     /// # Examples
     ///
@@ -462,17 +561,92 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// ```
     pub async fn fetch(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_for_fetch()?;
-        let data = crate::market_data::historical::r#async::historical_data(
-            self.client,
-            self.contract,
-            end_date,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
-        )
-        .await?;
+        let data =
+            crate::market_data::historical::r#async::historical_data(self.client, self.bar_request(end_date, duration), self.request_id).await?;
         Ok(trim_to_range(data, self.between))
+    }
+
+    /// Send the request once and return a subscription of its
+    /// [`HistoricalDataFrame`]s: [`Bars`](HistoricalDataFrame::Bars), then
+    /// [`End`](HistoricalDataFrame::End), after which the stream ends.
+    ///
+    /// Unlike [`fetch`](Self::fetch), the caller owns the request: its id is
+    /// [`request_id`](Self::request_id), it is never resent (after a connection
+    /// reset, build a new request), and only the caller bounds the wait.
+    /// [`ending`](Self::ending), [`between`](Self::between) and
+    /// [`buffer_limit`](Self::buffer_limit) all apply. The bars come as TWS sent
+    /// them: after `between`, build a [`HistoricalData`] from them and the `End`
+    /// window and call [`trim_to`](HistoricalData::trim_to).
+    ///
+    /// Dropping the subscription before `End` sends `cancelHistoricalData`. To
+    /// know when TWS is done with the request, use `cancel_and_drain`. Any TWS
+    /// error ends a historical request, so after one it returns `Rejected`
+    /// without writing a cancel. Observed live (server 226), TWS answers a
+    /// cancel of a request still running with error 162 ("API historical data
+    /// query cancelled"), so `cancel_and_drain` returns `Rejected` with code
+    /// 162: the request is over at TWS.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`], with nothing sent, for an invalid date range,
+    /// [`WhatToShow::AdjustedLast`] with an end date, or a `buffer_limit`
+    /// outside `1..=`[`MAX_BUFFER_LIMIT`](crate::subscriptions::MAX_BUFFER_LIMIT).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::prelude::*;
+    /// use ibapi::market_data::historical::{HistoricalData, HistoricalDataFrame};
+    /// use time::macros::datetime;
+    /// use tokio::time::{timeout_at, Duration, Instant};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let (start, end) = (datetime!(2023-04-10 0:00 UTC), datetime!(2023-04-15 0:00 UTC));
+    ///
+    ///     let request = client.historical_data(&contract, HistoricalBarSize::Hour).between(start, end);
+    ///     println!("request id: {}", request.request_id());
+    ///     let mut subscription = request.subscribe().await.expect("request failed");
+    ///
+    ///     // `next()` is cancel-safe: bars read before a timed-out wait are kept.
+    ///     let deadline = Instant::now() + Duration::from_secs(30);
+    ///     let mut bars = None;
+    ///     loop {
+    ///         match timeout_at(deadline, subscription.next()).await {
+    ///             Ok(Some(Ok(SubscriptionItem::Data(HistoricalDataFrame::Bars(received))))) => bars = Some(received),
+    ///             Ok(Some(Ok(SubscriptionItem::Data(HistoricalDataFrame::End { start: served_start, end: served_end })))) => {
+    ///                 if let Some(bars) = bars.take() {
+    ///                     let data = HistoricalData { start: served_start, end: served_end, bars };
+    ///                     println!("{} bars", data.trim_to(start, end).bars.len());
+    ///                 }
+    ///                 break;
+    ///             }
+    ///             Ok(Some(Ok(SubscriptionItem::Notice(notice)))) => eprintln!("notice: {notice}"),
+    ///             Ok(Some(Err(e))) => {
+    ///                 eprintln!("error: {e}");
+    ///                 break;
+    ///             }
+    ///             Ok(None) => break,
+    ///             Err(_elapsed) => {
+    ///                 // Timed out: cancel, and wait a little to learn whether TWS is done.
+    ///                 let outcome = subscription.cancel_and_drain(Instant::now() + Duration::from_secs(5)).await;
+    ///                 eprintln!("timed out: {outcome:?}");
+    ///                 break;
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn subscribe(self) -> Result<crate::subscriptions::r#async::Subscription<HistoricalDataFrame>, Error> {
+        let (end_date, duration) = self.resolve_date_spec()?;
+        crate::market_data::historical::r#async::historical_data_subscription(
+            self.client,
+            self.bar_request(end_date, duration),
+            self.request_id,
+            self.buffer_limit,
+        )
+        .await
     }
 
     /// Subscribe to one finite historical response, retaining request notices.
@@ -508,12 +682,8 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
         let (end_date, duration) = self.resolve_for_fetch()?;
         crate::market_data::historical::r#async::historical_snapshot_subscription_once(
             self.client,
-            self.contract,
-            end_date,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
+            self.bar_request(end_date, duration),
+            self.request_id,
         )
         .await
     }
@@ -521,8 +691,9 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// Fetch one strictly completed response without replay on connection reset.
     ///
     /// Requires HistoricalDataEnd; missing completion is UnexpectedEndOfStream.
-    /// A stream-only buffer_limit is rejected before sending.
-    /// Applications owning reconnect/generation policy should use this method.
+    /// A stream-only buffer_limit is rejected before sending. Like
+    /// [`fetch`](Self::fetch), the wait is bounded by the client's `one_shot_timeout`
+    /// when one is set. Applications owning reconnect/generation policy should use this method.
     ///
     /// # Examples
     ///
@@ -535,16 +706,8 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// ```
     pub async fn fetch_once(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_for_fetch()?;
-        let data = crate::market_data::historical::r#async::historical_data_once(
-            self.client,
-            self.contract,
-            end_date,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
-        )
-        .await?;
+        let data =
+            crate::market_data::historical::r#async::historical_data_once(self.client, self.bar_request(end_date, duration), self.request_id).await?;
         Ok(trim_to_range(data, self.between))
     }
 
@@ -573,15 +736,12 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     ///     drop(subscription);
     /// }
     /// ```
-    pub async fn stream(self) -> Result<crate::subscriptions::Subscription<HistoricalBarUpdate>, Error> {
+    pub async fn stream(self) -> Result<crate::subscriptions::r#async::Subscription<HistoricalBarUpdate>, Error> {
         let duration = self.resolve_for_stream()?;
         crate::market_data::historical::r#async::historical_data_stream(
             self.client,
-            self.contract,
-            duration,
-            self.bar_size,
-            self.what_to_show,
-            self.trading_hours,
+            self.bar_request(None, duration),
+            self.request_id,
             self.buffer_limit,
         )
         .await

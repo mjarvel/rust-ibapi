@@ -153,17 +153,17 @@ fn check_tick<T: TickDecoder<T>>(roster: &mut Roster) {
 }
 
 /// The roster. One line per production `impl StreamDecoder` / `impl TickDecoder`;
-/// kept honest by [`test_decoder_roster_is_complete`].
+/// kept honest by [`decoder_roster_is_complete`].
 fn check_all() -> Roster {
     use crate::accounts::{AccountSummaryResult, AccountUpdate, AccountUpdateMulti, PnL, PnLSingle, PositionUpdate, PositionUpdateMulti};
-    use crate::contracts::{ContractDetails, OptionChain, OptionComputation};
+    use crate::contracts::{ContractDetails, OptionChain};
     use crate::display_groups::DisplayGroupUpdate;
-    use crate::market_data::historical::{HistoricalBarUpdate, HistoricalSnapshotUpdate, TickBidAsk, TickLast, TickMidpoint};
+    use crate::market_data::historical::{HistoricalBarUpdate, HistoricalDataFrame, HistoricalSnapshotUpdate, TickBidAsk, TickLast, TickMidpoint};
     use crate::market_data::realtime::{Bar, BidAsk, MarketDepths, MidPoint, TickTypes, Trade};
     use crate::news::{NewsArticle, NewsBulletin};
     use crate::orders::{CancelOrder, Executions, ExerciseOptions, OrderStatus, OrderUpdate, Orders, PlaceOrder};
     use crate::scanner::ScannerData;
-    use crate::wsh::{WshEventData, WshMetadata};
+    use crate::wsh::WshEventData;
 
     let mut roster = Roster::default();
 
@@ -176,10 +176,10 @@ fn check_all() -> Roster {
     check_stream::<PositionUpdateMulti>(&mut roster);
     check_stream::<ContractDetails>(&mut roster);
     check_stream::<OptionChain>(&mut roster);
-    check_stream::<OptionComputation>(&mut roster);
     check_stream::<DisplayGroupUpdate>(&mut roster);
     check_stream::<HistoricalBarUpdate>(&mut roster);
     check_stream::<HistoricalSnapshotUpdate>(&mut roster);
+    check_stream::<HistoricalDataFrame>(&mut roster);
     check_stream::<Bar>(&mut roster);
     check_stream::<BidAsk>(&mut roster);
     check_stream::<MarketDepths>(&mut roster);
@@ -197,7 +197,6 @@ fn check_all() -> Roster {
     check_stream::<PlaceOrder>(&mut roster);
     check_stream::<Vec<ScannerData>>(&mut roster);
     check_stream::<WshEventData>(&mut roster);
-    check_stream::<WshMetadata>(&mut roster);
 
     check_tick::<TickBidAsk>(&mut roster);
     check_tick::<TickLast>(&mut roster);
@@ -207,7 +206,7 @@ fn check_all() -> Roster {
 }
 
 #[test]
-fn test_response_message_ids_match_decode_arms() {
+fn response_message_ids_match_decode_arms() {
     let roster = check_all();
 
     assert!(
@@ -225,7 +224,7 @@ fn test_response_message_ids_match_decode_arms() {
 /// Counted per trait, so a `TickDecoder` added while a `StreamDecoder` is
 /// deleted cannot net out to zero.
 #[test]
-fn test_decoder_roster_is_complete() {
+fn decoder_roster_is_complete() {
     let roster = check_all();
     let found = collect_impls(&[STREAM_HEADER, TICK_HEADER]);
 

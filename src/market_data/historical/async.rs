@@ -9,11 +9,11 @@ use futures::Stream;
 use log::error;
 use time::OffsetDateTime;
 
+use crate::client::ids::RequestId;
 use crate::client::ClientRequestBuilders;
-use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
+use crate::common::request_helpers::{self, empty_on_end_of_stream};
 use crate::common::retry::retry_on_connection_reset;
 use crate::contracts::Contract;
-use crate::messages::IncomingMessages;
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::common::SubscriptionItem;
 use crate::subscriptions::log_cancel_error;
@@ -22,8 +22,11 @@ use crate::transport::{AsyncInternalSubscription, AsyncMessageBus};
 use crate::{Client, Error};
 
 use super::common::tick::{classify, TickAction};
-use super::common::{self, decoders, encoders};
-use super::{BarSize, Duration, HistogramEntry, HistoricalBarUpdate, HistoricalData, Schedule, TickDecoder, WhatToShow};
+use super::common::{self, encoders};
+use super::{
+    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalBarUpdate, HistoricalData, HistoricalDataFrame,
+    Schedule, ScheduleRequest, TickDecoder, WhatToShow,
+};
 use crate::market_data::TradingHours;
 
 // === Public API Functions ===
@@ -58,11 +61,9 @@ impl Client {
     /// }
     /// ```
     pub async fn head_timestamp(&self, contract: &Contract, what_to_show: WhatToShow, trading_hours: TradingHours) -> Result<OffsetDateTime, Error> {
-        request_helpers::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_request_head_timestamp(request_id, contract, what_to_show, trading_hours.use_rth()),
-            expect_proto(decoders::decode_head_timestamp_proto),
-        )
+        request_helpers::one_shot_cancelling::<HeadTimestampRequest>(self, |request_id| {
+            encoders::encode_request_head_timestamp(request_id, contract, what_to_show, trading_hours.use_rth())
+        })
         .await
     }
 
@@ -110,12 +111,15 @@ impl Client {
     /// }
     /// ```
     pub fn historical_data<'a>(&'a self, contract: &'a Contract, bar_size: BarSize) -> super::HistoricalDataBuilder<'a, Self> {
-        super::HistoricalDataBuilder::new(self, contract, bar_size)
+        super::HistoricalDataBuilder::new(self, contract, bar_size, self.mint_request_id())
     }
 
     /// Build a request for [`Schedule`] data over the given duration.
     ///
-    /// Defaults to anchoring at the current time. Use [`HistoricalScheduleBuilder::ending`](super::HistoricalScheduleBuilder::ending)
+    /// Defaults to regular trading hours, anchored at the current time. Use
+    /// [`HistoricalScheduleBuilder::trading_hours`](super::HistoricalScheduleBuilder::trading_hours)
+    /// to include extended-hours sessions, and
+    /// [`HistoricalScheduleBuilder::ending`](super::HistoricalScheduleBuilder::ending)
     /// to anchor at a specific end date.
     ///
     /// # Arguments
@@ -126,6 +130,7 @@ impl Client {
     ///
     /// ```no_run
     /// use ibapi::prelude::*;
+    /// use ibapi::market_data::TradingHours;
     /// use time::macros::datetime;
     ///
     /// #[tokio::main]
@@ -133,17 +138,18 @@ impl Client {
     ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
     ///     let contract = Contract::stock("GM").build();
     ///
-    ///     // Ending now:
-    ///     let schedule = client
-    ///         .historical_schedules(&contract, 30.days())
-    ///         .fetch()
-    ///         .await
-    ///         .expect("historical schedule request failed");
-    ///
     ///     // Anchored to a specific end date:
     ///     let schedule = client
     ///         .historical_schedules(&contract, 30.days())
     ///         .ending(datetime!(2023-04-15 0:00 UTC))
+    ///         .fetch()
+    ///         .await
+    ///         .expect("historical schedule request failed");
+    ///
+    ///     // Extended-hours sessions, ending now:
+    ///     let schedule = client
+    ///         .historical_schedules(&contract, 30.days())
+    ///         .trading_hours(TradingHours::Extended)
     ///         .fetch()
     ///         .await
     ///         .expect("historical schedule request failed");
@@ -266,126 +272,108 @@ impl Client {
     /// }
     /// ```
     pub async fn histogram_data(&self, contract: &Contract, trading_hours: TradingHours, period: BarSize) -> Result<Vec<HistogramEntry>, Error> {
-        request_helpers::one_shot_by_request_id(
-            self,
-            |request_id| encoders::encode_request_histogram_data(request_id, contract, trading_hours.use_rth(), period),
-            expect_proto(decoders::decode_histogram_data_proto),
-        )
+        request_helpers::one_shot_cancelling::<HistogramRequest>(self, |request_id| {
+            encoders::encode_request_histogram_data(request_id, contract, trading_hours.use_rth(), period)
+        })
         .await
         .or_else(empty_on_end_of_stream)
     }
 }
 
-pub(crate) async fn historical_data(
-    client: &Client,
-    contract: &Contract,
-    end_date: Option<OffsetDateTime>,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
-) -> Result<HistoricalData, Error> {
-    retry_on_connection_reset(client, || async {
-        historical_data_once(client, contract, end_date, duration, bar_size, what_to_show, trading_hours).await
+pub(crate) async fn historical_data(client: &Client, request: BarRequest<'_>, request_id: RequestId) -> Result<HistoricalData, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    // One deadline for both reads and every resend.
+    let deadline = request_helpers::one_shot_deadline(client);
+    let mut first_id = Some(request_id);
+
+    retry_on_connection_reset(client, deadline, || {
+        // The first attempt uses the builder's id; a resend takes a new one.
+        let first_id = first_id.take();
+        async move {
+            request_helpers::check_deadline(deadline)?;
+            let builder = match first_id {
+                Some(id) => client.request_with_id(id),
+                None => client.request(),
+            };
+            let message = request.encode(builder.request_id(), false)?;
+
+            // The window frame is a second read, which is why this is not a
+            // one-shot and cannot use the helpers in `common::request_helpers`.
+            // Dropping the subscription before it, on any error below or with
+            // the future, sends TWS's cancel; after it, nothing is sent.
+            let mut subscription = builder.send::<HistoricalDataFrame>(message).await?;
+
+            let bars = request_helpers::next_frame(&mut subscription, deadline).await?.into_bars()?;
+            // Only the window frame proves the download is complete, so a close
+            // before it is an error.
+            let (start, end) = request_helpers::next_frame(&mut subscription, deadline).await?.into_window()?;
+
+            Ok(HistoricalData { start, end, bars })
+        }
     })
     .await
 }
 
-// Builder-fed internal encoder seam, matching historical_data_once's flat arguments.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn historical_snapshot_subscription_once(
-    client: &Client,
-    contract: &Contract,
-    end_date: Option<OffsetDateTime>,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
-) -> Result<Subscription<HistoricalSnapshotUpdate>, Error> {
-    common::validate_historical_data(end_date, what_to_show)?;
-
-    let builder = client.request();
-    let request = encoders::encode_request_historical_data(
-        builder.request_id(),
-        contract,
-        end_date,
-        duration,
-        bar_size,
-        what_to_show,
-        trading_hours.use_rth(),
-        false,
-    )?;
-
-    builder.send::<HistoricalSnapshotUpdate>(request).await
-}
-
-// Builder-fed wire seam: the public API already names optional inputs.
-pub(crate) async fn historical_data_once(
-    client: &Client,
-    contract: &Contract,
-    end_date: Option<OffsetDateTime>,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
-) -> Result<HistoricalData, Error> {
-    common::validate_historical_data(end_date, what_to_show)?;
-
-    let builder = client.request();
-    let request = encoders::encode_request_historical_data(
-        builder.request_id(),
-        contract,
-        end_date,
-        duration,
-        bar_size,
-        what_to_show,
-        trading_hours.use_rth(),
-        false,
-    )?;
-
-    let mut subscription = builder.send_raw(request).await?;
-
-    let message = subscription.next().await.ok_or(Error::UnexpectedEndOfStream)??;
-    let mut data = decoders::decode_historical_data(message.expect_type(IncomingMessages::HistoricalData)?)?;
-
-    // Only the broker end frame proves completion. Both fetch entry points share
-    // this read, while their connection-reset retry policies remain distinct.
-    let end_message = subscription.next().await.ok_or(Error::UnexpectedEndOfStream)??;
-    (data.start, data.end) = decoders::decode_historical_data_end(end_message.expect_type(IncomingMessages::HistoricalDataEnd)?)?;
-
-    Ok(data)
-}
-
+/// `request.end_date` is `None`: IBKR requires it with `keep_up_to_date`.
 pub(crate) async fn historical_data_stream(
     client: &Client,
-    contract: &Contract,
-    duration: Duration,
-    bar_size: BarSize,
-    what_to_show: WhatToShow,
-    trading_hours: TradingHours,
+    request: BarRequest<'_>,
+    request_id: RequestId,
     buffer_limit: Option<usize>,
 ) -> Result<Subscription<HistoricalBarUpdate>, Error> {
-    let builder = client.request();
-    let request = encoders::encode_request_historical_data(
-        builder.request_id(),
-        contract,
-        None, // IBKR requires end_date=None when keep_up_to_date=true
-        duration,
-        bar_size,
-        what_to_show,
-        trading_hours.use_rth(),
-        true, // keep_up_to_date — the whole point of .stream()
-    )?;
+    let message = request.encode(request_id.raw(), true)?;
+    client.request_with_id(request_id).send_capped(message, buffer_limit).await
+}
 
-    builder.send_capped::<HistoricalBarUpdate>(request, buffer_limit).await
+/// Sent once, never resent: the caller owns the request. Reached through
+/// [`HistoricalDataBuilder::subscribe`](super::HistoricalDataBuilder::subscribe).
+pub(crate) async fn historical_data_subscription(
+    client: &Client,
+    request: BarRequest<'_>,
+    request_id: RequestId,
+    buffer_limit: Option<usize>,
+) -> Result<Subscription<HistoricalDataFrame>, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    let message = request.encode(request_id.raw(), false)?;
+    client.request_with_id(request_id).send_capped(message, buffer_limit).await
+}
+
+/// Fork: sent once with the builder's id; envelopes keep optional wire values.
+/// Reached through [`HistoricalDataBuilder::snapshot_once`](super::HistoricalDataBuilder::snapshot_once).
+pub(crate) async fn historical_snapshot_subscription_once(
+    client: &Client,
+    request: BarRequest<'_>,
+    request_id: RequestId,
+) -> Result<Subscription<HistoricalSnapshotUpdate>, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    let message = request.encode(request_id.raw(), false)?;
+    client.request_with_id(request_id).send::<HistoricalSnapshotUpdate>(message).await
+}
+
+/// Fork: one attempt of [`historical_data`], never resent after a connection
+/// reset, so applications that own reconnect policy see the reset. Shares its
+/// deadline and completion checks.
+pub(crate) async fn historical_data_once(client: &Client, request: BarRequest<'_>, request_id: RequestId) -> Result<HistoricalData, Error> {
+    common::validate_historical_data(request.end_date, request.what_to_show)?;
+    let deadline = request_helpers::one_shot_deadline(client);
+    let builder = client.request_with_id(request_id);
+    let message = request.encode(builder.request_id(), false)?;
+
+    // Dropping the subscription (or the future) before the window frame sends TWS's cancel.
+    let mut subscription = builder.send::<HistoricalDataFrame>(message).await?;
+    let bars = request_helpers::next_frame(&mut subscription, deadline).await?.into_bars()?;
+    // Only the window frame proves completion; a close before it is an error.
+    let (start, end) = request_helpers::next_frame(&mut subscription, deadline).await?.into_window()?;
+
+    Ok(HistoricalData { start, end, bars })
 }
 
 // pub(crate) internal plumbing called from `HistoricalTicksBuilder`; the
 // public API is already a builder, so flat args here are the deliberate
-// seam between the typed builder and the wire encoder (the builder-fed exception in
-// docs/rules/style/param-budget.md).
+// seam between the typed builder and the wire encoder. Internal, so the param
+// budget doesn't apply; the allow is for clippy's 8-arg lint.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn historical_ticks<T: TickDecoder<T> + Send>(
+pub(crate) async fn historical_ticks<T: TickDecoder<T>>(
     client: &Client,
     contract: &Contract,
     start: Option<OffsetDateTime>,
@@ -417,14 +405,20 @@ pub(crate) async fn historical_schedule(
     contract: &Contract,
     end_date: Option<OffsetDateTime>,
     duration: Duration,
+    trading_hours: TradingHours,
 ) -> Result<Schedule, Error> {
-    request_helpers::one_shot_by_request_id(
-        client,
-        |request_id| {
-            encoders::encode_request_historical_data(request_id, contract, end_date, duration, BarSize::Day, WhatToShow::Schedule, true, false)
-        },
-        expect_proto(decoders::decode_historical_schedule_proto),
-    )
+    request_helpers::one_shot_cancelling::<ScheduleRequest>(client, |request_id| {
+        encoders::encode_request_historical_data(
+            request_id,
+            contract,
+            end_date,
+            duration,
+            BarSize::Day,
+            WhatToShow::Schedule,
+            trading_hours.use_rth(),
+            false,
+        )
+    })
     .await
 }
 
@@ -446,7 +440,7 @@ pub(crate) async fn historical_schedule(
 /// for `.filter_data()` when you only want ticks. Both are in
 /// [`ibapi::prelude`](crate::prelude).
 #[must_use = "TickSubscription must be polled (.next().await or .filter_data()) to receive ticks; dropping it cancels the request"]
-pub struct TickSubscription<T: TickDecoder<T> + Send> {
+pub struct TickSubscription<T: TickDecoder<T>> {
     done: bool,
     stream_ended: bool,
     messages: AsyncInternalSubscription,
@@ -456,7 +450,7 @@ pub struct TickSubscription<T: TickDecoder<T> + Send> {
     cancelled: AtomicBool,
 }
 
-impl<T: TickDecoder<T> + Send> TickSubscription<T> {
+impl<T: TickDecoder<T>> TickSubscription<T> {
     fn new(messages: AsyncInternalSubscription, request_id: i32, message_bus: Arc<dyn AsyncMessageBus>) -> Self {
         Self {
             done: false,
@@ -510,7 +504,7 @@ impl<T: TickDecoder<T> + Send> TickSubscription<T> {
     }
 }
 
-impl<T: TickDecoder<T> + Send + Unpin> Stream for TickSubscription<T> {
+impl<T: TickDecoder<T> + Unpin> Stream for TickSubscription<T> {
     type Item = Result<SubscriptionItem<T>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -565,7 +559,7 @@ impl<T: TickDecoder<T> + Send + Unpin> Stream for TickSubscription<T> {
     }
 }
 
-impl<T: TickDecoder<T> + Send> Drop for TickSubscription<T> {
+impl<T: TickDecoder<T>> Drop for TickSubscription<T> {
     fn drop(&mut self) {
         if self.done || self.cancelled.swap(true, Ordering::Relaxed) {
             return;

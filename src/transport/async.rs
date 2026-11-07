@@ -18,20 +18,20 @@ pub(crate) use shutdown::ShutdownSignal;
 
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::Stream;
 use log::{debug, error, info, warn};
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::accounts::types::AccountId;
-use crate::client::id_generator::ClientIdManager;
+use crate::client::handshake_state::HandshakeState;
 use crate::client::ids::{OrderId, RequestId, WireId};
 use crate::connection::r#async::AsyncConnection;
 use crate::messages::{is_cancel_frame, transport_reconnect_notice, IncomingMessages, Notice, OutgoingMessages, ResponseMessage};
@@ -240,10 +240,18 @@ pub trait AsyncMessageBus: Send + Sync {
     fn request_shutdown_sync(&self);
 
     /// Resolve once the session is connected again, returning
-    /// [`Error::Shutdown`] if the session will never reconnect.
-    async fn wait_connected(&self) -> Result<(), Error>;
+    /// [`Error::ConnectionFailed`] if the reconnect gave up,
+    /// [`Error::Shutdown`] after a shutdown, or [`Error::Timeout`] if
+    /// `deadline` passes first.
+    async fn wait_connected(&self, deadline: Option<tokio::time::Instant>) -> Result<(), Error>;
 
     fn is_connected(&self) -> bool;
+
+    /// Counts sessions: 0 at connect, bumped each time a reconnect resets
+    /// the bus. A subscription compares it with the generation its request
+    /// was sent in: once they differ, the request died with an earlier
+    /// session and a cancel would name an id the current session never saw.
+    fn session_generation(&self) -> u64;
 
     /// The runtime the bus was built on. `Drop` impls spawn their async
     /// cleanup here, so it runs even when the drop is on a thread with no
@@ -269,6 +277,9 @@ pub struct AsyncInternalSubscription {
     lease: Option<(Lease, RouteKey)>,
     /// The shared-channel ticket, for a shared-channel subscription.
     shared: Option<SharedTicket>,
+    /// The bus session generation the request was sent in; see
+    /// [`AsyncMessageBus::session_generation`].
+    session: u64,
     /// Items this receiver has read, shared with a bounded route
     /// (`registry::RouteBound`) so it can tell how many are unread. `Sender::len()`
     /// can't: it counts values not yet seen by every receiver, and
@@ -295,6 +306,7 @@ impl Clone for AsyncInternalSubscription {
             // no-op while another clone still holds the lease.
             lease: self.lease.clone(),
             shared: self.shared,
+            session: self.session,
             reads: None,
             class: self.class,
         }
@@ -322,6 +334,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: None,
             lease: None,
             shared: None,
+            session: 0,
             reads: None,
             class: ChannelClass::default(),
         }
@@ -335,6 +348,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: Some(cleanup_sender),
             lease: None,
             shared: None,
+            session: 0,
             reads: None,
             class: ChannelClass::default(),
         }
@@ -349,6 +363,12 @@ impl AsyncInternalSubscription {
     /// Mark this a subscription to the shared channel `ticket` names.
     fn shared(mut self, ticket: SharedTicket) -> Self {
         self.shared = Some(ticket);
+        self
+    }
+
+    /// Record the bus session generation the request was sent in.
+    pub(crate) fn in_session(mut self, session: u64) -> Self {
+        self.session = session;
         self
     }
 
@@ -400,7 +420,11 @@ impl AsyncInternalSubscription {
         loop {
             let item = std::future::poll_fn(|cx| self.poll_next_routed(cx)).await?;
             // A lag notice maps to `None` here (`into_legacy` drops notices);
-            // its `warn!` already fired inside `poll_next_routed`.
+            // its `warn!` already fired inside `poll_next_routed`. Only
+            // single-frame one-shots read through here: a request-id channel
+            // holding one frame can't lag, and a shared one-shot whose frame
+            // was evicted times out. Multi-frame collectors read through
+            // `Subscription`, where a lag fails the collect (#1090).
             if let Some(legacy) = item.into_legacy() {
                 return Some(legacy);
             }
@@ -428,6 +452,10 @@ impl AsyncInternalSubscription {
     /// `None` otherwise.
     pub(crate) fn shared_ticket(&self) -> Option<SharedTicket> {
         self.shared
+    }
+
+    pub(crate) fn session(&self) -> u64 {
+        self.session
     }
 
     /// Send the cleanup signal, releasing this handle's lease first.
@@ -483,21 +511,30 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncTcpSocket> {
     cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     /// Runtime the bus was built on; see [`AsyncMessageBus::runtime_handle`].
     runtime: Handle,
-    /// Handle to the message processing task
-    process_task: Arc<RwLock<Option<task::JoinHandle<()>>>>,
+    /// Handle to the message processing task, set before `process_messages` returns.
+    process_task: std::sync::Mutex<Option<task::JoinHandle<()>>>,
     /// Latching shutdown flag, shared with the connection so a reconnect in
     /// progress sees the request.
     shutdown: Arc<ShutdownSignal>,
-    /// The client's order-ID generator, raised from the NextValidId frame the
-    /// reconnect handshake re-receives. Installed once via
-    /// [`Self::set_order_ids`] before the processing task starts; absent in
-    /// bus-only test fixtures, which never reconnect a client.
-    order_ids: OnceLock<Arc<ClientIdManager>>,
+    /// The client state a reconnect's handshake refreshes (order-id floor,
+    /// server version). Installed once via [`Self::set_handshake_state`]
+    /// before the processing task starts; absent in bus-only test fixtures,
+    /// which never reconnect a client.
+    handshake_state: OnceLock<HandshakeState>,
+    /// See [`AsyncMessageBus::session_generation`]; bumped in `reset_channels`.
+    session_generation: AtomicU64,
     /// Outbound rate limiter, if the client was built with one. Installed
     /// once via [`Self::set_rate_limiter`] before any request is sent.
     rate_limiter: OnceLock<RateLimiter>,
     /// Session state, and what `wait_connected` awaits.
     connection_state: Arc<ConnectionSignal>,
+    /// The session gate. The dispatcher holds it for write from failing the
+    /// channels of a lost connection until the replayed handshake has the
+    /// session live again; `write_now` holds it for read across its state
+    /// check and its write. So a write either finishes before the reconnect
+    /// starts, or is refused: none reaches the socket the reconnect installs
+    /// until the handshake on it is done.
+    session: tokio::sync::RwLock<()>,
 }
 
 impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
@@ -516,14 +553,14 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// through `with_channel_capacity` (the builder owns the default), so
     /// this exists for test fixtures that don't care about capacity.
     #[cfg(test)]
-    pub fn new(connection: AsyncConnection<S>) -> Result<Self, Error> {
+    pub fn new(connection: AsyncConnection<S>) -> Self {
         Self::with_channel_capacity(connection, BROADCAST_CHANNEL_CAPACITY)
     }
 
     /// Create a new async TCP message bus whose market-data channels hold up
     /// to `channel_capacity` frames per subscription before evicting the
     /// oldest. Order-class channels hold at least their [`ChannelClass`] floor.
-    pub fn with_channel_capacity(connection: AsyncConnection<S>, channel_capacity: usize) -> Result<Self, Error> {
+    pub fn with_channel_capacity(connection: AsyncConnection<S>, channel_capacity: usize) -> Self {
         let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
 
         let shutdown = connection.shutdown_signal();
@@ -541,11 +578,13 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             #[cfg(test)]
             cleanup_gate: Arc::default(),
             runtime: Handle::current(),
-            process_task: Arc::new(RwLock::new(None)),
+            process_task: std::sync::Mutex::new(None),
             shutdown,
-            order_ids: OnceLock::new(),
+            handshake_state: OnceLock::new(),
+            session_generation: AtomicU64::new(0),
             rate_limiter: OnceLock::new(),
             connection_state: Arc::new(ConnectionSignal::default()),
+            session: tokio::sync::RwLock::new(()),
         };
 
         // Start cleanup task
@@ -589,14 +628,14 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             }
         });
 
-        Ok(message_bus)
+        message_bus
     }
 
-    /// Installs the client's order-ID generator so a successful reconnect
-    /// re-seeds it from the handshake's NextValidId. Called exactly once,
-    /// before [`Self::process_messages`] starts the processing task.
-    pub(crate) fn set_order_ids(&self, order_ids: Arc<ClientIdManager>) {
-        self.order_ids.set(order_ids).expect("order-id generator installed twice");
+    /// Installs the client state a successful reconnect refreshes from its
+    /// handshake. Called exactly once, before [`Self::process_messages`]
+    /// starts the processing task.
+    pub(crate) fn set_handshake_state(&self, state: HandshakeState) {
+        self.handshake_state.set(state).expect("handshake state installed twice");
     }
 
     /// Installs the outbound rate limiter. Called at most once, before the
@@ -647,6 +686,18 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                 // reconnect can run for minutes.
                                 message_bus.reset_channels().await;
 
+                                // Fail any write still on the dead
+                                // connection, so the gate below need not wait
+                                // for a peer that stopped reading.
+                                message_bus.connection.socket.sever();
+
+                                // Waits out writes whose state check passed
+                                // before the flip (a write stuck on the dead
+                                // socket must not delay the failures above);
+                                // every later one is refused until the session
+                                // is live again.
+                                let session = message_bus.session.write().await;
+
                                 match message_bus.connection.reconnect().await {
                                     Ok(_) => {
                                         // Shutdown may have been requested while the
@@ -658,19 +709,18 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                             break;
                                         }
 
-                                        // The handshake re-received NextValidId; raise
-                                        // the client's generator from the server's floor so
-                                        // allocation never resumes below it. Only the initial
-                                        // connection seeded the generator before this. Do it
-                                        // before reporting the session as live so a caller
-                                        // gating on `is_connected()` cannot allocate below
-                                        // the new floor.
-                                        if let Some(order_ids) = message_bus.order_ids.get() {
-                                            let metadata = message_bus.connection.connection_metadata().await;
-                                            order_ids.raise_order_id_from_server(metadata.next_order_id);
+                                        // Before reporting the session as live; see
+                                        // `HandshakeState::refresh`.
+                                        if let Some(state) = message_bus.handshake_state.get() {
+                                            state.refresh(&message_bus.connection.connection_metadata().await);
                                         }
 
                                         info!("Successfully reconnected to TWS/Gateway");
+                                        // Released before the state flips: `set_connected`
+                                        // wakes `wait_connected`, and a woken caller's send
+                                        // must not be refused. Until the flip,
+                                        // `ensure_connected` still refuses.
+                                        drop(session);
                                         message_bus.connection_state.set_connected();
 
                                         // The notice stream is the central carrier of
@@ -694,6 +744,10 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                     }
                                     Err(e) => {
                                         error!("Failed to reconnect to TWS/Gateway: {e:?}");
+                                        // Latched before `retire`'s shutdown, which
+                                        // keeps it: later sends and waiters see
+                                        // `ConnectionFailed`, not `Shutdown`.
+                                        message_bus.connection_state.fail();
                                         break;
                                     }
                                 }
@@ -706,6 +760,9 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                             }
                             Err(err) => {
                                 error!("Error processing message (shutting down): {err:?}");
+                                // Nobody asked for this shutdown: report the
+                                // session as failed.
+                                message_bus.connection_state.fail();
                                 break;
                             }
                         }
@@ -721,12 +778,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             message_bus.retire().await;
         });
 
-        // Store the task handle
-        let process_task = self.process_task.clone();
-        tokio::spawn(async move {
-            let mut task_guard = process_task.write().await;
-            *task_guard = Some(handle);
-        });
+        *lock(&self.process_task) = Some(handle);
 
         Ok(())
     }
@@ -740,7 +792,6 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             RoutingDecision::ByRequestId(id) => self.route_to_request_channel(id, message).await,
             RoutingDecision::ByOrderId(order_id) => self.route_to_order_channel(order_id, message).await,
             RoutingDecision::ByMessageType(message_type) => self.route_to_shared_channel(message_type, message).await,
-            RoutingDecision::SharedMessage(message_type) => self.route_to_shared_channel(message_type, message).await,
             RoutingDecision::Error(payload) => self.route_error_message(payload).await,
             RoutingDecision::Shutdown => {
                 debug!("Received shutdown message, calling request_shutdown");
@@ -751,8 +802,11 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     }
 
     /// The send gate: every bus-originated write checks here first, and is
-    /// refused with `Error::ConnectionReset` unless the session is live and
-    /// not shutting down.
+    /// refused unless the session is live and not shutting down - with
+    /// `Error::ConnectionReset` while a reconnect may still bring it back,
+    /// `Error::ConnectionFailed` once the reconnect gave up, and
+    /// `Error::Shutdown` after a shutdown, so a caller can tell "wait" from
+    /// "stop".
     ///
     /// Without it, a request sent while the connection is down would be lost
     /// on the dead socket - or, worse, interleave with the handshake the
@@ -760,16 +814,26 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// would never be reset again, so its caller would await forever. Callers
     /// wait the reconnect out through `wait_connected` instead.
     ///
-    /// The check-then-write window is not closed: a caller that passes here
-    /// just before the dispatcher flips the state can still write, and in
-    /// principle race the socket swap inside `reconnect`. Closing that needs a
-    /// session-level gate held across the handshake.
+    /// On its own this check is a snapshot that races the dispatcher: a caller
+    /// that passes here just before the state flips could still write, and that
+    /// write could land in the handshake the reconnect is running on the new
+    /// socket (#1171). `write_now` runs it under the `session` gate, which the
+    /// dispatcher holds across the reconnect, so there the check and the write
+    /// are one step and the race is closed.
     fn ensure_connected(&self) -> Result<(), Error> {
-        if self.is_connected() {
-            Ok(())
-        } else {
-            Err(Error::ConnectionReset)
+        self.connection_state.check()?;
+        if self.shutdown.is_requested() {
+            return Err(Error::Shutdown);
         }
+        Ok(())
+    }
+
+    /// A refusal from the order taps, which close on shutdown, reported as
+    /// why the session ended - `ConnectionFailed` when the client gave up on
+    /// it, as the send gate does. Asked after the refusal: `fail` latches
+    /// before the taps close, so the reason is always already set.
+    fn ended_reason(&self, refusal: Error) -> Error {
+        self.connection_state.check_ended().err().unwrap_or(refusal)
     }
 
     /// The one funnel for every bus-originated write, so no send can reach a
@@ -789,8 +853,14 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         }
     }
 
-    /// Writes without throttling; the connected check runs after any wait.
+    /// Writes without throttling; the connected check runs after any wait,
+    /// under the `session` gate. The gate held for write is a reconnect in
+    /// progress, whatever the state signal says yet, so the write is refused
+    /// as `ensure_connected` would refuse it once the signal catches up.
     async fn write_now(&self, message: &[u8]) -> Result<(), Error> {
+        let Ok(_session) = self.session.try_read() else {
+            return Err(self.ended_reason(Error::ConnectionReset));
+        };
         self.ensure_connected()?;
         self.connection.write_message(message).await
     }
@@ -799,6 +869,9 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// reconnect is attempted.
     async fn reset_channels(&self) {
         debug!("resetting message bus channels");
+        // Before failing the routes, so a subscription that reads the reset
+        // already sees the new generation.
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
 
         self.requests.fail_all(|| Error::ConnectionReset.into());
         self.orders.fail_all(|| Error::ConnectionReset.into());
@@ -1004,6 +1077,9 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         class: ChannelClass,
         bound: Option<BufferBound>,
     ) -> Result<AsyncInternalSubscription, Error> {
+        // Read before the gate: a reset after this read leaves the
+        // subscription in the old session, which is where its request went.
+        let session = self.session_generation();
         self.ensure_connected()?;
 
         let capacity = bound.map_or(class.capacity(self.channel_capacity), |bound| bound.limit + 1);
@@ -1024,6 +1100,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // sends a second, harmless signal: `release` spares a replacement.
         let subscription = AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
             .leased(lease, key(id))
+            .in_session(session)
             .class(class);
         let subscription = match reads {
             Some(reads) => subscription.counting_reads(reads),
@@ -1070,6 +1147,8 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         account: Option<&AccountId>,
         message: Vec<u8>,
     ) -> Result<AsyncInternalSubscription, Error> {
+        // See `open_route`.
+        let session = self.session_generation();
         self.ensure_connected()?;
         self.throttle(&message).await;
 
@@ -1077,6 +1156,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
         Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
             .shared(ticket)
+            .in_session(session)
             .class(ChannelClass::of_shared(message_type)))
     }
 }
@@ -1139,18 +1219,22 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     }
 
     async fn create_order_status_subscription(&self, order_id: OrderId) -> Result<AsyncInternalSubscription, Error> {
+        // Not the send gate: nothing is written, and the stream may be
+        // opened mid-reconnect.
         let capacity = ChannelClass::Order.capacity(self.channel_capacity);
-        let NewTap { receiver, lease, .. } = self.order_taps.subscribe_status(order_id, capacity)?;
+        let NewTap { receiver, lease, .. } = self.order_taps.subscribe_status(order_id, capacity).map_err(|e| self.ended_reason(e))?;
         Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
             .leased(lease, RouteKey::OrderStatus(order_id))
+            .in_session(self.session_generation())
             .class(ChannelClass::Order))
     }
 
     async fn create_order_update_subscription(&self) -> Result<AsyncInternalSubscription, Error> {
         let capacity = ChannelClass::OrderStream.capacity(self.channel_capacity);
-        let NewTap { receiver, lease, .. } = self.order_taps.subscribe_updates(capacity)?;
+        let NewTap { receiver, lease, .. } = self.order_taps.subscribe_updates(capacity).map_err(|e| self.ended_reason(e))?;
         Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
             .leased(lease, RouteKey::OrderUpdateStream)
+            .in_session(self.session_generation())
             .class(ChannelClass::OrderStream))
     }
 
@@ -1164,12 +1248,8 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
         // Wakes the dispatcher's pending read, so the join below can't hang on it.
         self.retire().await;
 
-        // Wait for the processing task to finish
-        let task_handle = {
-            let mut task_guard = self.process_task.write().await;
-            task_guard.take()
-        };
-
+        // Wait for the processing task to finish; the guard is dropped before the await.
+        let task_handle = lock(&self.process_task).take();
         if let Some(handle) = task_handle {
             debug!("Waiting for processing task to finish");
             if let Err(e) = handle.await {
@@ -1183,12 +1263,16 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
         self.request_shutdown();
     }
 
-    async fn wait_connected(&self) -> Result<(), Error> {
-        self.connection_state.wait_connected().await
+    async fn wait_connected(&self, deadline: Option<tokio::time::Instant>) -> Result<(), Error> {
+        self.connection_state.wait_connected(deadline).await
     }
 
     fn is_connected(&self) -> bool {
         self.connection_state.is_connected() && !self.shutdown.is_requested()
+    }
+
+    fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
     }
 
     fn runtime_handle(&self) -> &Handle {

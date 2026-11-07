@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use log::{debug, error, warn};
@@ -14,6 +14,7 @@ use super::common::{
 use super::{log_cancel_error, StreamDecoder};
 use crate::client::ids::RequestId;
 use crate::errors::Error;
+use crate::messages::Notice;
 use crate::transport::{InternalSubscription, MessageBus, SharedTicket};
 
 /// A [Subscription] is a stream of responses returned from TWS. A [Subscription] is normally returned when invoking an API that can return more than one value.
@@ -43,7 +44,12 @@ use crate::transport::{InternalSubscription, MessageBus, SharedTicket};
 pub struct Subscription<T: StreamDecoder<T>> {
     context: DecoderContext,
     message_bus: Arc<dyn MessageBus>,
+    /// The bus's session generation when the request was sent. A reconnect
+    /// ends the request at TWS along with the old session, so once the bus
+    /// has moved on there is nothing to cancel.
+    session_generation: u64,
     request_id: Option<i32>,
+    order_id: Option<i32>,
     shared: Option<SharedTicket>,
     phantom: PhantomData<T>,
     cancelled: AtomicBool,
@@ -52,6 +58,10 @@ pub struct Subscription<T: StreamDecoder<T>> {
     /// Set only by the native end marker, not by errors: TWS has finished the
     /// request, so there is nothing left to cancel.
     ended_natively: AtomicBool,
+    /// The terminal TWS error of a request-id subscription, for
+    /// `cancel_and_drain`. Skips the cancel only where the decoder's
+    /// `rejection_ends_request` says TWS ended the request too.
+    rejected: OnceLock<Notice>,
     subscription: InternalSubscription,
 }
 
@@ -66,14 +76,17 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         // Raw from here on: the public accessor and the decoders' cancel
         // messages speak `i32`.
         let request_id = subscription.request_id.map(RequestId::raw);
+        let order_id = subscription.order_id.map(|id| id.value());
         let shared = subscription.shared;
 
         debug_assert_request_id_routable::<T, T>(request_id);
 
         Subscription {
             context,
+            session_generation: subscription.session,
             message_bus,
             request_id,
+            order_id,
             shared,
             subscription,
             phantom: PhantomData,
@@ -81,15 +94,17 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             snapshot_ended: AtomicBool::new(false),
             stream_ended: AtomicBool::new(false),
             ended_natively: AtomicBool::new(false),
+            rejected: OnceLock::new(),
         }
     }
 
     /// Cancel the subscription.
     ///
     /// Writes TWS's cancel unless the request has already finished (end
-    /// marker or snapshot end) or its type has none. Either way the
-    /// subscription stops receiving: it yields what was already queued, then
-    /// `Err(Error::Cancelled)`, then ends. Idempotent; also called on drop.
+    /// marker, snapshot end, or a TWS error its type knows ends the request)
+    /// or its type has none. Either way the subscription stops receiving: it
+    /// yields what was already queued, then `Err(Error::Cancelled)`, then
+    /// ends. Idempotent; also called on drop.
     pub fn cancel(&self) {
         // One atomic swap, not a load then a store: two threads cancelling the
         // same handle would otherwise both reach the bus, and on a shared
@@ -121,20 +136,77 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         self.request_id
     }
 
+    /// Whether the stream has terminated. Set once a `next`, `try_next` or
+    /// `next_timeout` call has returned TWS's end marker (as `None`), a
+    /// terminal error, or `Err(Error::Cancelled)` after [`cancel`](Self::cancel);
+    /// from then on those calls return `None` without reading. A snapshot's end
+    /// tick does not set it, since the reads go on after it; the end tick is
+    /// itself the signal that a snapshot is complete. Distinguishes between the
+    /// `None` that [`try_next`](Self::try_next) and
+    /// [`next_timeout`](Self::next_timeout) return at the end and the one they
+    /// return while nothing has arrived yet.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), ibapi::Error> {
+    /// let client = Client::connect("127.0.0.1:4002", 100)?;
+    /// let contract = Contract::stock("AAPL").build();
+    /// let subscription = client.contract_details_stream(&contract).subscribe()?;
+    ///
+    /// loop {
+    ///     match subscription.try_next() {
+    ///         Some(Ok(item)) => println!("{item:?}"),
+    ///         Some(Err(e)) => { eprintln!("error: {e}"); break; }
+    ///         None if subscription.is_terminated() => break,
+    ///         None => std::thread::sleep(Duration::from_millis(100)), // nothing yet
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn is_terminated(&self) -> bool {
+        self.stream_ended.load(Ordering::Relaxed)
+    }
+
     /// Whether the stream ended with TWS's end marker, as opposed to an
     /// error or a closed channel (both of which also end iteration).
     pub(crate) fn ended_natively(&self) -> bool {
         self.ended_natively.load(Ordering::Relaxed)
     }
 
+    /// The id a cancel names: the request id, else the order id.
+    fn id(&self) -> Option<i32> {
+        self.request_id.or(self.order_id)
+    }
+
+    /// Records a terminal TWS error for the request. Request-id streams only:
+    /// on a shared stream the error may be a request-less one fanned out.
+    /// Errors on our side (decode, buffer limit, reset) aren't recorded.
+    fn note_rejection(&self, error: &Error) {
+        if let (Some(_), Error::Notice(notice)) = (self.request_id, error) {
+            let _ = self.rejected.set(notice.clone());
+        }
+    }
+
     /// The cancel a subscription that isn't shared writes, if any. `None` when the
-    /// type has none, or once the stream has seen its end marker or snapshot
-    /// end: the cancel would name a request TWS already finished.
+    /// type has none, or once the stream has seen its end marker, a TWS error
+    /// its type knows ends the request, or snapshot end, or the request's
+    /// session has ended (a reconnect since it was sent): the cancel would
+    /// name a request TWS already finished.
     fn pending_cancel(&self) -> Option<Vec<u8>> {
-        if self.ended_natively() || self.snapshot_ended.load(Ordering::Relaxed) {
+        if self.message_bus.session_generation() != self.session_generation {
+            debug!("request {:?} outlived its session: cancel skipped", self.request_id);
             return None;
         }
-        T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)).ok()
+        if self.ended_natively() || self.rejected.get().is_some_and(T::rejection_ends_request) || self.snapshot_ended.load(Ordering::Relaxed) {
+            return None;
+        }
+        T::cancel_message(self.context.server_version, self.id(), Some(&self.context)).ok()
     }
 
     /// Cancel the request and wait, up to `deadline`, for TWS to confirm it
@@ -146,10 +218,16 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     ///
     /// | Outcome | Meaning |
     /// | --- | --- |
-    /// | [`Drained::Ended`] | TWS sent the end marker, before or after the cancel. Nothing is written if it (or a snapshot's end) had already arrived. |
-    /// | [`Drained::Rejected`] | TWS answered with an error for the request. |
-    /// | [`Drained::Unconfirmed`] | The deadline passed, or the stream had already ended with an error (such as [`Error::BufferLimitExceeded`]). Treat the id as possibly live. |
-    /// | `Err` | The connection reset or the client shut down meanwhile. |
+    /// | [`Drained::Ended`] | TWS sent the end marker or a snapshot's end, before or after the cancel. Nothing is written if it had already been read. |
+    /// | [`Drained::Rejected`] | TWS answered with an error for the request, before or during the drain. |
+    /// | [`Drained::Unconfirmed`] | The deadline passed, or the stream had already ended with an error on our side (such as [`Error::BufferLimitExceeded`]). Treat the id as possibly live. |
+    /// | `Err` | The cancel write failed, or the connection reset or the client shut down meanwhile. TWS's state is unknown. |
+    ///
+    /// The cancel is written whenever TWS may still be running the request,
+    /// after an error on our side too. A successful write means only that the
+    /// bytes went out: not that TWS acknowledged the cancel, nor that a pacing
+    /// slot is free. The write blocks until the transport takes it; `deadline`
+    /// bounds only the wait after it.
     ///
     /// The cancel is TWS's native one, where the request type has one (contract
     /// details: server 215+); otherwise nothing is written and the drain waits
@@ -188,13 +266,19 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         if self.ended_natively() || self.snapshot_ended.load(Ordering::Relaxed) {
             return Ok(Drained::Ended);
         }
-        // Ended with an error already: nothing more can arrive to confirm
-        // TWS's state. Drop writes the cancel, as for any errored stream.
-        if self.stream_ended.load(Ordering::Relaxed) {
-            return Ok(Drained::Unconfirmed);
-        }
+        // Settled before this call: TWS answered with an error, or the stream
+        // ended with an error on our side, after which nothing more can
+        // arrive to confirm TWS's state. The cancel is still written below
+        // where one is due, so a failed write reaches the caller.
+        let settled = match self.rejected.get() {
+            Some(notice) => Some(Drained::Rejected(notice.clone())),
+            None => self.stream_ended.load(Ordering::Relaxed).then_some(Drained::Unconfirmed),
+        };
         if self.request_id.is_none() {
-            self.cancel();
+            // A stream that already ended leaves its cancel to the drop.
+            if settled.is_none() {
+                self.cancel();
+            }
             return Ok(Drained::Unconfirmed);
         }
 
@@ -203,10 +287,11 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         // not reach us. The route goes when the subscription drops.
         if !self.cancelled.swap(true, Ordering::Relaxed) {
             if let Some(message) = self.pending_cancel() {
-                if let Err(e) = self.message_bus.send_message(&message) {
-                    log_cancel_error("subscription", &e);
-                }
+                self.message_bus.send_message(&message)?;
             }
+        }
+        if let Some(outcome) = settled {
+            return Ok(outcome);
         }
 
         loop {
@@ -218,6 +303,10 @@ impl<T: StreamDecoder<T>> Subscription<T> {
                 Some(item) => {
                     if let Some(outcome) = drain_outcome(item) {
                         return outcome;
+                    }
+                    // A snapshot's end finishes the request at TWS; nothing follows it.
+                    if self.snapshot_ended.load(Ordering::Relaxed) {
+                        return Ok(Drained::Ended);
                     }
                 }
                 None if self.ended_natively() => return Ok(Drained::Ended),
@@ -289,6 +378,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
                         _ => error!("error decoding message: {err}"),
                     }
                     self.stream_ended.store(true, Ordering::Relaxed);
+                    self.note_rejection(&err);
                     NextAction::Return(Some(Err(err)))
                 }
             },
@@ -303,6 +393,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             }
             Some(RoutedItem::Error(e)) => {
                 self.stream_ended.store(true, Ordering::Relaxed);
+                self.note_rejection(&e);
                 NextAction::Return(Some(Err(e)))
             }
             None => NextAction::Return(None),
@@ -315,8 +406,9 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     /// or terminal error. Use [`try_iter_data`](Self::try_iter_data) when notices
     /// should be filtered.
     ///
-    /// Returns `None` if no item is available *right now*; check the surrounding
-    /// loop or stream state to distinguish from end-of-stream.
+    /// `None` means either that no item is queued *right now* or that the
+    /// stream ended; [`is_terminated`](Self::is_terminated) distinguishes
+    /// between the two.
     pub fn try_next(&self) -> Option<Result<SubscriptionItem<T>, Error>> {
         if self.stream_ended.load(Ordering::Relaxed) {
             return None;
@@ -335,11 +427,11 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     /// or terminal error. Use [`timeout_iter_data`](Self::timeout_iter_data) when
     /// you want notices filtered.
     ///
-    /// `None` means either that `timeout` passed or that the stream ended with
-    /// TWS's end marker; terminal errors, a TWS rejection included, come as
-    /// `Some(Err(_))`. To collect a whole result within a time bound, use
-    /// [`collect_to_end_within`](Self::collect_to_end_within), which tells the
-    /// two apart.
+    /// `None` means either that `timeout` passed or that the stream ended;
+    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
+    /// Terminal errors, a TWS rejection included, come as `Some(Err(_))`. To
+    /// collect a whole result within a time bound, use
+    /// [`collect_to_end_within`](Self::collect_to_end_within).
     pub fn next_timeout(&self, timeout: Duration) -> Option<Result<SubscriptionItem<T>, Error>> {
         if self.stream_ended.load(Ordering::Relaxed) {
             return None;
@@ -373,7 +465,9 @@ impl<T: StreamDecoder<T>> Subscription<T> {
 
     /// Non-blocking iterator. Same `SubscriptionItem<T>` shape as [`iter`](Self::iter)
     /// (see [`try_iter_data`](Self::try_iter_data) for the data-only variant).
-    /// Returns `None` immediately when nothing is queued.
+    /// Returns `None` immediately when nothing is queued, and once the stream
+    /// has ended; [`is_terminated`](Self::is_terminated) distinguishes between
+    /// the two.
     pub fn try_iter(&self) -> SubscriptionTryIter<'_, T> {
         SubscriptionTryIter { subscription: self }
     }
@@ -381,6 +475,8 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     /// Iterator that waits up to `timeout` for each item. Same
     /// `SubscriptionItem<T>` shape as [`iter`](Self::iter); see
     /// [`timeout_iter_data`](Self::timeout_iter_data) for the data-only variant.
+    /// Returns `None` when `timeout` passes, and once the stream has ended;
+    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
     pub fn timeout_iter(&self, timeout: Duration) -> SubscriptionTimeoutIter<'_, T> {
         SubscriptionTimeoutIter { subscription: self, timeout }
     }
@@ -391,12 +487,16 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         self.iter().filter_data()
     }
 
-    /// Non-blocking data iterator (notices filtered).
+    /// Non-blocking data iterator (notices filtered). Returns `None` immediately
+    /// when nothing is queued, and once the stream has ended;
+    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
     pub fn try_iter_data(&self) -> FilterData<SubscriptionTryIter<'_, T>> {
         self.try_iter().filter_data()
     }
 
-    /// Timeout-bounded data iterator (notices filtered).
+    /// Timeout-bounded data iterator (notices filtered). Returns `None` when
+    /// `timeout` passes, and once the stream has ended;
+    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
     pub fn timeout_iter_data(&self, timeout: Duration) -> FilterData<SubscriptionTimeoutIter<'_, T>> {
         self.timeout_iter(timeout).filter_data()
     }

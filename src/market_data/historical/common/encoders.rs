@@ -46,8 +46,8 @@ pub(crate) fn encode_request_head_timestamp(request_id: i32, contract: &Contract
 
 // pub(crate) wire encoder for `HistoricalDataRequest`. Called from the
 // `HistoricalDataBuilder` finalisers, which present the typed surface to
-// users; the flat-arg encoder is the deliberate seam to prost (the builder-fed
-// exception in docs/rules/style/param-budget.md).
+// users; the flat-arg encoder is the deliberate seam to prost. Internal,
+// so the param budget doesn't apply; the allow is for clippy's 8-arg lint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_request_historical_data(
     request_id: i32,
@@ -83,8 +83,8 @@ pub(crate) fn encode_request_historical_data(
 
 // pub(crate) wire encoder for `HistoricalTicksRequest`. Called from the
 // `HistoricalTicksBuilder` finalisers, which present the typed surface to
-// users; the flat-arg encoder is the deliberate seam to prost (the builder-fed
-// exception in docs/rules/style/param-budget.md).
+// users; the flat-arg encoder is the deliberate seam to prost. Internal,
+// so the param budget doesn't apply; the allow is for clippy's 8-arg lint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_request_historical_ticks(
     request_id: i32,
@@ -145,19 +145,18 @@ pub(crate) fn encode_request_histogram_data(request_id: i32, contract: &Contract
     ))
 }
 
-#[allow(dead_code)]
 pub(crate) fn encode_cancel_histogram_data(request_id: i32) -> Result<Vec<u8>, Error> {
     crate::proto::encoders::encode_cancel_by_id!(request_id, CancelHistogramData, crate::messages::OutgoingMessages::CancelHistogramData)
 }
 
-#[allow(dead_code)]
 pub(crate) fn encode_cancel_head_timestamp(request_id: i32) -> Result<Vec<u8>, Error> {
     crate::proto::encoders::encode_cancel_by_id!(request_id, CancelHeadTimestamp, crate::messages::OutgoingMessages::CancelHeadTimestamp)
 }
 
 // Per-encoder body assertions live in the migrated sync/async tests via
-// `assert_request<B>(builder)`; cancel encoders are exercised through their
-// production paths (e.g. subscription drop handlers).
+// `assert_request<B>(builder)`; the cancel encoders are exercised through
+// their production paths (subscription drop handlers, and the one-shot
+// cancels in `request_helpers::one_shot_cancelling`) and the unit tests below.
 #[cfg(test)]
 #[path = "encoders_tests.rs"]
 mod tests;

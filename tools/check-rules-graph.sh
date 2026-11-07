@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Validates the docs/rules/ knowledge graph and its index in AGENTS.md.
+# Validates the docs/rules/ knowledge graph, its index in AGENTS.md, and the links in
+# docs/wire-facts/ and .claude/skills/.
 #
-#   1. every markdown link in AGENTS.md and docs/rules/** resolves
-#      to a real file
+#   1. every markdown link in AGENTS.md, docs/rules/**, docs/wire-facts/** and
+#      .claude/skills/** resolves to a real file
 #   2. every node's frontmatter `id` matches its filename stem
 #   3. every `related:` id names an existing node
 #   4. AGENTS.md contains no `@`-imports (they would inline every node into
@@ -11,9 +12,9 @@
 #   5. no node cites a `file.rs:NNN` line number — line refs rot silently the
 #      same way the retired rule numbers did, and nothing recomputes them. Name
 #      the fn, test, or type instead.
-#
-# `memory:` entries are deliberately NOT validated — that directory lives
-# outside the repo and is specific to one maintainer.
+#   6. no node carries a `memory:` key — private memory lives outside the repo,
+#      so every such reference is dead for other readers and unverifiable here.
+#      Put the evidence in the node.
 
 set -uo pipefail
 
@@ -21,6 +22,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 RULES_DIR="docs/rules"
+WIRE_FACTS_DIR="docs/wire-facts"
+SKILLS_DIR=".claude/skills"
 INDEX="AGENTS.md"
 ERRORS="$(mktemp)"
 trap 'rm -f "$ERRORS"' EXIT
@@ -68,7 +71,7 @@ done
 
 # --- 1. markdown links resolve ----------------------------------------------
 
-for file in $INDEX $(nodes) "$RULES_DIR/README.md"; do
+for file in $INDEX $(nodes) "$RULES_DIR/README.md" $(find "$WIRE_FACTS_DIR" "$SKILLS_DIR" -name '*.md' | sort); do
     dir="$(dirname "$file")"
     grep -o '](\([^) ]*\))' "$file" 2>/dev/null | sed 's/^](//; s/)$//' | while read -r link; do
         case "$link" in
@@ -95,6 +98,13 @@ fi
 for file in $(nodes); do
     grep -nE '[A-Za-z0-9_/.-]+\.(rs|sh|toml|md):[0-9]+' "$file" |
         sed "s|^|$file: line-number citation (name the fn or test instead) -> line |" >>"$ERRORS"
+done
+
+# --- 6. no references to private memory -------------------------------------
+
+for file in $(nodes) "$RULES_DIR/README.md"; do
+    grep -qE '^memory:' "$file" &&
+        echo "$file: memory: key references files outside the repo (fold the evidence into the node)" >>"$ERRORS"
 done
 
 # --- report -----------------------------------------------------------------

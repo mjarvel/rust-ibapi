@@ -7,7 +7,7 @@
 | Mode | Command | Primary client path | Blocking client path |
 |------|---------|---------------------|----------------------|
 | Default async | `cargo build` | `client::Client` | – |
-| Sync only | `cargo build --no-default-features --features sync` | `client::Client` | – |
+| Sync only | `cargo build --no-default-features --features sync` | `client::Client` | `client::blocking::Client` (alias of `client::Client`) |
 | Async + sync | `cargo build --all-features` (or `--no-default-features --features "sync async"`) | `client::Client` (async) | `client::blocking::Client` |
 
 ## Available Features
@@ -39,13 +39,13 @@ The crate enforces that at least one of the two features is enabled; both may be
 ```toml
 [dependencies]
 # Default async client
-ibapi = "5.2"
+ibapi = "5.7"
 
 # Sync-only (disable defaults)
-ibapi = { version = "5.2", default-features = false, features = ["sync"] }
+ibapi = { version = "5.7", default-features = false, features = ["sync"] }
 
 # Async + blocking together
-ibapi = { version = "5.2", default-features = false, features = ["sync", "async"] }
+ibapi = { version = "5.7", default-features = false, features = ["sync", "async"] }
 ```
 
 ## Testing with Features

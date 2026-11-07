@@ -15,7 +15,7 @@ impl Client {
     /// Requests news providers which the user has subscribed to.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -69,7 +69,8 @@ impl Client {
     /// * `provider_codes` - A list of provider codes.
     /// * `start_time`     - Marks the (exclusive) start of the date range.
     /// * `end_time`       - Marks the (inclusive) end of the date range.
-    /// * `total_results`  - The maximum number of headlines to fetch (1 – 300)
+    /// * `total_results`  - The maximum number of headlines to fetch (1 – 300). TWS returns at most 300 for a
+    ///   larger value, without a notice, and rejects 0 with error 321 (live: 2026-11-05).
     ///
     /// # Examples
     ///
@@ -86,7 +87,7 @@ impl Client {
     /// // Define a past date range for the news query
     /// let start_time = datetime!(2023-01-01 0:00 UTC);
     /// let end_time = datetime!(2023-01-02 0:00 UTC);
-    /// let total_results = 5u8; // Request a small number of articles for the example
+    /// let total_results = 5; // Request a small number of articles for the example
     ///
     /// let articles_subscription = client.historical_news(
     ///     contract_id,
@@ -99,18 +100,20 @@ impl Client {
     /// println!("Requested historical news articles:");
     /// for article in articles_subscription.iter_data().take(total_results as usize) {
     ///     let article = article?;
-    ///     println!("- Headline: {}, ID: {}, Provider: {}, Time: {}",
+    ///     println!("- Headline: {}, ID: {}, Provider: {}, Time: {:?}",
     ///              article.headline, article.article_id, article.provider_code, article.time);
     /// }
     /// # Ok::<(), ibapi::Error>(())
     /// ```
+    // Flat by design (#901): all five arguments are required with no meaningful default, so a
+    // builder would buy nothing over positional args (docs/rules/style/param-budget.md).
     pub fn historical_news(
         &self,
         contract_id: i32,
         provider_codes: &[&str],
         start_time: OffsetDateTime,
         end_time: OffsetDateTime,
-        total_results: u8,
+        total_results: u16,
     ) -> Result<Subscription<NewsArticle>, Error> {
         let builder = self.request();
         let request =
@@ -124,6 +127,10 @@ impl Client {
     ///
     /// * `provider_code` - Short code indicating news provider, e.g. FLY.
     /// * `article_id`    - ID of the specific article.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] if TWS reports an article type other than text (`0`) or binary (`1`).
     ///
     /// # Examples
     ///
@@ -166,13 +173,16 @@ impl Client {
     /// let provider_codes = ["DJ-N"];
     ///
     /// let subscription = client.contract_news(&contract, &provider_codes).expect("request contract news failed");
-    /// for article in &subscription {
-    ///     println!("{article:?}");
+    /// for article in subscription.iter_data() {
+    ///     match article {
+    ///         Ok(article) => println!("{article:?}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
     /// }
     /// ```
     pub fn contract_news(&self, contract: &Contract, provider_codes: &[&str]) -> Result<Subscription<NewsArticle>, Error> {
         let builder = self.request();
-        let request = common::encode_contract_news_request(builder.request_id(), contract, provider_codes)?;
+        let request = encoders::encode_contract_news_request(builder.request_id(), contract, provider_codes)?;
         builder.send_with_context(request, common::tick_news_context(self.decoder_context()))
     }
 
@@ -192,13 +202,16 @@ impl Client {
     /// let provider_code = "BRFG";
     ///
     /// let subscription = client.broad_tape_news(provider_code).expect("request broad tape news failed");
-    /// for article in &subscription {
-    ///     println!("{article:?}");
+    /// for article in subscription.iter_data() {
+    ///     match article {
+    ///         Ok(article) => println!("{article:?}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
     /// }
     /// ```
     pub fn broad_tape_news(&self, provider_code: &str) -> Result<Subscription<NewsArticle>, Error> {
         let builder = self.request();
-        let request = common::encode_broad_tape_news_request(builder.request_id(), provider_code)?;
+        let request = encoders::encode_broad_tape_news_request(builder.request_id(), provider_code)?;
         builder.send_with_context(request, common::tick_news_context(self.decoder_context()))
     }
 }

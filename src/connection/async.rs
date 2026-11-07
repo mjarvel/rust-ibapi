@@ -38,7 +38,7 @@ pub struct AsyncConnection<S: AsyncStream = AsyncTcpSocket> {
     pub(crate) notice_broadcaster: NoticeBroadcaster,
     /// Reconnection attempts before `reconnect` gives up; `None` retries
     /// forever. Defaults to `Some(`[`MAX_RECONNECT_ATTEMPTS`]`)`.
-    max_reconnect_attempts: Option<u32>,
+    pub(crate) max_reconnect_attempts: Option<u32>,
     /// Shared with the bus so `reconnect` can abandon its backoff as soon as
     /// shutdown is requested. See [`AsyncConnection::shutdown_signal`].
     shutdown: Arc<ShutdownSignal>,
@@ -124,6 +124,7 @@ impl<S: AsyncStream> AsyncConnection<S> {
 
     fn handshake_context(&self) -> StartupHandshakeContext<'_> {
         StartupHandshakeContext {
+            client_id: self.client_id,
             startup: self.startup_callback.as_deref(),
             notice_sink: &self.notice_broadcaster,
         }
@@ -146,6 +147,10 @@ impl<S: AsyncStream> AsyncConnection<S> {
     /// remembered market data type. When every attempt fails, returns the
     /// last attempt's error — a permanent cause (say, an incompatible server
     /// version) must not exit as a generic failure.
+    ///
+    /// Every failure is retried, [`Error::ClientIdInUse`] included: TWS can
+    /// hold the dropped session's client id until it notices that socket is
+    /// dead (live: 326 on each attempt until then, then a clean reconnect).
     ///
     /// Returns [`Error::Shutdown`] once shutdown is requested. The backoff
     /// wait ends immediately on the request; a connect already in flight is
@@ -288,8 +293,8 @@ impl<S: AsyncStream> AsyncConnection<S> {
         let mut attempts = 0;
         let ctx = self.handshake_context();
         loop {
-            let mut message = self.read_message().await?;
-            let info = self.connection_handler.parse_account_info(&mut message, &ctx)?;
+            let message = self.read_message().await?;
+            let info = self.connection_handler.parse_account_info(&message, &ctx)?;
 
             attempts += 1;
             if account_info.merge(info) || attempts > MAX_ACCOUNT_INFO_ATTEMPTS {

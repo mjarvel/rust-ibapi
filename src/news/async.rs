@@ -13,7 +13,7 @@ impl Client {
     /// Requests news providers which the user has subscribed to.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -61,7 +61,16 @@ impl Client {
         self.subscription().send_shared(OutgoingMessages::RequestNewsBulletins, request).await
     }
 
-    /// Historical News Headlines
+    /// Requests historical news headlines.
+    ///
+    /// # Arguments
+    ///
+    /// * `contract_id`    - Contract ID of ticker. See [contract_details](Client::contract_details) for how to retrieve contract ID.
+    /// * `provider_codes` - A list of provider codes.
+    /// * `start_time`     - Marks the (exclusive) start of the date range.
+    /// * `end_time`       - Marks the (inclusive) end of the date range.
+    /// * `total_results`  - The maximum number of headlines to fetch (1 – 300). TWS returns at most 300 for a
+    ///   larger value, without a notice, and rejects 0 with error 321 (live: 2026-11-05).
     ///
     /// # Examples
     ///
@@ -90,13 +99,15 @@ impl Client {
     ///     }
     /// }
     /// ```
+    // Flat by design (#901): all five arguments are required with no meaningful default, so a
+    // builder would buy nothing over positional args (docs/rules/style/param-budget.md).
     pub async fn historical_news(
         &self,
         contract_id: i32,
         provider_codes: &[&str],
         start_time: OffsetDateTime,
         end_time: OffsetDateTime,
-        total_results: u8,
+        total_results: u16,
     ) -> Result<Subscription<NewsArticle>, Error> {
         let builder = self.request();
         let request =
@@ -105,6 +116,10 @@ impl Client {
     }
 
     /// Requests news article body
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] if TWS reports an article type other than text (`0`) or binary (`1`).
     ///
     /// # Examples
     ///
@@ -150,7 +165,7 @@ impl Client {
     /// ```
     pub async fn contract_news(&self, contract: &Contract, provider_codes: &[&str]) -> Result<Subscription<NewsArticle>, Error> {
         let builder = self.request();
-        let request = common::encode_contract_news_request(builder.request_id(), contract, provider_codes)?;
+        let request = encoders::encode_contract_news_request(builder.request_id(), contract, provider_codes)?;
         builder
             .send_with_context(request, common::tick_news_context(self.decoder_context()))
             .await
@@ -175,7 +190,7 @@ impl Client {
     /// ```
     pub async fn broad_tape_news(&self, provider_code: &str) -> Result<Subscription<NewsArticle>, Error> {
         let builder = self.request();
-        let request = common::encode_broad_tape_news_request(builder.request_id(), provider_code)?;
+        let request = encoders::encode_broad_tape_news_request(builder.request_id(), provider_code)?;
         builder
             .send_with_context(request, common::tick_news_context(self.decoder_context()))
             .await

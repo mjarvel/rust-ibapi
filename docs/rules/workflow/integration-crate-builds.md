@@ -10,13 +10,11 @@ triggers:
 symbols: [ibapi-integration-sync, ibapi-integration-async, ibapi-test, default-members]
 related: [pre-pr-checks, restrict-after-callers, proto-only-decoding]
 precedents: ["#593"]
-memory: [feedback_minimal_test_helper_deps, feedback_integration_test_tws_encoding]
 ---
 
 The `integration/` crates — `ibapi-integration-sync`, `ibapi-integration-async`, and the
-`ibapi-test` helper — are workspace members but **not** in `default-members`, which is `["."]`.
-Plain `cargo build` / `cargo test` / `cargo clippy --all-targets` skip them entirely, and so
-does CI.
+`ibapi-test` helper — are workspace members but not in `default-members` (`["."]`). Plain
+`cargo build` / `cargo test` / `cargo clippy --all-targets` skip them, and so does every CI job.
 
 When a change touches `Subscription`, the proto encoders or decoders, a public API shape, or
 anything else wire-adjacent, also run:
@@ -28,21 +26,22 @@ cargo clippy -p ibapi-integration-sync  --tests -- -D warnings
 cargo clippy -p ibapi-integration-async --tests -- -D warnings
 ```
 
-Compilation is the contract here — no live gateway is needed for this check.
+Compilation is the check; no gateway needed. (`just integration` runs them against a live one.)
 
 ## Why
 
-These crates are the largest body of real calling code in the repo, and they are invisible to
-every automated gate. A signature change that compiles against `src/` and its unit tests can
-still break every integration test, and nothing will say so until someone runs them against a
-gateway — which happens far less often than merging.
+These crates are the largest body of real calling code in the repo and no automated gate
+builds them. A signature change that compiles against `src/` can break every integration test
+unnoticed until someone next runs them against a gateway. Deliberately caller-breaking changes
+(`#[must_use]`, a removed field, narrowed visibility) are most exposed: their diff looks
+complete because `cargo clippy --all-targets` is green.
 
-The exposure is worst for changes that are *deliberately* caller-breaking: a `#[must_use]`, a
-removed field, a narrowed visibility. Those are exactly the PRs whose diff looks complete
-because `cargo clippy --all-targets` is green.
+`ibapi-test` depends on `time` / `time-tz` only. An `ibapi` dependency there, to share a helper
+needing `Order` or `Contract`, would unify features and build `ibapi` with `sync` under
+`-p ibapi-integration-async`; duplicate such helpers per crate instead.
 
 ## Precedents
 
-- #593 — `#[must_use]` on 31 builders and 8 subscription types. Nine callsites had to gain an
-  explicit `let _ = ...`; **eight of the nine were integration-test cleanup paths**, reachable
-  only through `-p ibapi-integration-*`.
+- #507 — created the integration workspace; kept `ibapi` out of `ibapi-test`.
+- #593 — `#[must_use]` on 31 builders and 8 subscription types; eight of the nine callsites needing
+  `let _ = ...` were integration-test cleanup paths, reachable only via `-p ibapi-integration-*`.

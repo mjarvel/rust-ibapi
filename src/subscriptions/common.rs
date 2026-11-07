@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::Error;
-use crate::messages::{IncomingMessages, Notice, OutgoingMessages, ResponseMessage};
+use crate::messages::{IncomingMessages, Notice, OutgoingMessages, ResponseMessage, SUBSCRIPTION_LAG_CODE};
 
 /// An item yielded by a [`Subscription`](crate::subscriptions::Subscription).
 ///
@@ -44,11 +44,14 @@ impl<T> SubscriptionItem<T> {
 pub enum Drained {
     /// TWS sent the end marker: the request is over at TWS.
     Ended,
-    /// TWS sent an error for the request: the request is over at TWS.
+    /// TWS answered with an error for the request. For request types whose
+    /// errors aren't known to end the request at TWS, the drop still writes
+    /// the cancel.
     Rejected(Notice),
     /// No terminal evidence: the deadline passed, or the stream had already
-    /// ended with an error (such as a buffer overflow), after which TWS's state
-    /// can't be observed. Treat the request id as possibly still live.
+    /// ended with an error on our side (such as a buffer overflow), after
+    /// which TWS's state can't be observed. Treat the request id as possibly
+    /// still live.
     Unconfirmed,
 }
 
@@ -73,6 +76,20 @@ pub(crate) fn filter_notice<T>(item: Result<SubscriptionItem<T>, Error>) -> Opti
             None
         }
         Err(e) => Some(Err(e)),
+    }
+}
+
+/// Turns a broadcast-lag notice ([`SUBSCRIPTION_LAG_CODE`]) into
+/// `Err(Error::Notice)`; passes everything else through unchanged.
+///
+/// For readers that assemble a complete result from several frames: the
+/// evicted frames can't be recovered, so a result read past the gap would be
+/// missing rows. Streams keep the notice non-terminal. Async only in practice
+/// — the sync transport never lags.
+pub(crate) fn lag_as_error<T>(item: Result<SubscriptionItem<T>, Error>) -> Result<SubscriptionItem<T>, Error> {
+    match item {
+        Ok(SubscriptionItem::Notice(notice)) if notice.code == SUBSCRIPTION_LAG_CODE => Err(Error::Notice(notice)),
+        item => item,
     }
 }
 
@@ -126,13 +143,15 @@ pub(crate) enum Bound<I> {
 
 /// Applies one item to `rows`. Returns `Some` when collection ends: on a
 /// terminal error, a snapshot-end sentinel (not appended), or once `stop`
-/// fires on the rows (the triggering row is appended). Notices are logged.
+/// fires on the rows (the triggering row is appended). Notices are logged,
+/// except a broadcast-lag notice, which is terminal ([`lag_as_error`]): the
+/// rows would have a gap.
 pub(crate) fn collect_step<T: StreamDecoder<T>>(
     rows: &mut Vec<T>,
     item: Result<SubscriptionItem<T>, Error>,
     stop: &mut impl FnMut(&[T]) -> bool,
 ) -> Option<CollectStop> {
-    match filter_notice(item)? {
+    match filter_notice(lag_as_error(item))? {
         Ok(value) if value.is_snapshot_end() => Some(CollectStop::Stopped),
         Ok(value) => {
             rows.push(value);
@@ -275,6 +294,20 @@ pub(crate) trait StreamDecoder<T> {
     /// See [`classify`](crate::messages::classify) for why this is not a
     /// classification change.
     fn is_nonterminal_notice(_notice: &Notice) -> bool {
+        false
+    }
+
+    /// Whether a terminal error notice also ends the request at TWS, so drop
+    /// writes no cancel (TWS would answer it with 366). Opt in only where
+    /// that is wire-verified: ending the stream on our side doesn't prove TWS
+    /// ended the request, and a skipped cancel then leaks it at TWS (a market
+    /// data line, a scanner slot). Default: `false`, the cancel is written.
+    ///
+    /// Match the codes verified live, not every error: an unverified terminal
+    /// code (10197 on market data, 165 on scanners) must keep its cancel. A
+    /// one-shot query with nothing to continue (`HistoricalDataFrame`) may
+    /// accept any error.
+    fn rejection_ends_request(_notice: &Notice) -> bool {
         false
     }
 

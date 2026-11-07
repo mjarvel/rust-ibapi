@@ -103,7 +103,7 @@ impl ExerciseOptionsBuilder<'_, crate::client::sync::Client> {
     /// Note: a TWS setting decides whether an exercise request must be finalized before it is sent.
     ///
     /// # Errors
-    /// [`Error::InvalidArgument`] if neither [`exercise`](Self::exercise) nor [`lapse`](Self::lapse)
+    /// [`Error::Validation`] if neither [`exercise`](Self::exercise) nor [`lapse`](Self::lapse)
     /// was called, or the quantity is not positive; [`Error::OrderIdInRequestRange`] if the client's
     /// next order id has reached 1,500,000,000 (reserved for request ids).
     ///
@@ -150,7 +150,7 @@ impl ExerciseOptionsBuilder<'_, crate::client::r#async::Client> {
     /// Note: a TWS setting decides whether an exercise request must be finalized before it is sent.
     ///
     /// # Errors
-    /// [`Error::InvalidArgument`] if neither [`exercise`](Self::exercise) nor [`lapse`](Self::lapse)
+    /// [`Error::Validation`] if neither [`exercise`](Self::exercise) nor [`lapse`](Self::lapse)
     /// was called, or the quantity is not positive; [`Error::OrderIdInRequestRange`] if the client's
     /// next order id has reached 1,500,000,000 (reserved for request ids).
     ///
@@ -181,7 +181,7 @@ impl ExerciseOptionsBuilder<'_, crate::client::r#async::Client> {
     ///     }
     /// }
     /// ```
-    pub async fn submit(self) -> Result<crate::subscriptions::Subscription<super::ExerciseOptions>, Error> {
+    pub async fn submit(self) -> Result<crate::subscriptions::r#async::Subscription<super::ExerciseOptions>, Error> {
         let (order_id, request) = self.encode(|| self.client.next_order_id())?;
         let internal_subscription = self.client.send_order(order_id, request).await?;
 

@@ -4,10 +4,11 @@ use crate::common::test_utils::helpers::{
     create_test_client_with_ordered_proto_responses, proto_error_response, proto_response, request_message_count, test_notice, TEST_REQ_ID_FIRST,
 };
 use crate::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
+use crate::market_data::historical::common::test_tables::{HMDS_CONNECTED_MESSAGE, PRE_DATA_NOTICES};
 use crate::market_data::historical::BarTimestamp;
 use crate::market_data::historical::TickLast;
 use crate::market_data::IgnoreSize;
-use crate::messages::{IncomingMessages, OutgoingMessages};
+use crate::messages::{IncomingMessages, OutgoingMessages, HMDS_QUERY_MESSAGE_CODE};
 use crate::protocol::{Features, ProtocolFeature};
 use crate::server_versions;
 use crate::stubs::MessageBusStub;
@@ -47,7 +48,7 @@ fn expect_data<T: std::fmt::Debug>(item: Option<Result<SubscriptionItem<T>, Erro
 
 /// Build a `TickSubscription<T>` fed by `items`, with the broadcast channel
 /// closed after the last item.
-fn tick_sub_from_routed<T: TickDecoder<T> + Send>(items: Vec<RoutedItem>) -> TickSubscription<T> {
+fn tick_sub_from_routed<T: TickDecoder<T>>(items: Vec<RoutedItem>) -> TickSubscription<T> {
     let (tx, rx) = tokio::sync::broadcast::channel(16);
     for item in items {
         tx.send(item).unwrap();
@@ -87,8 +88,31 @@ where
     assert!(matches!(err, Error::UnexpectedResponse(_)), "expected UnexpectedResponse, got: {err:?}");
 }
 
+// Feeds a single frame of a message type the request doesn't expect: it is
+// skipped, the stream closes before the answer, and the request is cancelled
+// at TWS with `cancel`.
+async fn assert_skips_undeclared<F, Fut, T>(server_version: i32, response: crate::messages::ResponseMessage, cancel: OutgoingMessages, call: F)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: std::future::Future<Output = Result<T, Error>>,
+{
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![response]));
+    let client = Client::stubbed(message_bus.clone(), server_version);
+    let Err(err) = call(client).await else {
+        panic!("expected UnexpectedEndOfStream");
+    };
+    assert!(
+        matches!(err, Error::UnexpectedEndOfStream),
+        "expected UnexpectedEndOfStream, got: {err:?}"
+    );
+    // Drop spawns its cancel; give it the chance to run.
+    tokio::task::yield_now().await;
+    let messages = message_bus.request_messages.read().unwrap().clone();
+    assert_eq!(count_proto_msgs(&messages, cancel), 1, "no answer, so the request is cancelled");
+}
+
 #[tokio::test]
-async fn test_head_timestamp() {
+async fn head_timestamp() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HeadTimestamp,
         head_timestamp_response().unix_timestamp(1_678_838_400).encode_proto(),
@@ -118,7 +142,7 @@ async fn test_head_timestamp() {
 }
 
 #[tokio::test]
-async fn test_histogram_data_malformed_size_fails_the_request() {
+async fn histogram_data_malformed_size_fails_the_request() {
     // End-to-end through the public API: a malformed size must fail the request
     // rather than silently decoding as 0 (issue #716).
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
@@ -135,7 +159,7 @@ async fn test_histogram_data_malformed_size_fails_the_request() {
 }
 
 #[tokio::test]
-async fn test_histogram_data() {
+async fn histogram_data() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HistogramData,
         histogram_data_response()
@@ -181,7 +205,7 @@ async fn test_histogram_data() {
 }
 
 #[tokio::test]
-async fn test_historical_data() {
+async fn historical_data() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::HistoricalData,
@@ -274,7 +298,7 @@ async fn test_historical_data() {
 }
 
 #[tokio::test]
-async fn test_historical_data_adjusted_last_validation() {
+async fn historical_data_adjusted_last_validation() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
 
@@ -297,14 +321,14 @@ async fn test_historical_data_adjusted_last_validation() {
 }
 
 #[tokio::test]
-async fn test_historical_data_error_response() {
+async fn historical_data_error_response() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_error_response(
         9000,
         162,
         "Historical Market Data Service error message:No market data permissions.",
     )]));
 
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
     let contract = test_contract();
 
     let result = client.historical_data(&contract, BarSize::Hour).duration(Duration::days(1)).fetch().await;
@@ -313,60 +337,61 @@ async fn test_historical_data_error_response() {
         result.unwrap_err().to_string().contains("No market data permissions"),
         "Error should contain the error message"
     );
+    // TWS ended the query with its error; a cancel would draw 366.
+    assert_eq!(historical_requests_and_cancels(&message_bus).await, (1, 0));
 }
 
-/// TWS sends 2188 on the error callback and then delivers the bars: the account
-/// may not stream the up-to-the-second tail, but the historical data itself is
-/// served. Classified as an error it would end the request before
-/// `HistoricalData` arrived, and the caller would see no bars at all.
+/// TWS sends these on the error callback and then delivers the bars: 2188 (the
+/// account may not stream the up-to-the-second tail, but the historical data
+/// itself is served) and 165 "HMDS server connection was successful" (the farm
+/// connected on demand, #1136). Classified as an error either would end the
+/// request before `HistoricalData` arrived, and the caller would see no bars.
 #[tokio::test]
-async fn test_historical_data_up_to_the_second_advisory_is_skipped() {
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
-        proto_error_response(
-            9000,
-            2188,
-            "Up-to-the-second historical data requires additional subscription for the API.",
-        ),
-        proto_response(
-            IncomingMessages::HistoricalData,
-            historical_data_response()
-                .bar(
-                    historical_data_daily_bar("20230315")
-                        .ohlc(185.75, 186.25, 185.50, 186.00)
-                        .volume(1500.0)
-                        .wap(185.85)
-                        .count(150),
-                )
-                .encode_proto(),
-        ),
-        proto_response(
-            IncomingMessages::HistoricalDataEnd,
-            historical_data_end_response()
-                .start_date_str("20230315 09:30:00 UTC")
-                .end_date_str("20230315 16:00:00 UTC")
-                .encode_proto(),
-        ),
-    ]));
+async fn historical_data_notice_before_bars_is_skipped() {
+    for (code, message) in PRE_DATA_NOTICES {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+            proto_error_response(9000, code, message),
+            proto_response(
+                IncomingMessages::HistoricalData,
+                historical_data_response()
+                    .bar(
+                        historical_data_daily_bar("20230315")
+                            .ohlc(185.75, 186.25, 185.50, 186.00)
+                            .volume(1500.0)
+                            .wap(185.85)
+                            .count(150),
+                    )
+                    .encode_proto(),
+            ),
+            proto_response(
+                IncomingMessages::HistoricalDataEnd,
+                historical_data_end_response()
+                    .start_date_str("20230315 09:30:00 UTC")
+                    .end_date_str("20230315 16:00:00 UTC")
+                    .encode_proto(),
+            ),
+        ]));
 
-    let client = Client::stubbed(message_bus, server_versions::PROTOBUF_REST_MESSAGES_3);
+        let client = Client::stubbed(message_bus, server_versions::PROTOBUF_REST_MESSAGES_3);
 
-    let result = client
-        .historical_data(&test_contract(), BarSize::Day)
-        .duration(Duration::days(1))
-        .ending(datetime!(2023-03-15 16:00:00 UTC))
-        .fetch()
-        .await;
+        let result = client
+            .historical_data(&test_contract(), BarSize::Day)
+            .duration(Duration::days(1))
+            .ending(datetime!(2023-03-15 16:00:00 UTC))
+            .fetch()
+            .await;
 
-    let data = result.expect("advisory 2188 must not abort the request");
-    assert_eq!(data.bars.len(), 1, "bars sent after the advisory should be returned");
+        let data = result.unwrap_or_else(|e| panic!("{code} must not abort the request: {e:?}"));
+        assert_eq!(data.bars.len(), 1, "bars sent after {code} should be returned");
+    }
 }
 
 #[tokio::test]
-async fn test_historical_data_unexpected_response() {
-    // 1 = TickPrice — wrong type for historical_data.
+async fn historical_data_unexpected_response() {
+    // The window frame ahead of the bars is out of order.
     assert_unexpected_response(
         server_versions::SIZE_RULES,
-        proto_response(IncomingMessages::TickPrice, Vec::new()),
+        proto_response(IncomingMessages::HistoricalDataEnd, historical_data_end_response().encode_proto()),
         |c| async move {
             c.historical_data(&test_contract(), BarSize::Hour)
                 .duration(Duration::days(1))
@@ -378,7 +403,7 @@ async fn test_historical_data_unexpected_response() {
 }
 
 #[tokio::test]
-async fn test_historical_schedules() {
+async fn historical_schedules() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HistoricalSchedule,
         historical_schedule_response()
@@ -422,7 +447,7 @@ async fn test_historical_schedules() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_methods() {
+async fn tick_subscription_methods() {
     // mask = 10 (binary 1010) → bid_past_low=true,  ask_past_high=false
     // mask = 11 (binary 1011) → bid_past_low=true,  ask_past_high=true
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
@@ -480,7 +505,7 @@ async fn test_tick_subscription_methods() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_buffer_and_iteration() {
+async fn tick_subscription_buffer_and_iteration() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HistoricalTickBidAsk,
         historical_ticks_bid_ask_response()
@@ -510,7 +535,7 @@ async fn test_tick_subscription_buffer_and_iteration() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_bid_ask() {
+async fn tick_subscription_bid_ask() {
     // bid_past_low = true, ask_past_high = false
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HistoricalTickBidAsk,
@@ -562,7 +587,7 @@ async fn test_tick_subscription_bid_ask() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_midpoint() {
+async fn tick_subscription_midpoint() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HistoricalTick,
         historical_ticks_response()
@@ -599,7 +624,7 @@ async fn test_tick_subscription_midpoint() {
 }
 
 #[tokio::test]
-async fn test_historical_ticks_trade() {
+async fn historical_ticks_trade() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
         IncomingMessages::HistoricalTickLast,
         historical_ticks_last_response()
@@ -641,7 +666,7 @@ async fn test_historical_ticks_trade() {
 }
 
 #[tokio::test]
-async fn test_historical_data_time_zone_handling() {
+async fn historical_data_time_zone_handling() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::HistoricalData,
@@ -680,7 +705,7 @@ async fn test_historical_data_time_zone_handling() {
 }
 
 #[tokio::test]
-async fn test_historical_data_streaming_with_updates() {
+async fn historical_data_streaming_with_updates() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
             IncomingMessages::HistoricalData,
@@ -720,11 +745,11 @@ async fn test_historical_data_streaming_with_updates() {
         .expect("streaming request should succeed");
 
     // First: receive initial historical data
-    let Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) = subscription.next().await else {
+    let Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(bars)))) = subscription.next().await else {
         panic!("Expected Historical variant");
     };
-    assert_eq!(data.bars.len(), 1, "Should have 1 initial bar");
-    assert_eq!(data.bars[0].open, 185.50, "Wrong open price");
+    assert_eq!(bars.len(), 1, "Should have 1 initial bar");
+    assert_eq!(bars[0].open, 185.50, "Wrong open price");
 
     // Second: receive streaming update
     let Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar)))) = subscription.next().await else {
@@ -749,10 +774,10 @@ async fn test_historical_data_streaming_with_updates() {
     );
 }
 
-// Async twin of the sync `test_historical_data_streaming_error_response`; see
+// Async twin of the sync `historical_data_streaming_error_response`; see
 // that test for why this path is covered per API rather than only at the transport.
 #[tokio::test]
-async fn test_historical_data_streaming_error_response() {
+async fn historical_data_streaming_error_response() {
     let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![proto_error_response(
         9000,
         162,
@@ -773,8 +798,39 @@ async fn test_historical_data_streaming_error_response() {
     assert_tws_error_message(err, 162, "No market data permissions");
 }
 
+/// 165 "HMDS server connection was successful" ahead of the bars is a notice:
+/// the stream yields it and keeps going (#1136).
 #[tokio::test]
-async fn test_tick_subscription_sends_cancel_on_drop() {
+async fn historical_data_streaming_hmds_connected_notice_then_data() {
+    let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![
+        proto_error_response(9000, HMDS_QUERY_MESSAGE_CODE, HMDS_CONNECTED_MESSAGE),
+        proto_response(
+            IncomingMessages::HistoricalData,
+            historical_data_response()
+                .bar(historical_data_bar(1_678_886_400).ohlc(185.50, 186.00, 185.25, 185.75))
+                .encode_proto(),
+        ),
+    ]);
+
+    let mut subscription = client
+        .historical_data(&Contract::stock("SPY").build(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .stream()
+        .await
+        .expect("streaming request should succeed");
+
+    let Some(Ok(SubscriptionItem::Notice(notice))) = subscription.next().await else {
+        panic!("165 should arrive as a notice");
+    };
+    assert_eq!((notice.code, notice.message.as_str()), (HMDS_QUERY_MESSAGE_CODE, HMDS_CONNECTED_MESSAGE));
+    let Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(bars)))) = subscription.next().await else {
+        panic!("bars should follow the notice");
+    };
+    assert_eq!(bars.len(), 1);
+}
+
+#[tokio::test]
+async fn tick_subscription_sends_cancel_on_drop() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let (_tx, rx) = tokio::sync::broadcast::channel(16);
@@ -795,7 +851,7 @@ async fn test_tick_subscription_sends_cancel_on_drop() {
 /// `Drop` used a bare `tokio::spawn`, which panicked on a thread with no
 /// runtime; the cancel now goes out on the bus's runtime (#848).
 #[tokio::test]
-async fn test_tick_subscription_drop_outside_runtime_sends_cancel() {
+async fn tick_subscription_drop_outside_runtime_sends_cancel() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let (_tx, rx) = tokio::sync::broadcast::channel(16);
@@ -813,7 +869,7 @@ async fn test_tick_subscription_drop_outside_runtime_sends_cancel() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_explicit_cancel_prevents_duplicate_on_drop() {
+async fn tick_subscription_explicit_cancel_prevents_duplicate_on_drop() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let (_tx, rx) = tokio::sync::broadcast::channel(16);
@@ -835,7 +891,7 @@ async fn test_tick_subscription_explicit_cancel_prevents_duplicate_on_drop() {
 /// skipped. The bus no longer injects `Cancelled` into the route, which it
 /// could only find by id (#894).
 #[tokio::test]
-async fn test_tick_subscription_cancel_reports_cancelled_then_ends() {
+async fn tick_subscription_cancel_reports_cancelled_then_ends() {
     // The sender stays open: a regression polls the channel and must time out
     // rather than hang.
     async fn next(subscription: &mut TickSubscription<TickLast>) -> Option<Result<SubscriptionItem<TickLast>, Error>> {
@@ -879,7 +935,7 @@ async fn test_tick_subscription_cancel_reports_cancelled_then_ends() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_drop_after_done_does_not_cancel() {
+async fn tick_subscription_drop_after_done_does_not_cancel() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let (_tx, rx) = tokio::sync::broadcast::channel(16);
@@ -898,7 +954,7 @@ async fn test_tick_subscription_drop_after_done_does_not_cancel() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_cancel_after_done_writes_nothing() {
+async fn tick_subscription_cancel_after_done_writes_nothing() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let (_tx, rx) = tokio::sync::broadcast::channel(16);
@@ -913,7 +969,7 @@ async fn test_tick_subscription_cancel_after_done_writes_nothing() {
 }
 
 #[tokio::test]
-async fn test_streaming_subscription_sends_cancel_on_drop() {
+async fn streaming_subscription_sends_cancel_on_drop() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let mut client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
@@ -939,8 +995,139 @@ async fn test_streaming_subscription_sends_cancel_on_drop() {
     );
 }
 
+/// The historical data requests and cancels written to `bus`, once the
+/// cancels that drops spawn have run.
+async fn historical_requests_and_cancels(bus: &MessageBusStub) -> (usize, usize) {
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let messages = bus.request_messages.read().unwrap();
+    (
+        count_proto_msgs(&messages, OutgoingMessages::RequestHistoricalData),
+        count_proto_msgs(&messages, OutgoingMessages::CancelHistoricalData),
+    )
+}
+
+/// Dropping the `fetch` future before the window frame cancels the request at TWS.
 #[tokio::test]
-async fn test_streaming_subscription_cancel_prevents_duplicate_on_drop() {
+async fn historical_data_dropped_fetch_cancels() {
+    let bus = Arc::new(MessageBusStub::default().keeping_channels_open());
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+
+    let contract = test_contract();
+    let fetch = client.historical_data(&contract, BarSize::Hour).duration(Duration::days(1)).fetch();
+    let elapsed = tokio::time::timeout(tokio::time::Duration::from_millis(20), fetch).await;
+
+    assert!(elapsed.is_err(), "the stub never answers");
+    assert_eq!(historical_requests_and_cancels(&bus).await, (1, 1));
+}
+
+/// `one_shot_timeout` bounds both reads: bars, then silence, times out
+/// and cancels the request at TWS.
+#[tokio::test]
+async fn historical_data_one_shot_timeout_cancels_between_frames() {
+    let bars = proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto());
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![bars]).keeping_channels_open());
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3).with_one_shot_timeout(std::time::Duration::from_millis(20));
+
+    let result = client
+        .historical_data(&test_contract(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch()
+        .await;
+
+    assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    assert_eq!(historical_requests_and_cancels(&bus).await, (1, 1));
+}
+
+/// A reconnect that outlasts `one_shot_timeout` ends the fetch without a resend.
+#[tokio::test]
+async fn historical_data_one_shot_timeout_skips_resend_past_deadline() {
+    // Far past the 20 ms `one_shot_timeout`: a fetch that waits it out has
+    // ignored its deadline.
+    const RECONNECT: std::time::Duration = std::time::Duration::from_secs(10);
+    let bars = proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto());
+    let end = proto_response(IncomingMessages::HistoricalDataEnd, historical_data_end_response().encode_proto());
+    let bus = Arc::new(
+        MessageBusStub::with_ordered_responses(vec![bars, end])
+            .with_connection_resets(1)
+            .with_reconnect_delay(RECONNECT),
+    );
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3).with_one_shot_timeout(std::time::Duration::from_millis(20));
+
+    let start = std::time::Instant::now();
+    let result = client
+        .historical_data(&test_contract(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch()
+        .await;
+
+    assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    assert!(start.elapsed() < RECONNECT / 2, "the reconnect wait must end at the deadline");
+    assert_eq!(historical_requests_and_cancels(&bus).await.0, 1, "no resend past the deadline");
+}
+
+/// The window frame ends the request at TWS: nothing to cancel.
+#[tokio::test]
+async fn historical_data_completed_fetch_sends_no_cancel() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::HistoricalData,
+            historical_data_response()
+                .bar(historical_data_bar(1_678_886_400).ohlc(185.50, 186.00, 185.25, 185.75))
+                .encode_proto(),
+        ),
+        proto_response(IncomingMessages::HistoricalDataEnd, historical_data_end_response().encode_proto()),
+    ]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+
+    let data = client
+        .historical_data(&test_contract(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch()
+        .await
+        .expect("completed request");
+
+    assert_eq!(data.bars.len(), 1);
+    assert_eq!(historical_requests_and_cancels(&bus).await, (1, 0));
+}
+
+/// A second batch of bars in place of the window frame cancels the request at TWS.
+#[tokio::test]
+async fn historical_data_out_of_order_frames_cancel() {
+    let bars = proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto());
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![bars.clone(), bars]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+
+    let result = client
+        .historical_data(&test_contract(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch()
+        .await;
+
+    assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "{result:?}");
+    assert_eq!(historical_requests_and_cancels(&bus).await, (1, 1));
+}
+
+/// A decode failure before the window frame cancels the request at TWS.
+#[tokio::test]
+async fn historical_data_local_error_cancels() {
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
+        IncomingMessages::HistoricalData,
+        vec![0xff],
+    )]));
+    let client = Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+
+    let result = client
+        .historical_data(&test_contract(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .fetch()
+        .await;
+
+    assert!(result.is_err(), "malformed bars must fail");
+    assert_eq!(historical_requests_and_cancels(&bus).await, (1, 1));
+}
+
+#[tokio::test]
+async fn streaming_subscription_cancel_prevents_duplicate_on_drop() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let mut client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
@@ -969,18 +1156,19 @@ async fn test_streaming_subscription_cancel_prevents_duplicate_on_drop() {
 }
 
 #[tokio::test]
-async fn test_head_timestamp_unexpected_response() {
+async fn head_timestamp_skips_undeclared_message() {
     // 17 = HistoricalData — wrong type for head_timestamp.
-    assert_unexpected_response(
+    assert_skips_undeclared(
         server_versions::BOND_ISSUERID,
         proto_response(IncomingMessages::HistoricalData, Vec::new()),
+        OutgoingMessages::CancelHeadTimestamp,
         |c| async move { c.head_timestamp(&test_contract(), WhatToShow::Trades, TradingHours::Regular).await },
     )
     .await;
 }
 
 #[tokio::test]
-async fn test_historical_data_with_end_message() {
+async fn historical_data_with_end_message() {
     // start/end always come on the follow-on HistoricalDataEnd (108) frame at floor 210.
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
@@ -1019,7 +1207,7 @@ async fn test_historical_data_with_end_message() {
 }
 
 #[tokio::test]
-async fn test_historical_data_end_of_stream_is_not_retried() {
+async fn historical_data_end_of_stream_is_not_retried() {
     // Empty responses → broadcast channel closes immediately → subscription.next()
     // yields None. A closed stream is not a reset: it fails on the first attempt.
     // Before #744 this side retried it five times and reported ConnectionReset,
@@ -1041,7 +1229,7 @@ async fn test_historical_data_end_of_stream_is_not_retried() {
 }
 
 #[tokio::test]
-async fn test_historical_data_retries_a_connection_reset() {
+async fn historical_data_retries_a_connection_reset() {
     // The case the async side never retried: a routed ConnectionReset came back
     // through `Some(Err(e))` and returned straight to the caller.
     let message_bus = Arc::new(
@@ -1070,18 +1258,19 @@ async fn test_historical_data_retries_a_connection_reset() {
 }
 
 #[tokio::test]
-async fn test_historical_schedules_unexpected_response() {
+async fn historical_schedules_skips_undeclared_message() {
     // 17 = HistoricalData — wrong type for the schedule decoder (expects 106).
-    assert_unexpected_response(
+    assert_skips_undeclared(
         server_versions::BOND_ISSUERID,
         proto_response(IncomingMessages::HistoricalData, Vec::new()),
+        OutgoingMessages::CancelHistoricalData,
         |c| async move { c.historical_schedules(&test_contract(), Duration::days(3)).fetch().await },
     )
     .await;
 }
 
 #[tokio::test]
-async fn test_cancel_historical_ticks() {
+async fn cancel_historical_ticks() {
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::CANCEL_CONTRACT_DATA);
 
@@ -1092,12 +1281,12 @@ async fn test_cancel_historical_ticks() {
 }
 
 #[tokio::test]
-async fn test_cancel_historical_ticks_version_check() {
+async fn cancel_historical_ticks_version_check() {
     assert_version_check_fails(Features::CANCEL_CONTRACT_DATA, |c| async move { c.cancel_historical_ticks(9000).await }).await;
 }
 
 #[tokio::test]
-async fn test_tick_subscription_cancel_idempotent() {
+async fn tick_subscription_cancel_idempotent() {
     let message_bus = Arc::new(MessageBusStub::default());
 
     let (_tx, rx) = tokio::sync::broadcast::channel(16);
@@ -1115,7 +1304,7 @@ async fn test_tick_subscription_cancel_idempotent() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_skips_unexpected_message_then_yields() {
+async fn tick_subscription_skips_unexpected_message_then_yields() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         // HistoricalData is unexpected for a tick subscription → should be skipped.
         proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto()),
@@ -1142,7 +1331,7 @@ async fn test_tick_subscription_skips_unexpected_message_then_yields() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_error_surfaces_via_err_arm() {
+async fn tick_subscription_error_surfaces_via_err_arm() {
     // #675 regression guard (async): a RoutedItem::Error must surface through the
     // `Err` arm, not be silently dropped (the pre-fix async path discarded it
     // entirely). Subsequent polls return None.
@@ -1156,7 +1345,31 @@ async fn test_tick_subscription_error_surfaces_via_err_arm() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_lag_yields_gap_notice_then_data() {
+async fn next_frame_fails_on_lag() {
+    // A lag may have evicted the bars frame; skipping the gap would read the
+    // window frame in its place (#1090).
+    let (tx, rx) = tokio::sync::broadcast::channel(2);
+    for code in [2100, 2101, 2102] {
+        tx.send(RoutedItem::Notice(test_notice(code, "n"))).unwrap();
+    }
+    drop(tx);
+
+    let mut subscription: Subscription<HistoricalDataFrame> = Subscription::new_from_internal(
+        AsyncInternalSubscription::new(rx),
+        Arc::new(MessageBusStub::default()),
+        Some(9000),
+        None,
+        crate::subscriptions::DecoderContext::default(),
+    );
+
+    match request_helpers::next_frame(&mut subscription, None).await {
+        Err(Error::Notice(n)) => assert_eq!(n.code, crate::messages::SUBSCRIPTION_LAG_CODE),
+        other => panic!("expected lag error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tick_subscription_lag_yields_gap_notice_then_data() {
     // Regression test for #779: a consumer that falls behind the broadcast
     // channel receives a synthesized gap notice naming the dropped count,
     // then the retained frames — not a silent resume.
@@ -1193,7 +1406,7 @@ async fn test_tick_subscription_lag_yields_gap_notice_then_data() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_notice_passes_through_then_data() {
+async fn tick_subscription_notice_passes_through_then_data() {
     // A Notice surfaces as SubscriptionItem::Notice (stream stays open); a
     // following tick batch is delivered after it. filter_data() drops the notice.
     let mut subscription: TickSubscription<TickLast> = tick_sub_from_routed(vec![
@@ -1216,7 +1429,7 @@ async fn test_tick_subscription_notice_passes_through_then_data() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_filter_data_drops_notice_keeps_error() {
+async fn tick_subscription_filter_data_drops_notice_keeps_error() {
     // filter_data() drops the Notice but still surfaces the terminal Error.
     let subscription: TickSubscription<TickLast> = tick_sub_from_routed(vec![
         RoutedItem::Notice(test_notice(2100, "warning")),
@@ -1232,7 +1445,7 @@ async fn test_tick_subscription_filter_data_drops_notice_keeps_error() {
 }
 
 #[tokio::test]
-async fn test_tick_subscription_returns_none_on_closed_channel() {
+async fn tick_subscription_returns_none_on_closed_channel() {
     // Empty ordered_responses closes the broadcast channel immediately; the first
     // poll sees the stream end and next() returns None.
     let message_bus = Arc::new(MessageBusStub::default());
@@ -1260,7 +1473,7 @@ async fn fetch_daily(responses: Vec<crate::messages::ResponseMessage>) -> (Resul
 
 /// A decoded batch alone cannot prove a finite request completed.
 #[tokio::test]
-async fn test_historical_data_requires_end_after_a_batch() {
+async fn historical_data_requires_end_after_a_batch() {
     for populated in [false, true] {
         let response = historical_data_response();
         let response = if populated {
@@ -1276,7 +1489,7 @@ async fn test_historical_data_requires_end_after_a_batch() {
 
 /// A second data frame is not the completion marker.
 #[tokio::test]
-async fn test_historical_data_requires_end_message_type() {
+async fn historical_data_requires_end_message_type() {
     let response = proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto());
     let (result, bus) = fetch_daily(vec![response.clone(), response]).await;
     assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "{result:?}");
@@ -1285,7 +1498,7 @@ async fn test_historical_data_requires_end_message_type() {
 
 /// An empty result is valid when the broker explicitly completes the request.
 #[tokio::test]
-async fn test_historical_data_requires_end_accepts_completed_empty_batch() {
+async fn historical_data_requires_end_accepts_completed_empty_batch() {
     let (result, bus) = fetch_daily(vec![
         proto_response(IncomingMessages::HistoricalData, historical_data_response().encode_proto()),
         proto_response(

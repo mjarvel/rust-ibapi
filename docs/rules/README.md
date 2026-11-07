@@ -5,10 +5,9 @@ the detail lives here so it loads only when the work actually calls for it.
 
 ## Why this shape
 
-Each rule used to be two documents fused together — a directive and an evidence trail. The
-directive is what you need at the moment of writing code; the evidence is what you need when
-deciding whether the directive still applies. Splitting them lets the index stay short
-enough to keep in context permanently while the reasoning stays available on demand.
+A rule is a directive (needed while writing code) plus an evidence trail (needed when deciding
+whether the directive still applies). Splitting them keeps the index short enough for permanent
+context while the reasoning stays available on demand.
 
 ## When a convention changes
 
@@ -17,12 +16,10 @@ alongside it — are in **[Maintaining the rule graph](../../AGENTS.md#maintaini
 because they have to fire without opening this file. This page carries the mechanics they refer
 to: the node format below, `triggers` phrasing, `status`, links, and the validator.
 
-The reason those obligations are worth their space in permanent context: nothing here is
-compile-checked, so a node that no longer matches `src/` is indistinguishable from one that
-does until someone reads both. That is how five errors accumulated across rules 15–20 before
-the first audit found them, and every cluster audited since has had the same class — names
-decay quietly, and completeness claims ("fully applied", "zero remaining", "every `pub fn`")
-decay faster than names.
+They live in permanent context because nothing here is compile-checked: a node that no longer
+matches `src/` reads exactly like one that does. Every audit so far has found the same decay —
+names go stale quietly, and completeness claims ("fully applied", "zero remaining", "every
+`pub fn`") go stale faster.
 
 ## Node format
 
@@ -38,7 +35,6 @@ triggers:                          # situations, not topics — see below
 symbols: [ResponseMessage, peek_int, text_request_id_field]
 related: [proto-only-decoding]     # ids of other nodes, not paths
 precedents: ["#519", "#647"]       # PR numbers
-memory: [feedback_request_id_index_registration]
 ---
 
 The directive. Three to five lines, imperative, no history.
@@ -68,8 +64,12 @@ when a future change could reopen the arc.
 - Node-to-node links use ordinary relative markdown links so they resolve for a human
   reading on GitHub. No `[[wikilinks]]`.
 - `related` holds ids; the validator resolves them.
-- `memory` names files in the maintainer's private memory directory. It is **not** validated
-  — that directory lives outside the repo and is user-specific.
+- **No private notes.** A node never cites an agent's memory files or a `plans/` file as
+  evidence: only one machine can resolve the reference, so it is dead for every other reader and
+  no gate can check it. Naming a `plans/` file as where a process keeps its working list
+  (`plans/live-checks.md` in [plans and issues](workflow/plans-and-issues.md)) is not evidence
+  and is fine. Evidence that matters goes into `## Why` or `## Precedents`. Links run
+  the other way: private notes may cite node ids. The validator rejects a `memory:` key.
 
 ### ⚠️ `AGENTS.md` must never `@`-import these files
 
@@ -83,12 +83,10 @@ avoid. Use plain markdown links. `just rules-check` enforces this.
 just rules-check
 ```
 
-Checks that every markdown link resolves, every `id` matches its filename, every `related`
-id names a real node, that `AGENTS.md` contains no `@`-imports, and that no node cites a
-`file.rs:NNN` line number.
-
-Link resolution covers `AGENTS.md` and `docs/rules/**`. `plans/` is untracked and out of
-scope; see [plans and issues](workflow/plans-and-issues.md).
+What it checks, and which files it scans, is listed once, in the header of
+[`tools/check-rules-graph.sh`](../../tools/check-rules-graph.sh); add a check there and the
+list grows with it. `plans/` is untracked and out of scope; see
+[plans and issues](workflow/plans-and-issues.md).
 
 **Cite names, not line numbers.** `src/protocol_tests.rs:5` is accurate until the next edit
 to that file and nothing recomputes it — the same silent decay that made rule numbers
@@ -140,7 +138,7 @@ from outside the numbered set: `wire/one-shot-narrowing` (#738/#749) and
 
 The regression check on trigger phrasing: re-run after a round of node edits, or whenever a
 node's `triggers` are rewritten. Give each probe to a fresh subagent with no knowledge of the
-graph. **Last run 2026-08-06: 3/3 pass** — every one opened its node as its first read rather
+graph. **Last run 2026-10-27: 3/3 pass** — every one opened its node as its first read rather
 than answering from the `AGENTS.md` index line.
 
 1. *"I'm adding a `contract_id()` accessor to `ResponseMessage` — what do I need to know?"*

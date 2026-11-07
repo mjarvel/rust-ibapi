@@ -1,5 +1,6 @@
 use futures::StreamExt;
 use ibapi::accounts::types::{AccountGroup, AccountId, ContractId};
+use ibapi::accounts::LedgerOnly;
 use ibapi::contracts::Contract;
 use ibapi::orders::{Action, Order, OrderStatusKind, PlaceOrder};
 use ibapi::subscriptions::SubscriptionItem;
@@ -36,6 +37,8 @@ async fn managed_accounts_returns_list() {
 
     let accounts = client.managed_accounts().await.expect("managed_accounts failed");
     assert!(!accounts.is_empty());
+    // The handshake's list is the same wire list, kept from connect.
+    assert_eq!(client.handshake_managed_accounts(), accounts);
 }
 
 #[tokio::test]
@@ -127,7 +130,7 @@ async fn account_updates_multi() {
     let (client, account, _client_id) = connect_and_get_account().await;
 
     let mut subscription = client
-        .account_updates_multi(Some(&account), None)
+        .account_updates_multi(Some(&account), None, LedgerOnly::Yes)
         .await
         .expect("account_updates_multi failed");
 

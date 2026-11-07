@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::orders::OrderId;
+use crate::orders::{OrderId, TimeInForce};
 
 /// Order IDs from [`AttachedOrdersBuilder::submit`](crate::orders::AttachedOrdersBuilder).
 ///
@@ -89,10 +89,7 @@ pub struct Quantity(f64);
 impl Quantity {
     /// Create a validated quantity ensuring it is positive and finite.
     pub fn new(value: f64) -> Result<Self, ValidationError> {
-        if value <= 0.0 {
-            return Err(ValidationError::InvalidQuantity(value));
-        }
-        if value.is_nan() || value.is_infinite() {
+        if !value.is_finite() || value <= 0.0 {
             return Err(ValidationError::InvalidQuantity(value));
         }
         Ok(Self(value))
@@ -112,7 +109,7 @@ pub struct Price(f64);
 impl Price {
     /// Create a validated price ensuring it is finite.
     pub fn new(value: f64) -> Result<Self, ValidationError> {
-        if value.is_nan() || value.is_infinite() {
+        if !value.is_finite() {
             return Err(ValidationError::InvalidPrice(value));
         }
         Ok(Self(value))
@@ -313,6 +310,16 @@ impl OrderType {
         }
     }
 
+    /// The time in force this type is made of, for the types `as_str` sends as a plain
+    /// `MKT` / `LMT` / `MTL`.
+    pub(crate) fn implied_time_in_force(&self) -> Option<TimeInForce> {
+        match self {
+            Self::MarketOnOpen | Self::LimitOnOpen => Some(TimeInForce::OnOpen),
+            Self::AtAuction => Some(TimeInForce::Auction),
+            _ => None,
+        }
+    }
+
     /// Returns true if this order type requires a limit price
     pub fn requires_limit_price(&self) -> bool {
         matches!(
@@ -347,7 +354,7 @@ impl OrderType {
 
     // `build()` sends a price field only for the types below, so one left by an earlier
     // order-type setter is dropped. Sets follow C# `OrderSamples.cs`, plus `limit_price` for
-    // PEG BEST and the fields the REL combos (reachable only through `.order_type(..)`) may carry.
+    // PEG BEST and an `aux_price` offset on the REL combos, which only `.order_type(..)` can carry.
 
     /// Types whose stop price the builder sends as `aux_price`.
     pub(crate) fn uses_stop_price(&self) -> bool {

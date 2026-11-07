@@ -87,7 +87,7 @@ impl Client {
     /// Fetch the account family codes registered with the broker.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -355,12 +355,15 @@ impl Client {
     /// # Arguments
     /// * `account`        - Account values can be requested for a particular account.
     /// * `model_code`     - Account values can also be requested for a model.
+    /// * `ledger_only`    - Which keys arrive: [`LedgerOnly::Yes`] for only the per-currency
+    ///   `$LEDGER-*` keys, [`LedgerOnly::No`] for those plus the account-level keys
+    ///   (`NetLiquidation`, `BuyingPower`, ...).
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use ibapi::Client;
-    /// use ibapi::accounts::AccountUpdateMulti;
+    /// use ibapi::accounts::{AccountUpdateMulti, LedgerOnly};
     /// use ibapi::accounts::types::AccountId;
     /// use ibapi::subscriptions::SubscriptionItem;
     /// use futures::StreamExt;
@@ -371,7 +374,7 @@ impl Client {
     ///
     ///     let account = AccountId("U1234567".to_string());
     ///
-    ///     let mut subscription = client.account_updates_multi(Some(&account), None).await.expect("error requesting account updates multi");
+    ///     let mut subscription = client.account_updates_multi(Some(&account), None, LedgerOnly::No).await.expect("error requesting account updates multi");
     ///
     ///     while let Some(item) = subscription.next().await {
     ///         match item {
@@ -391,17 +394,21 @@ impl Client {
         &self,
         account: Option<&AccountId>,
         model_code: Option<&ModelCode>,
+        ledger_only: LedgerOnly,
     ) -> Result<Subscription<AccountUpdateMulti>, Error> {
         let builder = self.request();
-        let request = encoders::encode_request_account_updates_multi(builder.request_id(), account, model_code)?;
+        let request = encoders::encode_request_account_updates_multi(builder.request_id(), account, model_code, ledger_only)?;
 
         builder.send::<AccountUpdateMulti>(request).await
     }
 
     /// Fetch the list of accounts accessible to the current user.
     ///
+    /// For the list TWS sent at connect, with no round trip, see
+    /// [`handshake_managed_accounts`](Self::handshake_managed_accounts).
+    ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -430,7 +437,7 @@ impl Client {
     /// Query the current server time reported by TWS or IB Gateway.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -457,7 +464,7 @@ impl Client {
     /// Query the current server time in milliseconds reported by TWS or IB Gateway.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -531,7 +538,7 @@ impl Client {
     /// * `fa_data_type` - which FA dataset to fetch.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -609,7 +616,7 @@ impl Client {
     /// Most users will not call this directly; it is part of the IB Linking flow.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -636,7 +643,7 @@ impl Client {
     /// Continue a TWS extension verification handshake by sending the API response data.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -694,6 +701,11 @@ impl AccountSummarySnapshots {
     ///
     /// Not cancel-safe: dropping the future, as `tokio::select!` does with the branches that lose,
     /// drops the rows of a batch still being read.
+    ///
+    /// If the consumer falls behind, frames are dropped and this returns `Error::Notice` with
+    /// [`SUBSCRIPTION_LAG_CODE`](crate::SUBSCRIPTION_LAG_CODE). Later snapshots may then hold
+    /// values the dropped frames updated, since TWS resends only changed tags: cancel and
+    /// resubscribe for a fresh snapshot.
     pub async fn next(&mut self) -> Option<Result<AccountSummarySnapshot, Error>> {
         loop {
             match self.subscription.next_batch(self.quiet).await {

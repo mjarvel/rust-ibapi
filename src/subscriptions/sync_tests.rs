@@ -22,7 +22,7 @@ impl StreamDecoder<EndOfStreamItem> for EndOfStreamItem {
 }
 
 #[test]
-fn test_subscription_skips_undeclared_messages_without_limit() {
+fn subscription_skips_undeclared_messages_without_limit() {
     use std::sync::atomic::AtomicUsize;
 
     static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -63,7 +63,7 @@ fn test_subscription_skips_undeclared_messages_without_limit() {
 }
 
 #[test]
-fn test_routed_item_error_terminates_subscription() {
+fn routed_item_error_terminates_subscription() {
     use crate::subscriptions::common::RoutedItem;
     use crate::transport::SubscriptionBuilder;
     use crossbeam::channel;
@@ -100,7 +100,7 @@ fn test_routed_item_error_terminates_subscription() {
 }
 
 #[test]
-fn test_routed_item_notice_surfaces_as_subscription_item() {
+fn routed_item_notice_surfaces_as_subscription_item() {
     use crate::messages::Notice;
     use crate::subscriptions::common::RoutedItem;
     use crate::transport::SubscriptionBuilder;
@@ -153,7 +153,7 @@ fn test_routed_item_notice_surfaces_as_subscription_item() {
 }
 
 #[test]
-fn test_no_retries_after_end_of_stream() {
+fn no_retries_after_end_of_stream() {
     let stub = MessageBusStub::with_ordered_responses(vec![
         ResponseMessage::from("1\0data\0"),  // triggers EndOfStream via decoder
         ResponseMessage::from("1\0stray\0"), // stray message after stream ended
@@ -230,7 +230,7 @@ fn data(value: i32) -> RoutedItem {
 }
 
 #[test]
-fn test_collect_for_stops_at_snapshot_end() {
+fn collect_for_stops_at_snapshot_end() {
     // 10, 20, snapshot-end, 30 — collection stops at the sentinel (excluded);
     // 30 is never consumed.
     let (sub, _keep) = collect_subscription(vec![data(10), data(20), data(-1), data(30)], true);
@@ -241,7 +241,7 @@ fn test_collect_for_stops_at_snapshot_end() {
 }
 
 #[test]
-fn test_collect_until_stops_on_predicate() {
+fn collect_until_stops_on_predicate() {
     // No sentinel; the predicate halts collection once two items arrive.
     let (sub, _keep) = collect_subscription(vec![data(10), data(20), data(30), data(40)], true);
 
@@ -251,7 +251,7 @@ fn test_collect_until_stops_on_predicate() {
 }
 
 #[test]
-fn test_collect_for_returns_prefix_on_terminal_error() {
+fn collect_for_returns_prefix_on_terminal_error() {
     // One datum, then a terminal error — the prefix collected so far is returned.
     let (sub, _keep) = collect_subscription(vec![data(10), RoutedItem::Error(Error::ConnectionReset), data(20)], true);
 
@@ -261,7 +261,7 @@ fn test_collect_for_returns_prefix_on_terminal_error() {
 }
 
 #[test]
-fn test_collect_for_returns_empty_on_timeout() {
+fn collect_for_returns_empty_on_timeout() {
     // Channel stays open with no data; the total timeout bounds the wait.
     let (sub, _keep) = collect_subscription(vec![], true);
 
@@ -271,7 +271,7 @@ fn test_collect_for_returns_empty_on_timeout() {
 }
 
 #[test]
-fn test_collect_for_zero_timeout_returns_immediately() {
+fn collect_for_zero_timeout_returns_immediately() {
     // A zero deadline trips the top-of-loop guard before any item is read,
     // even though data is queued.
     let (sub, _keep) = collect_subscription(vec![data(10), data(20)], true);
@@ -282,7 +282,7 @@ fn test_collect_for_zero_timeout_returns_immediately() {
 }
 
 #[test]
-fn test_collect_for_drains_to_stream_end() {
+fn collect_for_drains_to_stream_end() {
     // No sentinel and the sender is dropped, so collection ends at stream end.
     let (sub, _keep) = collect_subscription(vec![data(10), data(20), data(30)], false);
 
@@ -292,7 +292,7 @@ fn test_collect_for_drains_to_stream_end() {
 }
 
 #[test]
-fn test_collect_for_filters_notices() {
+fn collect_for_filters_notices() {
     use crate::messages::Notice;
 
     let notice = RoutedItem::Notice(Notice {
@@ -310,12 +310,12 @@ fn test_collect_for_filters_notices() {
     assert_eq!(collected, vec![CollectItem(10), CollectItem(20)]);
 }
 
-/// The complement of `test_subscription_skips_undeclared_messages_without_limit`.
+/// The complement of `subscription_skips_undeclared_messages_without_limit`.
 /// Declaring a type the `decode` match does not handle is a bug, and it must be
 /// loud: the `_` arm's `UnexpectedResponse` is no longer skippable, so it
 /// terminates instead of silently yielding nothing.
 #[test]
-fn test_declared_type_with_no_decode_arm_terminates() {
+fn declared_type_with_no_decode_arm_terminates() {
     #[derive(Debug)]
     struct DeclaresMoreThanItHandles;
 
@@ -354,13 +354,21 @@ fn routed_subscription<T: StreamDecoder<T>>(
     builder: SubscriptionBuilder,
     items: Vec<RoutedItem>,
 ) -> (Subscription<T>, Arc<MessageBusStub>, channel::Receiver<Signal>) {
+    routed_subscription_on(MessageBusStub::default(), builder, items)
+}
+
+fn routed_subscription_on<T: StreamDecoder<T>>(
+    stub: MessageBusStub,
+    builder: SubscriptionBuilder,
+    items: Vec<RoutedItem>,
+) -> (Subscription<T>, Arc<MessageBusStub>, channel::Receiver<Signal>) {
     let (sender, receiver) = channel::unbounded::<RoutedItem>();
     let (signaler, signals) = channel::unbounded();
     for item in items {
         sender.send(item).unwrap();
     }
     let internal = builder.receiver(receiver).sender(sender).signaler(signaler).lease(Lease::new()).build();
-    let stub = Arc::new(MessageBusStub::default());
+    let stub = Arc::new(stub);
     (Subscription::new(stub.clone(), internal, DecoderContext::default()), stub, signals)
 }
 
@@ -374,7 +382,7 @@ fn unregistered_request(signals: &channel::Receiver<Signal>) -> bool {
 }
 
 #[test]
-fn test_decoded_end_skips_cancel_on_drop() {
+fn decoded_end_skips_cancel_on_drop() {
     let (sub, bus, _signals) = request_subscription::<EndOfStreamItem>(vec![data(1)]);
 
     assert!(sub.next().is_none());
@@ -386,7 +394,7 @@ fn test_decoded_end_skips_cancel_on_drop() {
 }
 
 #[test]
-fn test_routed_end_skips_cancel_on_drop() {
+fn routed_end_skips_cancel_on_drop() {
     let (sub, bus, _signals) = request_subscription::<EndOfStreamItem>(vec![RoutedItem::Error(Error::EndOfStream)]);
 
     assert!(sub.next().is_none());
@@ -397,11 +405,11 @@ fn test_routed_end_skips_cancel_on_drop() {
 }
 
 #[test]
-fn test_error_end_still_cancels() {
+fn error_end_still_cancels() {
     // Only the end marker proves TWS finished; after an error the cancel goes out as before.
-    let (sub, bus, signals) = request_subscription::<EndOfStreamItem>(vec![RoutedItem::Error(Error::ConnectionReset)]);
+    let (sub, bus, signals) = request_subscription::<EndOfStreamItem>(vec![RoutedItem::Error(Error::Simple("boom".into()))]);
 
-    assert!(matches!(sub.next(), Some(Err(Error::ConnectionReset))));
+    assert!(matches!(sub.next(), Some(Err(Error::Simple(_)))));
     assert!(!sub.ended_natively());
 
     drop(sub);
@@ -409,12 +417,48 @@ fn test_error_end_still_cancels() {
     assert!(unregistered_request(&signals), "route kept after cancel");
 }
 
+/// A reconnect ended the request at TWS along with the old session; the new
+/// session never saw its id. Dropped after the reconnect, even without having
+/// read the reset, it writes no cancel but still releases its route.
+#[test]
+fn drop_after_reconnect_skips_cancel() {
+    let (sub, bus, signals) = request_subscription::<EndOfStreamItem>(vec![RoutedItem::Error(Error::ConnectionReset)]);
+
+    bus.start_new_session();
+    drop(sub);
+
+    assert!(bus.request_messages().is_empty(), "no cancel for a request from an earlier session");
+    assert!(unregistered_request(&signals), "route still released");
+}
+
+/// A reset can land between the write and `Subscription::new`; the
+/// subscription takes the request's generation from the route, not the bus's
+/// at construction, so it still skips the cancel.
+#[test]
+fn reset_before_construction_skips_cancel() {
+    let (_sender, receiver) = channel::unbounded::<RoutedItem>();
+    let (signaler, _signals) = channel::unbounded();
+    let internal = SubscriptionBuilder::new()
+        .request_id(RequestId::nth(1))
+        .session(0)
+        .receiver(receiver)
+        .signaler(signaler)
+        .lease(Lease::new())
+        .build();
+    let bus = Arc::new(MessageBusStub::default());
+    bus.start_new_session();
+
+    drop(Subscription::<EndOfStreamItem>::new(bus.clone(), internal, DecoderContext::default()));
+
+    assert!(bus.request_messages().is_empty(), "cancel written to the new session");
+}
+
 // --- cancel releases the route ------------------------------------------
 // The cancel message is optional; unregistering is not, so a handle kept
 // after `cancel()` stops collecting frames.
 
 #[test]
-fn test_cancel_without_cancel_message_unregisters() {
+fn cancel_without_cancel_message_unregisters() {
     let (sub, bus, signals) = request_subscription::<CollectItem>(vec![]);
 
     sub.cancel();
@@ -424,7 +468,7 @@ fn test_cancel_without_cancel_message_unregisters() {
 }
 
 #[test]
-fn test_cancel_after_end_marker_unregisters() {
+fn cancel_after_end_marker_unregisters() {
     let (sub, bus, signals) = request_subscription::<EndOfStreamItem>(vec![data(1)]);
     assert!(sub.next().is_none());
 
@@ -434,7 +478,7 @@ fn test_cancel_after_end_marker_unregisters() {
 }
 
 #[test]
-fn test_cancel_after_snapshot_end_unregisters() {
+fn cancel_after_snapshot_end_unregisters() {
     let (sub, bus, signals) = request_subscription::<DrainItem>(vec![data(-1)]);
     assert!(matches!(sub.next(), Some(Ok(SubscriptionItem::Data(DrainItem(-1))))));
 
@@ -444,7 +488,7 @@ fn test_cancel_after_snapshot_end_unregisters() {
 }
 
 #[test]
-fn test_order_subscription_cancel_unregisters() {
+fn order_subscription_cancel_unregisters() {
     let (sub, bus, signals) = routed_subscription::<CollectItem>(SubscriptionBuilder::new().order_id(OrderId::from(7)), vec![]);
 
     sub.cancel();
@@ -456,8 +500,42 @@ fn test_order_subscription_cancel_unregisters() {
     assert!(matches!(sub.next(), Some(Err(Error::Cancelled))));
 }
 
+/// Has a cancel message that carries the id it was given, so a test can see
+/// which id the subscription named.
+#[derive(Debug)]
+struct IdCancelItem;
+
+impl StreamDecoder<IdCancelItem> for IdCancelItem {
+    const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::TickPrice];
+
+    fn decode(_context: &DecoderContext, _msg: &ResponseMessage) -> Result<IdCancelItem, Error> {
+        Ok(IdCancelItem)
+    }
+
+    fn cancel_message(_server_version: i32, id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
+        Ok(id.expect("cancel needs an id").to_string().into_bytes())
+    }
+}
+
+/// The cancel names the request id, else the order id, as the async side does.
 #[test]
-fn test_order_update_stream_cancel_unregisters() {
+fn cancel_names_request_id_else_order_id() {
+    for (builder, expected) in [
+        (SubscriptionBuilder::new().request_id(RequestId::nth(1)), RequestId::nth(1).raw()),
+        (SubscriptionBuilder::new().order_id(OrderId::from(7)), 7),
+    ] {
+        let (sub, bus, _signals) = routed_subscription::<IdCancelItem>(builder, vec![]);
+        sub.cancel();
+        assert_eq!(
+            bus.request_messages(),
+            vec![expected.to_string().into_bytes()],
+            "cancel for id {expected}"
+        );
+    }
+}
+
+#[test]
+fn order_update_stream_cancel_unregisters() {
     // No request id, order id or shared ticket: the order update stream.
     let (sub, bus, signals) = routed_subscription::<CollectItem>(SubscriptionBuilder::new(), vec![]);
 
@@ -470,7 +548,7 @@ fn test_order_update_stream_cancel_unregisters() {
 /// The drop signal needs only the lease, so a subscription built without a
 /// sender still sends it, with its lease already released.
 #[test]
-fn test_drop_signals_without_a_sender() {
+fn drop_signals_without_a_sender() {
     let (_sender, receiver) = channel::unbounded::<RoutedItem>();
     let (signaler, signals) = channel::unbounded();
     let internal = SubscriptionBuilder::new()
@@ -494,7 +572,7 @@ fn test_drop_signals_without_a_sender() {
 // --- collect_to_end ------------------------------------------------------
 
 #[test]
-fn test_collect_to_end_returns_items_and_skips_notices() {
+fn collect_to_end_returns_items_and_skips_notices() {
     use crate::messages::Notice;
 
     let notice = RoutedItem::Notice(Notice {
@@ -510,14 +588,14 @@ fn test_collect_to_end_returns_items_and_skips_notices() {
 }
 
 #[test]
-fn test_collect_to_end_returns_terminal_error() {
+fn collect_to_end_returns_terminal_error() {
     let (sub, _keep) = collect_subscription(vec![data(10), RoutedItem::Error(Error::ConnectionReset)], true);
 
     assert!(matches!(sub.collect_to_end(), Err(Error::ConnectionReset)));
 }
 
 #[test]
-fn test_collect_to_end_without_end_marker_is_unexpected_end() {
+fn collect_to_end_without_end_marker_is_unexpected_end() {
     // Channel closes after the last item, with no end marker.
     let (sub, _keep) = collect_subscription(vec![data(10)], false);
 
@@ -527,7 +605,7 @@ fn test_collect_to_end_without_end_marker_is_unexpected_end() {
 // --- collect_to_end_within -----------------------------------------------
 
 #[test]
-fn test_collect_to_end_within_returns_items_at_end_marker() {
+fn collect_to_end_within_returns_items_at_end_marker() {
     let (sub, _keep) = collect_subscription(vec![data(10), data(20), RoutedItem::Error(Error::EndOfStream)], true);
 
     assert_eq!(
@@ -537,7 +615,7 @@ fn test_collect_to_end_within_returns_items_at_end_marker() {
 }
 
 #[test]
-fn test_collect_to_end_within_times_out_without_end_marker() {
+fn collect_to_end_within_times_out_without_end_marker() {
     // Channel stays open with no end marker; rows read before the deadline are dropped.
     let (sub, _keep) = collect_subscription(vec![data(10)], true);
 
@@ -547,7 +625,7 @@ fn test_collect_to_end_within_times_out_without_end_marker() {
 }
 
 #[test]
-fn test_collect_to_end_within_deadline_holds_while_items_are_ready() {
+fn collect_to_end_within_deadline_holds_while_items_are_ready() {
     // The whole result is already queued, but the deadline has passed.
     let (sub, _keep) = collect_subscription(vec![data(10), data(20), RoutedItem::Error(Error::EndOfStream)], true);
 
@@ -555,14 +633,14 @@ fn test_collect_to_end_within_deadline_holds_while_items_are_ready() {
 }
 
 #[test]
-fn test_collect_to_end_within_returns_terminal_error() {
+fn collect_to_end_within_returns_terminal_error() {
     let (sub, _keep) = collect_subscription(vec![data(10), RoutedItem::Error(Error::ConnectionReset)], true);
 
     assert!(matches!(sub.collect_to_end_within(Duration::from_secs(30)), Err(Error::ConnectionReset)));
 }
 
 #[test]
-fn test_collect_to_end_within_closed_channel_is_unexpected_end() {
+fn collect_to_end_within_closed_channel_is_unexpected_end() {
     // A closed channel also makes `next_timeout` return `None`, but early:
     // not a timeout.
     let (sub, _keep) = collect_subscription(vec![data(10)], false);
@@ -575,8 +653,50 @@ fn test_collect_to_end_within_closed_channel_is_unexpected_end() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+// --- is_terminated ------------------------------------------------------------
+
+type Read = fn(&Subscription<CollectItem>) -> Option<Result<SubscriptionItem<CollectItem>, Error>>;
+
+const READS: [(&str, Read); 3] = [
+    ("next", |sub| sub.next()),
+    ("try_next", |sub| sub.try_next()),
+    ("next_timeout", |sub| sub.next_timeout(Duration::from_millis(100))),
+];
+
 #[test]
-fn test_next_batch_closes_after_quiet_period() {
+fn is_terminated_after_end_marker_or_error_not_snapshot_end() {
+    for (name, read) in READS {
+        let (sub, _keep) = collect_subscription(vec![data(10), RoutedItem::Error(Error::EndOfStream)], true);
+        assert!(!sub.is_terminated(), "{name}: new subscription");
+        assert!(matches!(read(&sub), Some(Ok(SubscriptionItem::Data(CollectItem(10))))));
+        assert!(!sub.is_terminated(), "{name}: after a data item");
+        assert!(read(&sub).is_none());
+        assert!(sub.is_terminated(), "{name}: after the end marker");
+
+        // -1 is `CollectItem`'s snapshot-end sentinel.
+        let (sub, _keep) = collect_subscription(vec![data(-1)], true);
+        assert!(matches!(read(&sub), Some(Ok(SubscriptionItem::Data(CollectItem(-1))))));
+        assert!(!sub.is_terminated(), "{name}: reads go on after a snapshot end");
+
+        let (sub, _keep) = collect_subscription(vec![RoutedItem::Error(Error::ConnectionReset)], true);
+        assert!(matches!(read(&sub), Some(Err(Error::ConnectionReset))));
+        assert!(sub.is_terminated(), "{name}: after a terminal error");
+    }
+}
+
+#[test]
+fn is_terminated_false_while_nothing_has_arrived() {
+    let (sub, _keep) = collect_subscription(vec![], true);
+
+    assert!(sub.try_next().is_none());
+    assert!(sub.next_timeout(Duration::from_millis(10)).is_none());
+    assert!(!sub.is_terminated());
+}
+
+// --- next_batch ------------------------------------------------------------
+
+#[test]
+fn next_batch_closes_after_quiet_period() {
     let (sub, _keep) = collect_subscription(vec![data(10), data(20)], true);
 
     assert_eq!(
@@ -586,7 +706,7 @@ fn test_next_batch_closes_after_quiet_period() {
 }
 
 #[test]
-fn test_next_batch_closes_at_batch_end_with_marker_last() {
+fn next_batch_closes_at_batch_end_with_marker_last() {
     // A 30s quiet period would take in 30 if the marker didn't close the batch.
     let (sub, _keep) = collect_subscription(vec![data(10), data(0), data(30)], true);
 
@@ -597,7 +717,7 @@ fn test_next_batch_closes_at_batch_end_with_marker_last() {
 }
 
 #[test]
-fn test_next_batch_waits_for_first_item() {
+fn next_batch_waits_for_first_item() {
     let (sub, keep) = collect_subscription(vec![], true);
     let sender = keep.unwrap();
     let start = std::time::Instant::now();
@@ -615,7 +735,7 @@ fn test_next_batch_waits_for_first_item() {
 }
 
 #[test]
-fn test_next_batch_at_stream_end() {
+fn next_batch_at_stream_end() {
     let (sub, _keep) = collect_subscription(vec![data(10)], false);
     assert_eq!(sub.next_batch(Duration::from_secs(30)).unwrap().unwrap(), vec![CollectItem(10)]);
     assert!(sub.next_batch(Duration::from_secs(30)).is_none());
@@ -625,14 +745,14 @@ fn test_next_batch_at_stream_end() {
 }
 
 #[test]
-fn test_next_batch_returns_terminal_error() {
+fn next_batch_returns_terminal_error() {
     let (sub, _keep) = collect_subscription(vec![data(10), RoutedItem::Error(Error::ConnectionReset)], true);
 
     assert!(matches!(sub.next_batch(Duration::from_secs(30)), Some(Err(Error::ConnectionReset))));
 }
 
 #[test]
-fn test_collect_to_end_within_stops_at_snapshot_end() {
+fn collect_to_end_within_stops_at_snapshot_end() {
     let (sub, _keep) = collect_subscription(vec![data(10), data(-1), data(20)], true);
 
     assert_eq!(sub.collect_to_end_within(Duration::from_secs(30)).unwrap(), vec![CollectItem(10)]);
@@ -669,7 +789,7 @@ fn deadline() -> Instant {
 }
 
 #[test]
-fn test_drain_after_end_writes_nothing() {
+fn drain_after_end_writes_nothing() {
     let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![data(1), RoutedItem::Error(Error::EndOfStream)]);
     while sub.next().is_some() {}
 
@@ -678,7 +798,7 @@ fn test_drain_after_end_writes_nothing() {
 }
 
 #[test]
-fn test_drain_cancels_then_sees_end() {
+fn drain_cancels_then_sees_end() {
     let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![data(1), data(2), RoutedItem::Error(Error::EndOfStream)]);
 
     assert_eq!(sub.cancel_and_drain(deadline()).unwrap(), Drained::Ended);
@@ -686,7 +806,7 @@ fn test_drain_cancels_then_sees_end() {
 }
 
 #[test]
-fn test_drain_reports_tws_error() {
+fn drain_reports_tws_error() {
     let (sub, _bus, _signals) = request_subscription::<DrainItem>(vec![
         data(1),
         RoutedItem::Error(Error::Notice(crate::messages::Notice::synthesized(
@@ -702,7 +822,7 @@ fn test_drain_reports_tws_error() {
 }
 
 #[test]
-fn test_drain_deadline_is_unconfirmed() {
+fn drain_deadline_is_unconfirmed() {
     let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![data(1)]);
 
     let started = Instant::now();
@@ -715,7 +835,7 @@ fn test_drain_deadline_is_unconfirmed() {
 }
 
 #[test]
-fn test_drain_after_collect_timeout() {
+fn drain_after_collect_timeout() {
     // `collect_to_end_within` borrows, so a timeout can chain into the drain.
     let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![data(1)]);
 
@@ -728,25 +848,75 @@ fn test_drain_after_collect_timeout() {
 }
 
 #[test]
-fn test_drain_after_error_is_unconfirmed_and_cancels_on_drop() {
+fn drain_after_error_is_unconfirmed_and_writes_cancel() {
     let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![RoutedItem::Error(Error::BufferLimitExceeded { limit: 1 })]);
     assert!(matches!(sub.next(), Some(Err(Error::BufferLimitExceeded { .. }))));
 
     let started = Instant::now();
     assert_eq!(sub.cancel_and_drain(deadline()).unwrap(), Drained::Unconfirmed);
     assert!(started.elapsed() < Duration::from_secs(1), "no wait for evidence that can't arrive");
-    assert_eq!(bus.request_messages().len(), 1, "the drop writes the cancel");
+    assert_eq!(bus.request_messages(), vec![drain_cancel_frame()], "one cancel, not repeated on drop");
 }
 
 #[test]
-fn test_drain_session_error_is_err() {
+fn drain_returns_cancel_write_error() {
+    let (sub, bus, _signals) = routed_subscription_on::<DrainItem>(
+        MessageBusStub::default().with_failing_sends(),
+        SubscriptionBuilder::new().request_id(RequestId::nth(1)),
+        vec![],
+    );
+
+    assert!(matches!(sub.cancel_and_drain(deadline()), Err(Error::ConnectionReset)));
+    assert_eq!(bus.request_messages().len(), 1, "no second write on drop");
+}
+
+/// A local error doesn't end the request at TWS: the cancel is still due, and
+/// its failure reaches the caller rather than the drop's log.
+#[test]
+fn drain_after_error_returns_cancel_write_error() {
+    let (sub, bus, _signals) = routed_subscription_on::<DrainItem>(
+        MessageBusStub::default().with_failing_sends(),
+        SubscriptionBuilder::new().request_id(RequestId::nth(1)),
+        vec![RoutedItem::Error(Error::BufferLimitExceeded { limit: 1 })],
+    );
+    assert!(matches!(sub.next(), Some(Err(Error::BufferLimitExceeded { .. }))));
+
+    assert!(matches!(sub.cancel_and_drain(deadline()), Err(Error::ConnectionReset)));
+    assert_eq!(bus.request_messages().len(), 1, "no second write on drop");
+}
+
+/// A rejection read before the drain is still TWS's answer; the decoder
+/// doesn't opt into `rejection_ends_request`, so the cancel is written.
+#[test]
+fn drain_after_read_rejection_is_rejected() {
+    let notice = crate::messages::Notice::synthesized(200, "No security definition".to_string());
+    let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![RoutedItem::Error(Error::Notice(notice.clone()))]);
+    assert!(matches!(sub.next(), Some(Err(Error::Notice(_)))));
+
+    assert_eq!(sub.cancel_and_drain(deadline()).unwrap(), Drained::Rejected(notice));
+    assert_eq!(bus.request_messages(), vec![drain_cancel_frame()], "one cancel, not repeated on drop");
+}
+
+/// Without a request id the error may be a request-less one fanned out to
+/// every shared stream, so it isn't recorded as this request's rejection.
+#[test]
+fn drain_after_error_without_request_id_is_unconfirmed() {
+    let notice = crate::messages::Notice::synthesized(200, "No security definition".to_string());
+    let (sub, _bus, _signals) = routed_subscription::<DrainItem>(SubscriptionBuilder::new(), vec![RoutedItem::Error(Error::Notice(notice))]);
+    assert!(matches!(sub.next(), Some(Err(Error::Notice(_)))));
+
+    assert_eq!(sub.cancel_and_drain(deadline()).unwrap(), Drained::Unconfirmed);
+}
+
+#[test]
+fn drain_session_error_is_err() {
     let (sub, _bus, _signals) = request_subscription::<DrainItem>(vec![RoutedItem::Error(Error::ConnectionReset)]);
 
     assert!(matches!(sub.cancel_and_drain(deadline()), Err(Error::ConnectionReset)));
 }
 
 #[test]
-fn test_drain_without_cancel_message_waits_for_natural_end() {
+fn drain_without_cancel_message_waits_for_natural_end() {
     // CollectItem has no cancel message (like contract details below server 215).
     let (sub, bus, _signals) = request_subscription::<CollectItem>(vec![data(1), RoutedItem::Error(Error::EndOfStream)]);
 
@@ -755,7 +925,7 @@ fn test_drain_without_cancel_message_waits_for_natural_end() {
 }
 
 #[test]
-fn test_drain_after_snapshot_end_writes_nothing() {
+fn drain_after_snapshot_end_writes_nothing() {
     let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![data(-1)]);
     assert!(matches!(sub.next(), Some(Ok(SubscriptionItem::Data(DrainItem(-1))))));
 
@@ -765,8 +935,19 @@ fn test_drain_after_snapshot_end_writes_nothing() {
     assert!(bus.request_messages().is_empty());
 }
 
+/// A snapshot end read during the drain settles it: nothing follows it.
 #[test]
-fn test_drain_without_request_id_cancels_and_returns_unconfirmed() {
+fn drain_sees_snapshot_end_after_cancel() {
+    let (sub, bus, _signals) = request_subscription::<DrainItem>(vec![data(1), data(-1)]);
+
+    let started = Instant::now();
+    assert_eq!(sub.cancel_and_drain(deadline()).unwrap(), Drained::Ended);
+    assert!(started.elapsed() < Duration::from_secs(1), "no wait past the snapshot end");
+    assert_eq!(bus.request_messages(), vec![drain_cancel_frame()], "one cancel, not repeated on drop");
+}
+
+#[test]
+fn drain_without_request_id_cancels_and_returns_unconfirmed() {
     let (sender, receiver) = channel::unbounded::<RoutedItem>();
     let (signaler, _signaler_rx) = channel::unbounded();
     let internal = SubscriptionBuilder::new()

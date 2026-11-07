@@ -9,9 +9,9 @@ use super::*;
 use crate::client::ids::RequestId;
 use crate::client::sync::Client;
 use crate::common::test_utils::helpers::{
-    binary_text, error_frame, handshake_frames, handshake_response_frame, managed_accounts_frame, next_valid_id_frame, TEST_ACCOUNT,
+    binary_text, error_frame, handshake_frames, handshake_response_frame, managed_accounts_frame, next_valid_id_frame, wait_for, TEST_ACCOUNT,
 };
-use crate::market_data::realtime::common::encoders::encode_request_market_data_type;
+use crate::market_data::realtime::common::encode_request_market_data_type;
 use crate::market_data::MarketDataType;
 use crate::messages::{encode_raw_length, IncomingMessages};
 use crate::server_versions;
@@ -177,7 +177,7 @@ fn make_client() -> (Client, MemoryStream) {
     connection.establish_connection().expect("establish_connection failed");
     let server_version = connection.server_version();
 
-    let bus = Arc::new(TcpMessageBus::new(connection).expect("TcpMessageBus::new"));
+    let bus = Arc::new(TcpMessageBus::new(connection));
     bus.process_messages().expect("process_messages");
 
     let client = Client::stubbed(bus, server_version);
@@ -480,15 +480,6 @@ impl Reconnect for TestSocket {
 
 impl Stream for TestSocket {}
 
-/// Poll `condition` until it holds, failing rather than hanging.
-fn wait_for(label: &str, condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting for {label}");
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
 /// A shutdown requested while `reconnect` is waiting out its backoff must end
 /// the wait and return `Error::Shutdown`, not run the whole Fibonacci
 /// schedule. With `max_reconnect_attempts = None` the pre-fix loop never
@@ -538,7 +529,7 @@ fn dispatcher_exits_when_shutdown_requested_during_reconnect() {
     push_handshake(&stream);
     connection.establish_connection().expect("establish_connection failed");
 
-    let bus = Arc::new(TcpMessageBus::new(connection).expect("TcpMessageBus::new"));
+    let bus = Arc::new(TcpMessageBus::new(connection));
     bus.process_messages().expect("process_messages");
 
     // Break the read: the dispatcher enters reconnect and waits out its
@@ -583,7 +574,7 @@ fn dispatcher_exits_when_shutdown_requested_during_a_successful_reconnect() {
     connection.establish_connection().expect("establish_connection failed");
     let shutdown = connection.shutdown_signal();
 
-    let bus = Arc::new(TcpMessageBus::new(connection).expect("TcpMessageBus::new"));
+    let bus = Arc::new(TcpMessageBus::new(connection));
     bus.process_messages().expect("process_messages");
 
     // Break the read: the dispatcher enters reconnect, waits out its backoff
@@ -627,7 +618,7 @@ fn in_flight_subscription_is_reset_before_the_reconnect_completes() {
     push_handshake(&stream);
     connection.establish_connection().expect("establish_connection failed");
 
-    let bus = Arc::new(TcpMessageBus::new(connection).expect("TcpMessageBus::new"));
+    let bus = Arc::new(TcpMessageBus::new(connection));
     bus.process_messages().expect("process_messages");
     let message_bus: &dyn MessageBus = bus.as_ref();
 
@@ -676,11 +667,11 @@ fn one_shot_request_is_retried_after_the_reconnect() {
     connection.establish_connection().expect("establish_connection failed");
     let server_version = connection.server_version();
 
-    let bus = Arc::new(TcpMessageBus::new(connection).expect("TcpMessageBus::new"));
+    let bus = Arc::new(TcpMessageBus::new(connection));
     bus.process_messages().expect("process_messages");
     let client = Arc::new(Client::stubbed(bus.clone(), server_version));
 
-    let request = crate::accounts::common::encoders::encode_request_managed_accounts().expect("encode");
+    let request = crate::accounts::common::encode_request_managed_accounts().expect("encode");
     let (sender, receiver) = std::sync::mpsc::channel();
     let caller = Arc::clone(&client);
     thread::spawn(move || {
@@ -711,4 +702,57 @@ fn one_shot_request_is_retried_after_the_reconnect() {
     assert_eq!(accounts, vec![TEST_ACCOUNT.to_string()]);
 
     MessageBus::ensure_shutdown(&*bus);
+}
+
+const CLIENT_ID_IN_USE: &str = "Unable to connect as the client id is already in use. Retry with a unique client id.";
+
+/// TWS's answer to a held client id: the ack, then one 326 frame (live,
+/// server 226), then it closes the socket.
+fn push_client_id_in_use(stream: &MemoryStream) {
+    stream.push_inbound(handshake_response_frame(SERVER_VERSION, "EST"));
+    stream.push_inbound(error_frame(-1, 326, CLIENT_ID_IN_USE));
+    stream.push_hang_up();
+}
+
+#[test]
+fn establish_connection_reports_client_id_in_use() {
+    let stream = MemoryStream::default();
+    let connection = Connection::stubbed(stream.clone(), CLIENT_ID);
+    push_client_id_in_use(&stream);
+
+    let err = connection.establish_connection().expect_err("must refuse a held client id");
+
+    assert!(matches!(err, Error::ClientIdInUse { client_id: CLIENT_ID }), "got {err:?}");
+}
+
+/// After a dropped connection TWS can hold the old session for a while; the
+/// reconnect keeps trying until it lets go. Pins that 326 stays retryable
+/// there; it passes without the handshake check too.
+#[test]
+fn reconnect_retries_client_id_in_use() {
+    let stream = MemoryStream::default();
+    let connection = Connection::stubbed(stream.clone(), CLIENT_ID);
+    push_handshake(&stream);
+    connection.establish_connection().expect("initial establish_connection failed");
+
+    push_client_id_in_use(&stream);
+    push_handshake(&stream);
+
+    connection.reconnect().expect("reconnect must retry a held client id");
+    assert_eq!(connection.connection_metadata().next_order_id, 90);
+}
+
+#[test]
+fn reconnect_gives_up_with_client_id_in_use() {
+    let stream = MemoryStream::default();
+    let connection = Connection::stubbed(stream.clone(), CLIENT_ID);
+    push_handshake(&stream);
+    connection.establish_connection().expect("initial establish_connection failed");
+
+    for _ in 0..MAX_RECONNECT_ATTEMPTS {
+        push_client_id_in_use(&stream);
+    }
+
+    let err = connection.reconnect().expect_err("every attempt met a held id");
+    assert!(matches!(err, Error::ClientIdInUse { client_id: CLIENT_ID }), "got {err:?}");
 }

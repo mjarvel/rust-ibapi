@@ -4,11 +4,11 @@ default-members = ["."]
 
 [package]
 name = "ibapi"
-version = "5.2.0"
+version = "6.0.0-dev"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Wil Boayue <wil@wsblabs.com>"]
-description = "An unofficial Rust client for the Interactive Brokers TWS API. Async (Tokio) and blocking clients for TWS and IB Gateway."
+description = "An unofficial Rust client for the Interactive Brokers TWS API: market data, orders, and account data, with async (Tokio) and blocking clients for TWS and IB Gateway."
 readme = "README.md"
 repository = "https://github.com/wboayue/rust-ibapi/"
 documentation = "https://docs.rs/ibapi/latest/ibapi/"
@@ -61,6 +61,10 @@ utoipa-6 = ["utoipa", "dep:utoipa6"]
 ## Internal: the switch the derives check. Enable a `utoipa-<major>` feature,
 ## which selects the utoipa crate, instead of this one.
 utoipa = []
+
+[lints.clippy]
+# Test names describe the behavior; `#[test]` already says it is a test.
+redundant_test_prefix = "warn"
 
 [dependencies]
 byteorder = "1.5.0"
@@ -221,6 +225,11 @@ path = "examples/async/realtime_bars.rs"
 required-features = ["async"]
 
 [[example]]
+name = "async_stream_retry"
+path = "examples/async/stream_retry.rs"
+required-features = ["async"]
+
+[[example]]
 name = "async_tick_by_tick"
 path = "examples/async/tick_by_tick.rs"
 required-features = ["async"]
@@ -233,6 +242,11 @@ required-features = ["async"]
 [[example]]
 name = "async_historical_data"
 path = "examples/async/historical_data.rs"
+required-features = ["async"]
+
+[[example]]
+name = "async_historical_data_subscribe"
+path = "examples/async/historical_data_subscribe.rs"
 required-features = ["async"]
 
 [[example]]
@@ -515,6 +529,11 @@ required-features = ["sync"]
 [[example]]
 name = "historical_data"
 path = "examples/sync/historical_data.rs"
+required-features = ["sync"]
+
+[[example]]
+name = "historical_data_subscribe"
+path = "examples/sync/historical_data_subscribe.rs"
 required-features = ["sync"]
 
 [[example]]

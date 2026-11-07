@@ -42,13 +42,13 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Default async client
-ibapi = "5.2"
+ibapi = "5.7"
 
 # Sync-only (disable defaults)
-ibapi = { version = "5.2", default-features = false, features = ["sync"] }
+ibapi = { version = "5.7", default-features = false, features = ["sync"] }
 
 # Async + blocking together
-ibapi = { version = "5.2", default-features = false, features = ["sync", "async"] }
+ibapi = { version = "5.7", default-features = false, features = ["sync", "async"] }
 ```
 
 ### For Development
@@ -169,7 +169,7 @@ let stock = Contract::stock("AAPL").build();
 let option = Contract::call("AAPL")
     .strike(150.0)
     .expires_on(2024, 12, 20)
-    .build();
+    .build()?;
 ```
 
 For detailed documentation on creating all contract types, see the [Contract Builder Guide](contract-builder.md).

@@ -4,11 +4,10 @@ use super::{RequestEncoder, ResponseProtoEncoder};
 use crate::common::test_utils::helpers::constants::{TEST_ACCOUNT, TEST_REQ_ID_FIRST};
 use crate::contracts::Contract;
 use crate::messages::OutgoingMessages;
+use crate::orders::common::{encode_execution_filter, encode_order, encode_order_cancel};
 use crate::orders::{ExecutionFilter, ExerciseAction, Order, OrderStatusKind};
 use crate::proto;
-use crate::proto::encoders::{
-    encode_contract, encode_contract_with_order, encode_execution_filter, encode_order, encode_order_cancel, some_bool, some_str,
-};
+use crate::proto::encoders::{encode_contract, encode_contract_with_order, some_bool, some_str};
 
 const TEST_PERM_ID: i64 = 1376327563;
 const TEST_EXEC_ID: &str = "00025b46.63f8f39c.01.01";
@@ -112,23 +111,23 @@ impl ResponseProtoEncoder for OrderStatusResponse {
     }
 }
 
-// --- CommissionReport (msg 59) ---
+// --- CommissionAndFeesReport (msg 59) ---
 
 #[derive(Clone, Debug)]
-pub struct CommissionReportResponse {
+pub struct CommissionAndFeesReportResponse {
     pub execution_id: String,
-    pub commission: f64,
+    pub commission_and_fees: f64,
     pub currency: String,
     pub realized_pnl: Option<f64>,
     pub yields: Option<f64>,
     pub yield_redemption_date: String,
 }
 
-impl Default for CommissionReportResponse {
+impl Default for CommissionAndFeesReportResponse {
     fn default() -> Self {
         Self {
             execution_id: TEST_EXEC_ID.to_string(),
-            commission: 1.0,
+            commission_and_fees: 1.0,
             currency: "USD".to_string(),
             realized_pnl: None,
             yields: None,
@@ -137,13 +136,13 @@ impl Default for CommissionReportResponse {
     }
 }
 
-impl CommissionReportResponse {
+impl CommissionAndFeesReportResponse {
     pub fn execution_id(mut self, v: impl Into<String>) -> Self {
         self.execution_id = v.into();
         self
     }
-    pub fn commission(mut self, v: f64) -> Self {
-        self.commission = v;
+    pub fn commission_and_fees(mut self, v: f64) -> Self {
+        self.commission_and_fees = v;
         self
     }
     pub fn currency(mut self, v: impl Into<String>) -> Self {
@@ -160,13 +159,13 @@ impl CommissionReportResponse {
     }
 }
 
-impl ResponseProtoEncoder for CommissionReportResponse {
+impl ResponseProtoEncoder for CommissionAndFeesReportResponse {
     type Proto = proto::CommissionAndFeesReport;
 
     fn to_proto(&self) -> Self::Proto {
         proto::CommissionAndFeesReport {
             exec_id: Some(self.execution_id.clone()),
-            commission_and_fees: Some(self.commission),
+            commission_and_fees: Some(self.commission_and_fees),
             currency: Some(self.currency.clone()),
             realized_pnl: self.realized_pnl,
             bond_yield: self.yields,
@@ -221,6 +220,36 @@ impl ResponseProtoEncoder for OrderBoundResponse {
     }
 }
 
+// --- NextValidId (msg 9) ---
+
+#[derive(Clone, Copy, Debug)]
+pub struct NextValidIdResponse {
+    pub order_id: i32,
+}
+
+impl Default for NextValidIdResponse {
+    fn default() -> Self {
+        Self { order_id: 90 }
+    }
+}
+
+impl NextValidIdResponse {
+    pub fn order_id(mut self, v: i32) -> Self {
+        self.order_id = v;
+        self
+    }
+}
+
+impl ResponseProtoEncoder for NextValidIdResponse {
+    type Proto = proto::NextValidId;
+
+    fn to_proto(&self) -> Self::Proto {
+        proto::NextValidId {
+            order_id: Some(self.order_id),
+        }
+    }
+}
+
 // --- ExecutionData (msg 11) ---
 
 #[derive(Clone, Debug)]
@@ -243,7 +272,7 @@ pub struct ExecutionDataResponse {
     pub price: f64,
     pub perm_id: i64,
     pub client_id: i32,
-    pub liquidation: i32,
+    pub is_liquidation: bool,
     pub cumulative_quantity: f64,
     pub average_price: f64,
     pub order_reference: String,
@@ -251,6 +280,7 @@ pub struct ExecutionDataResponse {
     pub ev_multiplier: Option<f64>,
     pub model_code: String,
     pub last_liquidity: i32,
+    pub option_exercise_type: Option<i32>,
 }
 
 impl Default for ExecutionDataResponse {
@@ -274,7 +304,7 @@ impl Default for ExecutionDataResponse {
             price: 196.52,
             perm_id: TEST_PERM_ID,
             client_id: 100,
-            liquidation: 0,
+            is_liquidation: false,
             cumulative_quantity: 100.0,
             average_price: 196.52,
             order_reference: String::new(),
@@ -282,6 +312,7 @@ impl Default for ExecutionDataResponse {
             ev_multiplier: None,
             model_code: String::new(),
             last_liquidity: 2,
+            option_exercise_type: None,
         }
     }
 }
@@ -335,8 +366,16 @@ impl ExecutionDataResponse {
         self.perm_id = v;
         self
     }
+    pub fn liquidation(mut self, v: bool) -> Self {
+        self.is_liquidation = v;
+        self
+    }
     pub fn last_liquidity(mut self, v: i32) -> Self {
         self.last_liquidity = v;
+        self
+    }
+    pub fn option_exercise_type(mut self, v: i32) -> Self {
+        self.option_exercise_type = Some(v);
         self
     }
 }
@@ -368,7 +407,7 @@ impl ResponseProtoEncoder for ExecutionDataResponse {
                 price: Some(self.price),
                 perm_id: Some(self.perm_id),
                 client_id: Some(self.client_id),
-                is_liquidation: Some(self.liquidation != 0),
+                is_liquidation: Some(self.is_liquidation),
                 cum_qty: Some(self.cumulative_quantity.to_string()),
                 avg_price: Some(self.average_price),
                 order_ref: some_str(&self.order_reference),
@@ -376,6 +415,7 @@ impl ResponseProtoEncoder for ExecutionDataResponse {
                 ev_multiplier: self.ev_multiplier,
                 model_code: some_str(&self.model_code),
                 last_liquidity: Some(self.last_liquidity),
+                opt_exercise_or_lapse_type: self.option_exercise_type,
                 ..Default::default()
             }),
         }
@@ -625,7 +665,7 @@ impl Default for CompletedOrderResponse {
             local_symbol: "AAPL".to_string(),
             trading_class: "NMS".to_string(),
             action: "BUY".to_string(),
-            total_quantity: 100.0,
+            total_quantity: 0.0,
             order_type: "MKT".to_string(),
             limit_price: Some(0.0),
             aux_price: Some(0.0),
@@ -1109,12 +1149,16 @@ pub fn order_status() -> OrderStatusResponse {
     OrderStatusResponse::default()
 }
 
-pub fn commission_report() -> CommissionReportResponse {
-    CommissionReportResponse::default()
+pub fn commission_and_fees_report() -> CommissionAndFeesReportResponse {
+    CommissionAndFeesReportResponse::default()
 }
 
 pub fn order_bound() -> OrderBoundResponse {
     OrderBoundResponse::default()
+}
+
+pub fn next_valid_id() -> NextValidIdResponse {
+    NextValidIdResponse::default()
 }
 
 pub fn execution_data() -> ExecutionDataResponse {

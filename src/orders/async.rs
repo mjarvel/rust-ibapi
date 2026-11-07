@@ -20,6 +20,7 @@ impl Client {
     /// that guides you through the order creation process.
     ///
     /// # Examples
+    ///
     /// ```no_run
     /// use ibapi::Client;
     /// use ibapi::contracts::Contract;
@@ -47,10 +48,10 @@ impl Client {
     /// `filter_data()` drops them (logging at `warn!` level), so match on
     /// notices explicitly when monitoring fire-and-forget orders for rejection.
     ///
-    /// To pair a [`CommissionReport`] with the
+    /// To pair a [`CommissionAndFeesReport`] with the
     /// [`ExecutionData`] it belongs to, join on
     /// `execution_id` — the commission follows its execution and shares that key. See
-    /// the [`CommissionReport`] docs for the idiom.
+    /// the [`CommissionAndFeesReport`] docs for the idiom.
     ///
     /// # Gaps and recovery
     ///
@@ -125,7 +126,21 @@ impl Client {
         ))
     }
 
-    /// Submits an Order (fire-and-forget).
+    /// Submits or modifies an [`crate::orders::Order`] without returning a subscription.
+    ///
+    /// This is a fire-and-forget method that submits an [`crate::orders::Order`] for the given [Contract]
+    /// but does not return a subscription for order updates. To receive order status updates,
+    /// fills, and commission reports, use the [`order_update_stream`](Client::order_update_stream) method
+    /// or use [`place_order`](Client::place_order) instead which returns a subscription.
+    ///
+    /// # Arguments
+    /// * `order_id` - ID for [`crate::orders::Order`]. Get next valid ID using [Client::next_order_id].
+    /// * `contract` - [Contract] to submit order for.
+    /// * `order` - [`crate::orders::Order`] to submit.
+    ///
+    /// # Returns
+    /// * `Ok(())` if the order was successfully sent
+    /// * `Err(Error)` if validation failed or sending failed
     ///
     /// # Errors
     /// [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
@@ -133,20 +148,35 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
+    /// use futures::StreamExt;
+    /// use ibapi::orders::OrderUpdate;
     /// use ibapi::prelude::*;
     ///
     /// #[tokio::main]
-    /// async fn main() {
-    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
-    ///     let contract = Contract::stock("AAPL").build();
-    ///     let order = client
-    ///         .order(&contract)
-    ///         .buy(100)
-    ///         .market()
-    ///         .build()
-    ///         .expect("order build");
-    ///     let order_id = client.next_valid_order_id().await.expect("next id");
-    ///     client.submit_order(order_id, &contract, &order).await.expect("submit failed");
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///
+    ///     let contract = Contract::stock("MSFT").build();
+    ///     let order = client.order(&contract).buy(100).market().build_order()?;
+    ///     let order_id = client.next_order_id();
+    ///
+    ///     // Submit order without waiting for confirmation
+    ///     client.submit_order(order_id, &contract, &order).await?;
+    ///
+    ///     // Monitor all order updates via the order update stream
+    ///     // This will receive updates for ALL orders, not just this one
+    ///     let mut events = client.order_update_stream().await?.filter_data();
+    ///     while let Some(event) = events.next().await {
+    ///         match event? {
+    ///             OrderUpdate::OrderStatus(status) => println!("Order Status: {status:?}"),
+    ///             OrderUpdate::ExecutionData(exec) => println!("Execution: {exec:?}"),
+    ///             OrderUpdate::CommissionAndFeesReport(report) => println!("Commission: {report:?}"),
+    ///             OrderUpdate::OrderBound(binding) => println!("Order binding: {binding:?}"),
+    ///             _ => {}
+    ///         }
+    ///     }
+    ///
+    ///     Ok(())
     /// }
     /// ```
     pub async fn submit_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<(), Error> {
@@ -159,7 +189,63 @@ impl Client {
         Ok(())
     }
 
-    /// Submits an Order with a subscription for updates.
+    /// Submit multiple OCA (One-Cancels-All) orders
+    ///
+    /// When one order in the group is filled, all others are automatically cancelled.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::Client;
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::orders::OcaType;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///     
+    ///     let contract1 = Contract::stock("AAPL").build();
+    ///     let contract2 = Contract::stock("MSFT").build();
+    ///
+    ///     let order1 = client.order(&contract1)
+    ///         .buy(100)
+    ///         .limit(50.0)
+    ///         .oca_group("MyOCA", OcaType::CancelWithBlock)
+    ///         .build_order().expect("order build failed");
+    ///         
+    ///     let order2 = client.order(&contract2)
+    ///         .buy(100)
+    ///         .limit(45.0)
+    ///         .oca_group("MyOCA", OcaType::CancelWithBlock)
+    ///         .build_order().expect("order build failed");
+    ///
+    ///     let order_ids = client.submit_oca_orders(
+    ///         vec![(contract1, order1), (contract2, order2)]
+    ///     ).await.expect("OCA submission failed");
+    /// }
+    /// ```
+    pub async fn submit_oca_orders(&self, orders: Vec<(crate::contracts::Contract, crate::orders::Order)>) -> Result<Vec<OrderId>, Error> {
+        let mut order_ids = Vec::new();
+
+        for (contract, mut order) in orders.into_iter() {
+            let order_id = self.next_order_id();
+            order.order_id = order_id;
+            order_ids.push(OrderId::new(order_id));
+            self.submit_order(order_id, &contract, &order).await?;
+        }
+
+        Ok(order_ids)
+    }
+
+    /// Places or modifies an [`crate::orders::Order`].
+    ///
+    /// Submits an [`crate::orders::Order`] using [Client] for the given [Contract].
+    /// Upon successful submission, the client will start receiving events related to the order's activity via the subscription, including order status updates and execution reports.
+    ///
+    /// # Arguments
+    /// * `order_id` - ID for [`crate::orders::Order`]. Get next valid ID using [Client::next_order_id].
+    /// * `contract` - [Contract] to submit order for.
+    /// * `order` - [`crate::orders::Order`] to submit.
     ///
     /// # Errors
     /// [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
@@ -167,24 +253,29 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
+    /// use futures::StreamExt;
+    /// use ibapi::orders::PlaceOrder;
     /// use ibapi::prelude::*;
     ///
     /// #[tokio::main]
-    /// async fn main() {
-    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
-    ///     let contract = Contract::stock("AAPL").build();
-    ///     let order = client
-    ///         .order(&contract)
-    ///         .buy(100)
-    ///         .market()
-    ///         .build()
-    ///         .expect("order build");
-    ///     let order_id = client.next_valid_order_id().await.expect("next id");
-    ///     let subscription = client.place_order(order_id, &contract, &order).await.expect("place");
-    ///     let mut updates = subscription.filter_data();
-    ///     while let Some(update) = updates.next().await {
-    ///         println!("{update:?}");
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///
+    ///     let contract = Contract::stock("MSFT").build();
+    ///     let order = client.order(&contract).buy(100).market().build_order()?;
+    ///     let order_id = client.next_order_id();
+    ///
+    ///     let mut events = client.place_order(order_id, &contract, &order).await?.filter_data();
+    ///     while let Some(event) = events.next().await {
+    ///         match event? {
+    ///             PlaceOrder::OrderStatus(order_status) => println!("order status: {order_status:?}"),
+    ///             PlaceOrder::OpenOrder(open_order) => println!("open order: {open_order:?}"),
+    ///             PlaceOrder::ExecutionData(execution) => println!("execution: {execution:?}"),
+    ///             PlaceOrder::CommissionAndFeesReport(report) => println!("commission report: {report:?}"),
+    ///         }
     ///     }
+    ///
+    ///     Ok(())
     /// }
     /// ```
     pub async fn place_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<Subscription<PlaceOrder>, Error> {
@@ -301,7 +392,7 @@ impl Client {
     ///
     /// # Errors
     /// - [`Error::OrderIdInRequestRange`] if TWS returns an id at or above 1,500,000,000 (reserved for request ids).
-    /// - [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// - [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -330,6 +421,9 @@ impl Client {
     }
 
     /// Requests completed [Order]s.
+    ///
+    /// A completed order's `total_quantity` is the quantity left unfilled, not the size
+    /// ordered: `0` for a filled order. The size ordered is `total_quantity + filled_quantity`.
     ///
     /// # Examples
     ///
@@ -413,7 +507,10 @@ impl Client {
         ))
     }
 
-    /// Requests status updates about future orders placed from TWS.
+    /// Requests status updates about future orders placed from TWS. Can only be used with client ID 0.
+    ///
+    /// # Arguments
+    /// * `auto_bind` - if set to true, the newly created orders will be assigned an API order ID and implicitly associated with this client. If set to false, future orders will not be.
     ///
     /// # Examples
     ///
@@ -422,7 +519,7 @@ impl Client {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///     let client = Client::connect("127.0.0.1:4002", 0).await.expect("connection failed");
     ///     let subscription = client.auto_open_orders(true).await.expect("auto_open_orders failed");
     ///     let mut orders = subscription.filter_data();
     ///     while let Some(order) = orders.next().await {
@@ -448,9 +545,9 @@ impl Client {
     /// to reach earlier days.
     ///
     /// Both [`ExecutionData`] and
-    /// [`CommissionReport`] are delivered on this
+    /// [`CommissionAndFeesReport`] are delivered on this
     /// stream. Join a commission to its execution by `execution_id`
-    /// (see the [`CommissionReport`] docs) — the commission follows its execution.
+    /// (see the [`CommissionAndFeesReport`] docs) — the commission follows its execution.
     ///
     /// # Examples
     ///
@@ -507,6 +604,10 @@ impl Client {
     /// a [`place_order`](Self::place_order) subscription: all may be open at
     /// once, as may several streams on one order. Nothing is sent to TWS.
     ///
+    /// # Errors
+    ///
+    /// [`Error::OrderIdInRequestRange`] if `order_id` is at or above 1,500,000,000 (reserved for request ids).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -532,7 +633,7 @@ impl Client {
     /// }
     /// ```
     pub async fn order_status_stream(&self, order_id: impl Into<OrderId>) -> Result<Subscription<OrderStatus>, Error> {
-        let internal_subscription = self.message_bus.create_order_status_subscription(order_id.into()).await?;
+        let internal_subscription = self.message_bus.create_order_status_subscription(order_id.into().checked()?).await?;
         Ok(Subscription::new_from_internal_simple(
             internal_subscription,
             self.message_bus.clone(),
@@ -565,8 +666,9 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::ConnectionReset`] if the connection is down or drops during
-    /// the wait, [`Error::Shutdown`] if the client shuts down.
+    /// [`Error::OrderIdInRequestRange`] if `order_id` is at or above 1,500,000,000
+    /// (reserved for request ids), [`Error::ConnectionReset`] if the connection is
+    /// down or drops during the wait, [`Error::Shutdown`] if the client shuts down.
     ///
     /// # Examples
     ///
@@ -602,7 +704,7 @@ impl Client {
         let first = statuses.next().now_or_never();
         if first.is_none() {
             if let Some(status) = self.find_finished(order_id, deadline).await? {
-                if let Some(outcome) = tracker.observe(status) {
+                if let Some(outcome) = tracker.observe_completed(status) {
                     return Ok(outcome);
                 }
             }

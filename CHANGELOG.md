@@ -19,6 +19,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Historical `fetch_once` (sync/async) requires `HistoricalDataEnd` and never
   retries connection resets. Both fetch entry points share upstream completion
   validation; the ordinary `fetch` reset-retry policy remains unchanged.
+  Since the 6.0-dev reconciliation both use the builder's request id; `fetch_once`
+  honours `one_shot_timeout` and cancels at TWS when it fails before the end
+  frame, as `fetch` does.
+
+### Added
+
+- `Liquidity` and `OptionExerciseType` implement `From<T> for i32`, like the other integer-coded enums; `Liquidity` is now `Copy` and `Eq`.
+- `HistoricalData::trim_to(start, end)` keeps the bars in `[start, end)` and reports that range as the window: the trim `fetch()` applies after `between()`, for bars read another way, such as from a subscription (#1188).
+- `historical_data(..).request_id()` and `historical_data(..).subscribe()` (sync and async): a historical bar request the caller owns. Its id is known before anything is sent, it is sent once and never resent, `ending`/`between` and `buffer_limit` apply, and its frames come as the now-public `HistoricalDataFrame`: `Bars`, then `End`. Unlike `fetch()`, a dropped wait loses no bars read so far, and `cancel_and_drain` reports when TWS is done (a cancel of a running request is confirmed with 162). Examples `historical_data_subscribe` and `async_historical_data_subscribe` (#1189).
+
+### Changed
+
+- `ComboLegOpenClose` and `MarketDataType` keep a code they do not model as `Unknown(i32)`, and gain `From<T> for i32`; `value as i32` no longer compiles. A combo leg TWS reported with open/close code `4` or higher was re-sent as `3`. `ToField for ComboLegOpenClose` is removed. See `docs/migration-6.0.md` §2 (#1071).
+- `orders::CommissionReport` is renamed `CommissionAndFeesReport`, after IBKR's rename to commissions and fees. Its `commission` field is now `commission_and_fees`; the `PlaceOrder`, `OrderUpdate` and `Executions` variants are now `CommissionAndFeesReport`; `IncomingMessages::CommissionsReport` is `CommissionsAndFeesReport`; and `OrderState`'s `commission`, `minimum_commission`, `maximum_commission` and `commission_currency` are `commission_and_fees`, `min_commission_and_fees`, `max_commission_and_fees` and `commission_and_fees_currency`. No alias is kept. See `docs/migration-6.0.md` §4 (#1120, #1159).
+- `Contract::spread(symbol)` takes the combo symbol, which TWS requires (error 321 without it); `SpreadBuilder::new` takes it too. `SpreadBuilder::symbol(..)` and `Default for SpreadBuilder` are removed, and `build()` rejects an empty symbol with `Error::InvalidArgument`. See `docs/migration-6.0.md` §5 (#1131).
+- `TickType::Unknown` carries the tick id as `Unknown(i32)`, so a tick IBKR adds later keeps its id; `TickType` gains `From<TickType> for i32` (`tick_type as i32` no longer compiles). `From<&str> for TickType` is replaced by `TickType::from_name`, which returns `Option`, and its inverse `name()`. `Display` of an unknown tick is `Unknown(<id>)`. See `docs/migration-6.0.md` §6 (#1071).
+- `ContractDetails::fund_asset_type` and `fund_distribution_policy_indicator` are now `Option<FundAssetType>` and `Option<FundDistributionPolicyIndicator>`, `None` when TWS sends no value. Both enums lose their `None` variant and `Default`, keep an unrecognized value as `Unknown(String)` instead of reading it as unset, and replace `From<&str>` with `FromStr`, `as_str()` and `Display`. See `docs/migration-6.0.md` §7 (#1071).
+- `NewsArticle::time` is now `Option<OffsetDateTime>`: `None` when TWS sends no time or one the client can't parse (logged as a warning), for `historical_news`, `contract_news` and `broad_tape_news`. Such an article was dated 1970-01-01, and a tick news timestamp out of range ended the subscription with `Error::Parse`. See `docs/migration-6.0.md` §8 (#1154).
+- `MarketDepth::operation`, `MarketDepth::side`, `MarketDepthL2::operation` and `MarketDepthL2::side` are enums instead of `i32`: `DepthOperation` (`Insert`, `Update`, `Delete`) and `DepthSide` (`Ask`, `Bid`), each with `Unknown(i32)` for a code this version does not model. Serialized, each is a variant name (`"Insert"`, `"Bid"`) or `{"Unknown": n}` rather than a number, and the `utoipa` schemas change to match. See `docs/migration-6.0.md` §9 (#1164).
+- `NewsBulletin::message_type` is a `news::BulletinType` (`Regular`, `ExchangeUnavailable`, `ExchangeAvailable`, `Unknown(i32)`) and serializes as the variant. Previously it was the wire code as an `i32`; `i32::from(bulletin.message_type)` gives the code back. See `docs/migration-6.0.md` §10 (#1166).
+- `Missing`, the typestate marker for an unset required builder field, moves from `ibapi::contracts` to the new `ibapi::builder` module; no alias is kept. See `docs/migration-6.0.md` §11 (#1119).
+- `PriceConditionBuilder`, `TimeConditionBuilder`, `MarginConditionBuilder`, `VolumeConditionBuilder` and `PercentChangeConditionBuilder` are typestate builders: `build()` and `From<..> for OrderCondition` exist only after `greater_than()` or `less_than()`, so a missing comparison is a compile error instead of a panic, and a second comparison no longer compiles. See `docs/migration-6.0.md` §12 (#1119).
+- `OptionBuilder::build()` (`Contract::call(..)` / `Contract::put(..)`) returns `Result<Contract, Error>`: `Error::InvalidArgument` for a strike that isn't positive and finite, where `strike()` panicked. After `strike()` the builder's strike type parameter is `f64` instead of `Strike`. See `docs/migration-6.0.md` §13 (#1119).
+- `Execution::liquidation: i32` is now `is_liquidation: bool`, matching TWS's bool; `Execution::pending_price_revision` is now `is_price_revision_pending` and `MarketDepthL2::smart_depth` is now `is_smart_depth`, so bool fields keep their protobuf `is_` prefix. `MarketDepthL2` serializes the new key. See `docs/migration-6.0.md` §14 (#1174).
+- `PnLSingle::daily_pnl`, `unrealized_pnl`, `realized_pnl` and `value`, and `PnL::daily_pnl`, are now `Option<f64>` instead of `f64`: `None` when TWS sends no value, as `PnL::unrealized_pnl` and `realized_pnl` already are; serialized, an unset figure is `null` rather than a number, and the `utoipa` schema becomes a nullable `number`. Previously a figure TWS left out decoded as `0.0`, indistinguishable from a real zero. See `docs/migration-6.0.md` §15 (#1170).
+- `Client::account_updates_multi` (async and blocking) takes a third argument, `ledger_only: accounts::LedgerOnly`: `LedgerOnly::Yes` delivers only the per-currency `$LEDGER-*` keys, `No` those plus the account-level keys (`NetLiquidation`, `BuyingPower`, ...). Previously the request always sent the light-weight flag, so the account-level keys could not be requested; pass `LedgerOnly::Yes` to keep the old behavior. See `docs/migration-6.0.md` §16 (#1183).
+- `OrderBuilder::submit`, `analyze` and `build_order`, the bracket and attached-order submits and `ExerciseOptionsBuilder::submit` fail with the new `Error::Validation(ValidationError)` when their inputs are invalid, so a caller can match `ValidationError::InvalidQuantity`, `MissingRequiredField` and the other variants. Previously they returned `Error::InvalidArgument` with the message text. See `docs/migration-6.0.md` §18 (#1169).
+- `Subscription::cancel_and_drain` returns a failed cancel write as `Err`, where it logged it and went on draining. It also writes the cancel when the stream had already ended with an error on our side, rather than leaving it to the drop, and in async the deadline bounds the write. Sync and async. See `docs/migration-6.0.md` §19 (#1187).
+- `Order::use_price_mgmt_algo` and `Order::route_marketable_to_bbo` are now `Option<bool>` instead of `bool`: `true` becomes `Some(true)`, a `false` that meant "leave the TWS default" becomes `None`, and `Some(false)` turns the feature off; serialized, unset is `null`. Previously `false` and unset were the same, so neither feature could be turned off, and an open order's explicit off read as unset. `route_marketable_to_bbo: Some(false)` needs server version 217 like `Some(true)`. See `docs/migration-6.0.md` §20 (#1191).
+- `Client::historical_news` (async and blocking) takes `total_results: u16` instead of `u8`, so the 300 headlines IB documents as the maximum for one request can be requested. Previously the parameter type capped a request at 255. A typed `u8` argument needs `.into()`; literals compile unchanged. See `docs/migration-6.0.md` §21 (#1190).
+- `HistoricalBarUpdate::Historical` carries `Vec<Bar>` instead of `HistoricalData`. Previously its `start` and `end` were `OffsetDateTime::UNIX_EPOCH` placeholders, since TWS sends the window separately, as `HistoricalBarUpdate::End`. Serialized, the variant's payload is an array of bars instead of an object, and the `utoipa` schema is updated to match. `historical_data(..).fetch()` and `HistoricalData` are unchanged. See `docs/migration-6.0.md` §22 (#1195).
+
+### Removed
+
+- `ibapi::protocol` is crate-private. Its 53 constants deprecated in 5.1 (at or below the server version 213 connection floor, so a check always passed) are deleted, along with `is_supported` and `include_if_supported`, which nothing called. The three remaining gates (`CANCEL_CONTRACT_DATA`, `CONFIG`, `UPDATE_CONFIG`) are checked by the requests themselves, which return `Error::ServerVersion` from a server too old for them. See `docs/migration-6.0.md` §1 (#990, #1157).
+- `From<i32> for ArticleType` is removed: it read any unknown code as `Text`. See `docs/migration-6.0.md` §3 (#1071).
+- `Order::fa_profile`, `basis_points` and `basis_points_type` are removed. IB's protobuf `Order` message has no field for them, so nothing has sent or read them since 3.0. See `docs/migration-6.0.md` §17 (#1184).
+
+### Fixed
+
+- `Subscription::cancel_and_drain` returns `Drained::Ended` as soon as a snapshot's end (such as a market-data `snapshot()`'s `SnapshotEnd`) arrives during the drain. It discarded the end and waited out the whole deadline, then returned `Unconfirmed` (sync and async) (#1186).
+
+## [5.7.0] - 2026-11-05
+
+### Added
+
+- Combo implied bid/ask: `TickType::ComboImpliedBid` (112) and `TickType::ComboImpliedAsk` (113), requested on combo (BAG) contracts with generic tick `generic_tick::COMBO_IMPLIED_BID_ASK` (`"760"`). The client now advertises server version 227 (`server_versions::COMBO_IMPLIED_BID_ASK`).
+- `Execution::option_exercise_type` (`OptionExerciseType`) exposes TWS `optExerciseOrLapseType`; `None` when TWS sends `-1` or omits it. A struct literal of `Execution` without `..Default::default()` must add the field (#1175).
+
+### Fixed
+
+- A one-shot request (such as `managed_accounts()`) or a historical `fetch()` made while the connection is down returns `Error::Timeout` at its deadline (`one_shot_timeout`, or 30 seconds for shared one-shots) instead of waiting out the whole reconnect. A blocking call could hold its thread for minutes. Sync and async (#1168).
+- A request whose connection check passed just as the connection dropped could be written to the new connection before its handshake had finished. It now either completes on the old connection or is refused with `Error::ConnectionReset`, and requests made during the handshake are refused too (sync and async) (#1171).
+- A reconnect no longer waits behind a write stuck on a peer that stopped reading. The dispatcher severs the lost connection first, so the stuck write fails with `Error::ConnectionReset` and the reconnect goes ahead (sync and async) (#1179).
+
+## [5.6.0] - 2026-11-03
+
+### Added
+
+- Blocking `Subscription::is_terminated()`, `TickSubscription::is_terminated()` and `NoticeStream::is_terminated()`: whether the stream has terminated, so a caller polling with `try_next` or `next_timeout` can distinguish between their `None` at the end of the stream and the `None` they return while nothing has arrived yet (#1141).
+- `HistoricalScheduleBuilder::trading_hours` (sync and async): request extended-hours sessions with `TradingHours::Extended`. The schedule request always asked for regular trading hours, so a product's full session (for example, a futures contract's 17:00–16:00 session) was unreachable (#1147).
+
+### Fixed
+
+- `examples/async/historical_schedules.rs` no longer fails on GC futures: it asked for the expired `2025-02` contract and now uses the front month. It and `examples/sync/historical_schedules.rs` (`--extended`) also show extended-hours sessions (#1149).
+
+## [5.5.0] - 2026-10-30
+
+### Added
+
+- `Client::resubscribing(open)` (sync and async) streams a subscription across transport reconnects: on a lost connection it waits for the reconnect, calls `open` again, and yields a `TRANSPORT_RECONNECT_CODE` notice before the new subscription's first item. It accepts only `subscriptions::Resubscribable` item types (market data, account, position, PnL, scanner, news bulletins), so an order request can't be re-sent. `examples/sync/stream_retry.rs` uses it, with a new async twin (#1122).
+- `contracts::SpreadBuilder::collar(CollarLegs)` (also in the prelude): buy stock, buy put, sell call. `shares_per_contract` sets the stock leg's ratio and has no default, because a wrong deliverable places silently as a mis-hedged position (#1129).
+- `contracts::SpreadBuilder::symbol(..)`. TWS rejects a combo without a symbol (321), and the builder had no way to set one, so a built combo had to be patched by hand before placing (#1128).
+- `contracts::SpreadBuilder` presets `straddle(call, put)`, `strangle(call, put)`, `butterfly(ButterflyLegs)` and `iron_condor(IronCondorLegs)`. Butterfly and iron condor take their legs as named fields, so swapping two ids no longer compiles silently into a different strategy, the reason the positional `iron_condor` was removed in 5.0 (#1123).
+- `market_data::realtime::Quote` (also in the prelude): folds market data ticks into the latest bid/ask/last/open/high/low/close, sizes, volume, market data type and bid/ask/last/model greeks. `Quote::from_ticks(&snapshot_once(timeout)?)` for a snapshot, `quote.apply(&tick)` for a stream; delayed ticks fill the same fields (#1121).
+- `OptionComputation` derives `Clone` and `PartialEq`; `TickType` derives `Clone` and `Copy` (#1121).
+
+### Fixed
+
+- Code 165 "HMDS server connection was successful", which TWS binds to a historical request when the HMDS farm connects on demand, no longer ends the request as an error. It's now a `NoticeCategory::Warning` (`Notice::is_warning()` is true; logged at info): a stream yields it as a notice and keeps going, and a one-shot fetch skips it and returns the bars that follow. Other 165 texts are unchanged (#1136).
+
+## [5.4.0] - 2026-10-27
+
+### Added
+
+- `ClientBuilder::one_shot_timeout` (sync and async) bounds every one-shot request, one that returns a value rather than a subscription, with `Error::Timeout`. Without it, requests answered on their own request id (`historical_data(..).fetch()`, `head_timestamp`, the option calculations, ...) still wait without a limit, and the rest keep their 30-second bound. On timeout, a request TWS can cancel is cancelled (#1095).
+- `Client::handshake_managed_accounts()` (sync and async) returns the accounts TWS sent at connect, with no round trip. It isn't updated on reconnect; `managed_accounts()` still fetches the current list (#1092).
+- `OrderBuilder::volatility_order` sets the `VOL` order type with its volatility figure and `VolatilityType`, previously reachable only through `.order_type(..)` (#1082).
+- `OrderBuilder::relative_limit_combo` and `relative_market_combo` set the `REL + LMT` and `REL + MKT` combo order types, previously reachable only through `.order_type(..)` (#1076).
+
+### Changed
+
+- A one-shot request's timeout, the 30-second default included, now bounds the whole call. The clock no longer restarts when the request is resent after a connection reset (#1095).
+- `ExecutionFilterSide`, `OptionRight` and `LegAction` are no longer `#[non_exhaustive]`, so a `match` on them can be exhaustive without a wildcard arm; an existing `_ =>` arm now warns as unreachable and can be removed. Each covers a closed set of TWS values. The async `TickSubscription` no longer requires `T: Send` (#1081).
+- Internal: clippy now lints the hand-written protobuf converters; its allow covers only the generated code (#1084).
+
+### Fixed
+
+- `wait_for_fill` (sync and async) no longer reports a negative `remaining` for an order it finds among completed orders, e.g. one placed before a reconnect. TWS reports a completed order's `total_quantity` as the quantity left unfilled (`0` once filled), and it was read as the size ordered: a filled order came back with `remaining: -1.0`. The `completed_orders` docs now say what `total_quantity` holds (#1116).
+- The `Order::what_if_type` and `OrderBuilder::what_if_type` docs said an order with `what_if_type` but not `what_if` is placed live. TWS rejects it with error 321 and nothing is placed; set it with `.analyze()`. `seek_price_improvement` and `ignore_open_auction` docs now say what open-order reports carry back (#1115).
+- The `calculate_option_price` docs and examples now give its volatility as a fraction (`0.2` = 20%), as TWS reads it. They said a percentage (`20.0` for 20%) and passed `100.0`, so following them priced the option at 100 times the intended volatility (#1114).
+- `head_timestamp`, `histogram_data`, `historical_schedules(..).fetch()`, `calculate_option_price`, `calculate_implied_volatility`, `wsh_metadata` and `wsh_event_data_by_contract(..).fetch()` now cancel the request at TWS when dropped before the answer (a dropped future, a timeout, a local error), instead of leaving it running against pacing limits. A response of an unexpected message type is now skipped rather than reported as `Error::UnexpectedResponse` (#1107).
+- `historical_data(..).fetch()` (sync and async) cancels the request at TWS when dropped before the last bar arrives (a dropped future, a decode error, an out-of-order frame), instead of leaving it running against pacing limits. A response of an unexpected message type is now skipped; `Error::UnexpectedResponse` is reserved for frames arriving out of order (#1094).
+- A subscription ended by a TWS rejection that TWS itself has already closed no longer writes a cancel when dropped, so TWS stops answering with a "not found" error (366, 300, 310, 365, 10185/10186). Applies to the one-shot `historical_data(..).fetch()` for any rejection, and to market data, realtime bars, tick-by-tick, market depth, streaming historical bars, PnL and scanner subscriptions for the live-verified codes (200, 321, 162). Other rejections still cancel, so a request TWS keeps open isn't leaked (#1097, #1098).
+- A subscription that was open when the client reconnected no longer writes a cancel when it's cancelled or dropped afterwards. The request ended with the old session, so the cancel named an id the new session had never seen, and TWS answered it with an error (#1105).
+- `Client::server_version()`, and the version checks and decoding that use it, follow the version negotiated when the client reconnects. Previously they kept the first connection's, so after the gateway restarted on a different build the client could refuse a request the new server supports, or send one it doesn't (#1105).
+- Connecting with a client id another connection holds returns the new `Error::ClientIdInUse { client_id }` (TWS error 326) instead of an I/O end-of-file error that looked like a network failure. `connect` doesn't retry it. The automatic reconnect does, because after a dropped connection TWS can hold the old session's id until it notices the socket is dead (#1091).
+- Async `collect_to_end_within`, `next_batch`, `contract_details` and account-summary snapshots return `Error::Notice` with `SUBSCRIPTION_LAG_CODE` when the consumer fell behind and frames were dropped, instead of returning `Ok` with rows missing. `collect_for` and `collect_until` stop at the gap and return the rows read before it. Streams still deliver the lag as a non-terminal notice (#1090).
+- An order status with no `filled` or `remaining` quantity (or an "unset" sentinel) returns `Error::Parse` instead of decoding as `0`. A missing `remaining` could make `wait_for_fill` report a partial fill as `Filled`. TWS sends an explicit `"0"` in every observed state, so normal statuses are unaffected (#1089).
+- `positions`, `positions_multi`, `account_updates` and `pnl_single` return `Error::Parse` for a frame with no position quantity, or an "unset" sentinel in it, instead of reporting a flat `0`. TWS sends an explicit `"0"` for a closed position, so normal closes are unaffected (#1088).
+- `Contract::last_trade_date` is now populated from decoded contracts (contract details, open orders, positions, executions, ...) for options and futures. It was always `None` (#1087).
+- `order_status_stream` and `wait_for_fill` (sync and async) return `Error::OrderIdInRequestRange` for an order id at or above 1,500,000,000, as the other order methods do. Previously the stream never matched a status, so `wait_for_fill` waited out its timeout and returned `TimedOut` (#1069).
+- `OrderBuilder::order_type(OrderType::MarketOnOpen)`, `LimitOnOpen` and `AtAuction` set the time in force those types imply (`OnOpen`, `OnOpen`, `Auction`), as `market_on_open()`, `limit_on_open()` and `at_auction()` do. This replaces a time in force set earlier in the chain; a time-in-force setter called later still wins. Previously they sent a plain `MKT`, `LMT` or `MTL` day order (#1073).
+- `Strike::new` rejects NaN and infinite prices, and so `OptionBuilder::strike` panics on them as it does on zero or negative ones. Previously a NaN or infinite strike went into the contract unchecked. `OptionBuilder::strike` and the price, time, margin, volume and percent-change condition builders' `build()` now document their panics (#1072).
+- `news_article` (sync and async) returns `Error::Parse` when TWS reports an article type other than text (`0`) or binary (`1`). Previously an unknown type read as `ArticleType::Text`, so binary content could be handled as text (#1070).
+
+## [5.3.0] - 2026-10-25
+
+### Added
+
+- `Client::wait_connected` (blocking and async): waits until the client is connected again after a connection loss, failing with `Error::ConnectionFailed` once the reconnect gives up or `Error::Shutdown` after a shutdown. A stream loop calls it before resubscribing (#1052).
+- `Client::display_groups()` (async and blocking) returns the ids of the display groups visible in TWS, most used first; pass one to `subscribe_to_group_events` (#1058).
+- `Order::post_only`, `Order::allow_pre_open`, `Order::ignore_open_auction`, `Order::seek_price_improvement` and `Order::what_if_type` (new `orders::WhatIfType`, set with `OrderBuilder::what_if_type`) are sent with the order and read back from open-order reports. Previously they were dropped on send and left unset on decode. The first three need server version 216 and the last two 217; below that `place_order` / `submit_order` (sync and async) return `Error::ServerVersion` (#1065).
+
+### Changed
+
+- Once the automatic reconnect gives up, every later request fails with `Error::ConnectionFailed`, and after a shutdown with `Error::Shutdown`. Both used to fail with `Error::ConnectionReset`, the error for "still reconnecting", so a caller could not tell the states apart. `order_update_stream`, `order_status_stream` and `wait_for_fill` also fail with `ConnectionFailed` after the reconnect gives up, where they returned `Shutdown`. A dispatcher that stops on a read error reconnecting cannot fix now reports `ConnectionFailed` too, instead of `Shutdown`. One-shot requests that retry across a reconnect also end with `ConnectionFailed`, where they returned `Shutdown`. Streams open when the connection dropped still end with `ConnectionReset` (#1052).
+
+### Fixed
+
+- The stream-retry loop in README.md and `examples/sync/stream_retry.rs` no longer panics on a connection loss. It resubscribed while the client was still reconnecting, and `.expect` panicked on the `ConnectionReset` the request was refused with; it now calls `wait_connected` first (#1052).
+- A `HistoricalDataUpdate` frame with no bar fails to decode with `Error::Parse`. Previously it reached the subscriber as `HistoricalBarUpdate::Update` holding a bar dated 1970-01-01 with zero prices and volume. The `historical_data(..).stream()` subscription yields the error and ends (#1057).
+- An update bar from `historical_data(..).stream()` (`HistoricalBarUpdate::Update`) that carries no trade count has `count` `-1`, as bars in the initial batch already did, instead of `0` (#1057).
+- A historical bar whose `date` is missing or does not parse fails to decode with `Error::Parse`, which carries the value when it is malformed. Previously it decoded as a bar dated 1970-01-01. `historical_data(..).fetch()` returns the error; the `historical_data(..).stream()` subscription yields it and ends (#1057).
+- Async `Client::disconnect` called right after `connect` waits for the message-processing task to finish, as its docs promise. Previously it could return before the task had recorded its handle, leaving the task to be dropped later and a panic in it unlogged (#1059).
+
 ## [5.2.0] - 2026-10-20
 
 ### Added
@@ -423,7 +559,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions up to and including [3.0.1] predate this changelog; see the
 [GitHub Releases page](https://github.com/wboayue/rust-ibapi/releases) for their notes.
 
-[Unreleased]: https://github.com/wboayue/rust-ibapi/compare/v5.2.0...HEAD
+[Unreleased]: https://github.com/wboayue/rust-ibapi/compare/v5.6.0...HEAD
+[5.7.0]: https://github.com/wboayue/rust-ibapi/compare/v5.6.0...v5.7.0
+[5.6.0]: https://github.com/wboayue/rust-ibapi/compare/v5.5.0...v5.6.0
+[5.5.0]: https://github.com/wboayue/rust-ibapi/compare/v5.4.0...v5.5.0
+[5.4.0]: https://github.com/wboayue/rust-ibapi/compare/v5.3.0...v5.4.0
+[5.3.0]: https://github.com/wboayue/rust-ibapi/compare/v5.2.0...v5.3.0
 [5.2.0]: https://github.com/wboayue/rust-ibapi/compare/v5.1.0...v5.2.0
 [5.1.0]: https://github.com/wboayue/rust-ibapi/compare/v5.0.0...v5.1.0
 [5.0.0]: https://github.com/wboayue/rust-ibapi/compare/v4.2.0...v5.0.0

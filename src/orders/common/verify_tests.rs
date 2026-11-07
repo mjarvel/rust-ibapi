@@ -1,5 +1,6 @@
 use super::*;
 use crate::client::ids::REQUEST_ID_FLOOR;
+use crate::orders::common::test_tables::ORDER_PARAM_GATES;
 
 fn assert_rejected(result: Result<OrderId, Error>, what: &str) {
     assert!(matches!(result, Err(Error::OrderIdInRequestRange { .. })), "{what}: {result:?}");
@@ -52,62 +53,15 @@ fn verify_order_ids_rejects_request_range() {
 /// message in the error.
 #[test]
 fn verify_order_gates_fields_above_the_floor() {
-    let cases = [
-        (
-            "hedge_max_size",
-            Order {
-                hedge_max_size: Some(1),
-                ..Order::default()
-            },
-            HEDGE_MAX_SIZE,
-        ),
-        (
-            "deactivate",
-            Order {
-                deactivate: true,
-                ..Order::default()
-            },
-            DEACTIVATE,
-        ),
-        (
-            "route_marketable_to_bbo",
-            Order {
-                route_marketable_to_bbo: true,
-                ..Order::default()
-            },
-            ROUTE_MARKETABLE_TO_BBO,
-        ),
-        (
-            "preset_stop_loss_order_id",
-            Order {
-                preset_stop_loss_order_id: Some(8),
-                ..Order::default()
-            },
-            ATTACHED_ORDERS,
-        ),
-        (
-            "preset_profit_taker_order_id",
-            Order {
-                preset_profit_taker_order_id: Some(9),
-                ..Order::default()
-            },
-            ATTACHED_ORDERS,
-        ),
-        (
-            "conditions_include_overnight",
-            Order {
-                conditions_include_overnight: true,
-                ..Order::default()
-            },
-            CONDITIONS_INCLUDE_OVERNIGHT,
-        ),
-    ];
-    for (name, order, feature) in cases {
-        assert!(verify_order(feature.min_version, &order).is_ok(), "{name} at its minimum version");
-        match verify_order(feature.min_version - 1, &order) {
+    for gate in ORDER_PARAM_GATES {
+        let name = gate.name;
+        let mut order = Order::default();
+        (gate.set)(&mut order);
+        assert!(verify_order(gate.version, &order).is_ok(), "{name} at its minimum version");
+        match verify_order(gate.version - 1, &order) {
             Err(Error::ServerVersion(required, actual, message)) => assert_eq!(
                 (required, actual, message.as_str()),
-                (feature.min_version, feature.min_version - 1, feature.name),
+                (gate.version, gate.version - 1, gate.feature),
                 "{name}"
             ),
             other => panic!("{name} below its minimum version: {other:?}"),

@@ -99,16 +99,16 @@ let direct_route = Contract::stock("BMW")
 
 ### Options
 
-Options require strike price and expiration date. The builder enforces these at compile time.
+Options require strike price and expiration date. The builder enforces these at compile time; `build()` returns `Error::InvalidArgument` for a strike that isn't positive and finite.
 
 ```rust
 use ibapi::contracts::{Contract, ExpirationDate};
 
 // Call option
 let call = Contract::call("AAPL")
-    .strike(150.0)  // Validates positive strike price
+    .strike(150.0)  // build() checks it is positive and finite
     .expires_on(2024, 12, 20)
-    .build();
+    .build()?;
 
 // Put option with custom exchange
 let put = Contract::put("SPY")
@@ -116,19 +116,19 @@ let put = Contract::put("SPY")
     .expires(ExpirationDate::new(2024, 3, 15))
     .on_exchange("CBOE")
     .multiplier(100)
-    .build();
+    .build()?;
 
 // Weekly options (expires next Friday)
 let weekly_call = Contract::call("QQQ")
     .strike(400.0)
     .expires_weekly()
-    .build();
+    .build()?;
 
 // Monthly options (third Friday of the month)
 let monthly_put = Contract::put("IWM")
     .strike(200.0)
     .expires_monthly()
-    .build();
+    .build()?;
 
 // Note: These won't compile (type safety!)
 // let invalid = Contract::call("AAPL").build();  // Missing strike and expiry
@@ -272,35 +272,61 @@ The bond builder automatically:
 
 Complex multi-leg strategies with type-safe leg construction.
 
+`Contract::spread` takes the combo's symbol, usually the underlying: TWS rejects a combo without one (error 321), so `build()` rejects an empty symbol.
+
 ```rust
-use ibapi::contracts::{Contract, LegAction};
+use ibapi::contracts::{ButterflyLegs, CollarLegs, Contract, IronCondorLegs, LegAction};
 
 // Vertical spread
-let vertical = Contract::spread()
+let vertical = Contract::spread("AAPL")
     .vertical(11111, 22222)  // Long and short contract IDs
     .build()?;
 
 // Long calendar: sell the near expiry, buy the far one (same strike and right)
-let calendar = Contract::spread()
+let calendar = Contract::spread("AAPL")
     .long_calendar(20001, 20002)  // Near and far contract IDs
     .build()?;
 
-// Iron condor: a put vertical plus a call vertical
-let iron_condor = Contract::spread()
-    .vertical(10001, 10002)  // Long put, short put
-    .vertical(10004, 10003)  // Long call, short call
+// Straddle (same strike) and strangle (different strikes): buy a call and a put
+let straddle = Contract::spread("AAPL")
+    .straddle(40001, 40002)  // Call and put contract IDs
     .build()?;
 
-// Custom butterfly spread
-let butterfly = Contract::spread()
-    .add_leg(30001, LegAction::Buy)   // Buy 1 lower strike
-        .ratio(1)
+// Butterfly: buy 1 lower, sell 2 middle, buy 1 upper
+let butterfly = Contract::spread("AAPL")
+    .butterfly(ButterflyLegs {
+        lower: 30001.into(),
+        middle: 30002.into(),
+        upper: 30003.into(),
+    })
+    .build()?;
+
+// Iron condor: a put vertical plus a call vertical, legs named
+let iron_condor = Contract::spread("AAPL")
+    .iron_condor(IronCondorLegs {
+        long_put: 10001.into(),
+        short_put: 10002.into(),
+        short_call: 10003.into(),
+        long_call: 10004.into(),
+    })
+    .build()?;
+
+// Collar: buy the stock, buy a put floor, sell a call cap
+let collar = Contract::spread("AAPL")
+    .collar(CollarLegs {
+        stock: 265598.into(),
+        put: 10005.into(),
+        call: 10006.into(),
+        shares_per_contract: 100,  // the option's deliverable; not always 100
+    })
+    .build()?;
+
+// Custom ratio spread: buy 1, sell 2
+let ratio_spread = Contract::spread("AAPL")
+    .add_leg(50001, LegAction::Buy)
         .done()
-    .add_leg(30002, LegAction::Sell)  // Sell 2 middle strike
+    .add_leg(50002, LegAction::Sell)
         .ratio(2)
-        .done()
-    .add_leg(30003, LegAction::Buy)   // Buy 1 higher strike
-        .ratio(1)
         .done()
     .build()?;
 ```
@@ -379,13 +405,14 @@ let right = OptionRight::Put;   // Converts to "P"
 The builders use Rust's type system to track required fields:
 
 ```rust
-use ibapi::contracts::{Contract, Missing, Symbol, Strike, ExpirationDate};
+use ibapi::builder::Missing;
+use ibapi::contracts::{Contract, ExpirationDate, OptionBuilder, Symbol};
 
-// The option builder tracks which fields are set using phantom types
+// The option builder tracks which fields are set in its type parameters
 let builder1: OptionBuilder<Symbol, Missing, Missing> = Contract::call("AAPL");
-let builder2: OptionBuilder<Symbol, Strike, Missing> = builder1.strike(150.0);
-let builder3: OptionBuilder<Symbol, Strike, ExpirationDate> = builder2.expires_on(2024, 12, 20);
-let contract = builder3.build();  // Build only available when all required fields are set
+let builder2: OptionBuilder<Symbol, f64, Missing> = builder1.strike(150.0);
+let builder3: OptionBuilder<Symbol, f64, ExpirationDate> = builder2.expires_on(2024, 12, 20);
+let contract = builder3.build()?;  // Build only available when all required fields are set
 ```
 
 ## Error Handling
@@ -400,10 +427,14 @@ let result = Strike::new(-10.0);
 assert!(result.is_err());  // Negative strikes are invalid
 
 // Spread validation
-let empty_spread = Contract::spread().build();
+let empty_spread = Contract::spread("AAPL").build();
 assert!(empty_spread.is_err());  // Spreads need at least one leg
 
-// Option validation happens at compile time
+// Option strike validation happens in build()
+let bad_strike = Contract::call("AAPL").strike(-10.0).expires_on(2024, 12, 20).build();
+assert!(bad_strike.is_err());  // Strikes must be positive and finite
+
+// Missing option fields are caught at compile time
 // This won't compile:
 // let invalid = Contract::call("AAPL").build();  // Missing required fields
 ```

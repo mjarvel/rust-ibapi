@@ -1,8 +1,8 @@
 use super::*;
-use crate::common::test_utils::wire_enum::{check_wire_enum_rejects_unknown, check_wire_enum_round_trip};
+use crate::common::test_utils::wire_enum::{check_wire_code_round_trip, check_wire_enum_rejects_unknown, check_wire_enum_round_trip};
 
 #[test]
-fn test_v2_builders() {
+fn v2_builders() {
     // Test stock builder
     let stock = Contract::stock("AAPL").build();
     assert_eq!(stock.symbol, Symbol::from("AAPL"), "stock.symbol");
@@ -17,7 +17,7 @@ fn test_v2_builders() {
     assert_eq!(toyota.currency, Currency::from("JPY"));
 
     // Test call option builder
-    let call = Contract::call("AAPL").strike(150.0).expires_on(2023, 12, 15).build();
+    let call = Contract::call("AAPL").strike(150.0).expires_on(2023, 12, 15).build().unwrap();
     assert_eq!(call.symbol, Symbol::from("AAPL"));
     assert_eq!(call.security_type, SecurityType::Option);
     assert_eq!(call.strike, 150.0);
@@ -25,7 +25,7 @@ fn test_v2_builders() {
     assert_eq!(call.last_trade_date_or_contract_month, "20231215");
 
     // Test put option builder
-    let put = Contract::put("SPY").strike(450.0).expires_on(2024, 1, 19).build();
+    let put = Contract::put("SPY").strike(450.0).expires_on(2024, 1, 19).build().unwrap();
     assert_eq!(put.symbol, Symbol::from("SPY"));
     assert_eq!(put.right, Some(OptionRight::Put));
     assert_eq!(put.strike, 450.0);
@@ -134,7 +134,7 @@ fn all_security_types_covers_every_variant() {
 }
 
 #[test]
-fn test_security_type_display_all_variants() {
+fn security_type_display_all_variants() {
     let cases = [
         (SecurityType::Stock, "STK"),
         (SecurityType::Option, "OPT"),
@@ -160,7 +160,7 @@ fn test_security_type_display_all_variants() {
 }
 
 #[test]
-fn test_option_security_type_to_field() {
+fn option_security_type_to_field() {
     let some: Option<SecurityType> = Some(SecurityType::Option);
     assert_eq!(some.to_field(), "OPT");
     let none: Option<SecurityType> = None;
@@ -205,52 +205,47 @@ fn assert_isin_currency_mapping(make_bond: impl Fn(&str) -> Contract) {
 }
 
 #[test]
-fn test_bond_cusip_constructor() {
+fn bond_cusip_constructor() {
     assert_cusip_bond(Contract::bond_cusip("912810RN0"), "912810RN0");
 }
 
 #[test]
-fn test_bond_constructor_cusip_variant() {
+fn bond_constructor_cusip_variant() {
     assert_cusip_bond(Contract::bond(BondIdentifier::Cusip(Cusip::new("912810RN0"))), "912810RN0");
 }
 
 #[test]
-fn test_bond_isin_constructor_currency_mapping() {
+fn bond_isin_constructor_currency_mapping() {
     assert_isin_currency_mapping(|isin| Contract::bond_isin(isin));
 }
 
 #[test]
-fn test_bond_constructor_isin_currency_mapping() {
+fn bond_constructor_isin_currency_mapping() {
     assert_isin_currency_mapping(|isin| Contract::bond(BondIdentifier::Isin(Isin::new(isin))));
 }
 
 #[test]
-fn test_combo_leg_open_close() {
-    // Test From<i32> implementation
-    assert_eq!(ComboLegOpenClose::from(0), ComboLegOpenClose::Same, "0 should be Same");
-    assert_eq!(ComboLegOpenClose::from(1), ComboLegOpenClose::Open, "1 should be Open");
-    assert_eq!(ComboLegOpenClose::from(2), ComboLegOpenClose::Close, "2 should be Close");
-    assert_eq!(ComboLegOpenClose::from(3), ComboLegOpenClose::Unknown, "3 should be Unknown");
-
-    // Test ToField implementation
-    assert_eq!(ComboLegOpenClose::Same.to_field(), "0", "Same should be 0");
-    assert_eq!(ComboLegOpenClose::Open.to_field(), "1", "Open should be 1");
-    assert_eq!(ComboLegOpenClose::Close.to_field(), "2", "Close should be 2");
-    assert_eq!(ComboLegOpenClose::Unknown.to_field(), "3", "Unknown should be 3");
-
-    // Test Default implementation
-    assert_eq!(ComboLegOpenClose::default(), ComboLegOpenClose::Same, "Default should be Same");
+fn combo_leg_open_close_round_trips_every_wire_code() {
+    check_wire_code_round_trip(
+        &[
+            (ComboLegOpenClose::Same, 0),
+            (ComboLegOpenClose::Open, 1),
+            (ComboLegOpenClose::Close, 2),
+            // IB's UNKNOWN_POS: carried as a code, not a variant.
+            (ComboLegOpenClose::Unknown(3), 3),
+            (ComboLegOpenClose::Unknown(7), 7),
+        ],
+        ComboLegOpenClose::Unknown,
+    );
 }
 
 #[test]
-fn test_combo_leg_open_close_unknown_value() {
-    // Values outside the documented 0..=3 range decode to Unknown rather than panicking
-    assert_eq!(ComboLegOpenClose::from(4), ComboLegOpenClose::Unknown);
-    assert_eq!(ComboLegOpenClose::from(-1), ComboLegOpenClose::Unknown);
+fn combo_leg_open_close_default_is_same() {
+    assert_eq!(ComboLegOpenClose::default(), ComboLegOpenClose::Same);
 }
 
 #[test]
-fn test_tag_value_to_field() {
+fn tag_value_to_field() {
     // Test with multiple TagValue items
     let tag_values = vec![
         TagValue {
@@ -299,7 +294,7 @@ fn test_tag_value_to_field() {
 }
 
 #[test]
-fn test_is_bag() {
+fn is_bag() {
     // Test with a regular stock contract (not a bag/spread)
     let stock_contract = Contract::stock("AAPL").build();
     assert!(!stock_contract.is_bag(), "Stock contract should not be a bag");
@@ -364,4 +359,79 @@ fn schema_derives_work() {
     assert_schema::<ContractDetails>();
     assert_schema::<SecurityType>();
     assert_schema::<TagValue>();
+}
+
+// === Fund enums: open, unknown values keep their code (#1071) ===
+
+const ALL_FUND_DISTRIBUTION_POLICIES: [(FundDistributionPolicyIndicator, &str); 2] = [
+    (FundDistributionPolicyIndicator::AccumulationFund, "N"),
+    (FundDistributionPolicyIndicator::IncomeFund, "Y"),
+];
+
+#[test]
+fn fund_distribution_policy_indicator_round_trip() {
+    check_wire_enum_round_trip(&ALL_FUND_DISTRIBUTION_POLICIES);
+    check_wire_enum_round_trip(&[
+        (FundDistributionPolicyIndicator::Unknown("X".into()), "X"),
+        (FundDistributionPolicyIndicator::Unknown("n".into()), "n"),
+    ]);
+    check_wire_enum_rejects_unknown::<FundDistributionPolicyIndicator>(&[""]);
+}
+
+#[test]
+fn all_fund_distribution_policies_covers_every_variant() {
+    // No wildcard: a new variant fails to compile here until it joins the table.
+    fn modeled_index(v: &FundDistributionPolicyIndicator) -> Option<usize> {
+        match v {
+            FundDistributionPolicyIndicator::AccumulationFund => Some(0),
+            FundDistributionPolicyIndicator::IncomeFund => Some(1),
+            FundDistributionPolicyIndicator::Unknown(_) => None,
+        }
+    }
+    let mut seen = [false; 2];
+    for (variant, _) in &ALL_FUND_DISTRIBUTION_POLICIES {
+        seen[modeled_index(variant).expect("table holds only modeled variants")] = true;
+    }
+    assert!(seen.iter().all(|&s| s), "ALL_FUND_DISTRIBUTION_POLICIES is missing a variant");
+}
+
+const ALL_FUND_ASSET_TYPES: [(FundAssetType, &str); 8] = [
+    (FundAssetType::Others, "000"),
+    (FundAssetType::MoneyMarket, "001"),
+    (FundAssetType::FixedIncome, "002"),
+    (FundAssetType::MultiAsset, "003"),
+    (FundAssetType::Equity, "004"),
+    (FundAssetType::Sector, "005"),
+    (FundAssetType::Guaranteed, "006"),
+    (FundAssetType::Alternative, "007"),
+];
+
+#[test]
+fn fund_asset_type_round_trip() {
+    check_wire_enum_round_trip(&ALL_FUND_ASSET_TYPES);
+    check_wire_enum_round_trip(&[(FundAssetType::Unknown("008".into()), "008"), (FundAssetType::Unknown("1".into()), "1")]);
+    check_wire_enum_rejects_unknown::<FundAssetType>(&[""]);
+}
+
+#[test]
+fn all_fund_asset_types_covers_every_variant() {
+    // No wildcard: a new variant fails to compile here until it joins the table.
+    fn modeled_index(v: &FundAssetType) -> Option<usize> {
+        match v {
+            FundAssetType::Others => Some(0),
+            FundAssetType::MoneyMarket => Some(1),
+            FundAssetType::FixedIncome => Some(2),
+            FundAssetType::MultiAsset => Some(3),
+            FundAssetType::Equity => Some(4),
+            FundAssetType::Sector => Some(5),
+            FundAssetType::Guaranteed => Some(6),
+            FundAssetType::Alternative => Some(7),
+            FundAssetType::Unknown(_) => None,
+        }
+    }
+    let mut seen = [false; 8];
+    for (variant, _) in &ALL_FUND_ASSET_TYPES {
+        seen[modeled_index(variant).expect("table holds only modeled variants")] = true;
+    }
+    assert!(seen.iter().all(|&s| s), "ALL_FUND_ASSET_TYPES is missing a variant");
 }

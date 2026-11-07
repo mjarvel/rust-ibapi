@@ -19,7 +19,7 @@ impl Client {
     /// TWS's current time. TWS is synchronized with the server (not local computer) using NTP and this function will receive the current time in TWS.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -42,7 +42,7 @@ impl Client {
     /// Requests the current server time with millisecond precision.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -104,8 +104,11 @@ impl Client {
     ///
     /// let account = AccountId("U1234567".to_string());
     /// let subscription = client.positions_multi(Some(&account), None).expect("error requesting positions by model");
-    /// for position in subscription.iter() {
-    ///     println!("{position:?}")
+    /// for position in subscription.iter_data() {
+    ///     match position {
+    ///         Ok(position) => println!("{position:?}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
     /// }
     /// ```
     pub fn positions_multi(&self, account: Option<&AccountId>, model_code: Option<&ModelCode>) -> Result<Subscription<PositionUpdateMulti>, Error> {
@@ -131,8 +134,11 @@ impl Client {
     ///
     /// let account = AccountId("account id".to_string());
     /// let subscription = client.pnl(&account, None).expect("error requesting pnl");
-    /// for pnl in subscription.iter() {
-    ///     println!("{pnl:?}")
+    /// for pnl in subscription.iter_data() {
+    ///     match pnl {
+    ///         Ok(pnl) => println!("{pnl:?}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
     /// }
     /// ```
     pub fn pnl(&self, account: &AccountId, model_code: Option<&ModelCode>) -> Result<Subscription<PnL>, Error> {
@@ -161,8 +167,11 @@ impl Client {
     /// let contract_id = ContractId(1001);
     ///
     /// let subscription = client.pnl_single(&account, contract_id, None).expect("error requesting pnl");
-    /// for pnl in &subscription {
-    ///     println!("{pnl:?}")
+    /// for pnl in subscription.iter_data() {
+    ///     match pnl {
+    ///         Ok(pnl) => println!("{pnl:?}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
     /// }
     /// ```
     pub fn pnl_single(&self, account: &AccountId, contract_id: ContractId, model_code: Option<&ModelCode>) -> Result<Subscription<PnLSingle>, Error> {
@@ -197,8 +206,11 @@ impl Client {
     /// let group = AccountGroup("All".to_string());
     ///
     /// let subscription = client.account_summary(&group, &[AccountSummaryTags::ACCOUNT_TYPE]).expect("error requesting account summary");
-    /// for summary in &subscription {
-    ///     println!("{summary:?}")
+    /// for summary in subscription.iter_data() {
+    ///     match summary {
+    ///         Ok(summary) => println!("{summary:?}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
     /// }
     /// ```
     pub fn account_summary(&self, group: &AccountGroup, tags: &[&str]) -> Result<Subscription<AccountSummaryResult>, Error> {
@@ -308,18 +320,20 @@ impl Client {
 
     /// Requests account updates for account and/or model.
     ///
-    /// All account values and positions will be returned initially, and then there will only be updates when there is a change in a position, or to an account value every 3 minutes if it has changed.
     /// Each subscription is routed by its own request id, so several accounts or models can stream at once.
     ///
     /// # Arguments
     /// * `account`        - Account values can be requested for a particular account.
     /// * `model_code`     - Account values can also be requested for a model.
+    /// * `ledger_only`    - Which keys arrive: [`LedgerOnly::Yes`] for only the per-currency
+    ///   `$LEDGER-*` keys, [`LedgerOnly::No`] for those plus the account-level keys
+    ///   (`NetLiquidation`, `BuyingPower`, ...).
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use ibapi::client::blocking::Client;
-    /// use ibapi::accounts::AccountUpdateMulti;
+    /// use ibapi::accounts::{AccountUpdateMulti, LedgerOnly};
     ///
     /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
     ///
@@ -327,7 +341,7 @@ impl Client {
     ///
     /// let account = AccountId("U1234567".to_string());
     ///
-    /// let subscription = client.account_updates_multi(Some(&account), None).expect("error requesting account updates multi");
+    /// let subscription = client.account_updates_multi(Some(&account), None, LedgerOnly::No).expect("error requesting account updates multi");
     /// for update in subscription.iter_data() {
     ///     let update = update?;
     ///     println!("{update:?}");
@@ -343,17 +357,21 @@ impl Client {
         &self,
         account: Option<&AccountId>,
         model_code: Option<&ModelCode>,
+        ledger_only: LedgerOnly,
     ) -> Result<Subscription<AccountUpdateMulti>, Error> {
         let builder = self.request();
-        let request = encoders::encode_request_account_updates_multi(builder.request_id(), account, model_code)?;
+        let request = encoders::encode_request_account_updates_multi(builder.request_id(), account, model_code, ledger_only)?;
 
         builder.send(request)
     }
 
-    /// Requests the accounts to which the logged user has access to.
+    /// Fetch the list of accounts accessible to the current user.
+    ///
+    /// For the list TWS sent at connect, with no round trip, see
+    /// [`handshake_managed_accounts`](Self::handshake_managed_accounts).
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -378,7 +396,7 @@ impl Client {
     /// Get current [FamilyCode]s for all accessible accounts.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -443,7 +461,7 @@ impl Client {
     /// * `fa_data_type` - which FA dataset to fetch.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -513,7 +531,7 @@ impl Client {
     /// Most users will not call this directly; it is part of the IB Linking flow.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///
@@ -537,7 +555,7 @@ impl Client {
     /// Continue a TWS extension verification handshake by sending the API response data.
     ///
     /// # Errors
-    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds.
+    /// [`Error::Timeout`] if TWS sends no answer within 30 seconds, or within [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout) when set.
     ///
     /// # Examples
     ///

@@ -106,7 +106,7 @@ pub enum IncomingMessages {
     /// Market data type acknowledgment.
     MarketDataType = 58,
     /// Commissions report payload.
-    CommissionsReport = 59,
+    CommissionsAndFeesReport = 59,
     /// Position update.
     Position = 61,
     /// End marker for position updates.
@@ -249,7 +249,7 @@ impl From<i32> for IncomingMessages {
             56 => IncomingMessages::DeltaNeutralValidation,
             57 => IncomingMessages::TickSnapshotEnd,
             58 => IncomingMessages::MarketDataType,
-            59 => IncomingMessages::CommissionsReport,
+            59 => IncomingMessages::CommissionsAndFeesReport,
             61 => IncomingMessages::Position,
             62 => IncomingMessages::PositionEnd,
             63 => IncomingMessages::AccountSummary,
@@ -961,9 +961,8 @@ struct ExecutionMinimal {
 /// Crate-internal wire envelope; not part of the public API. All fields,
 /// constructors, and methods are crate-visible only. Framing is discriminated
 /// by `raw_bytes`: `Some(_)` = protobuf payload, `None` = NUL-delimited text
-/// payload pre-parsed into `fields` (carries WSH metadata/event-data, plus
-/// unhandled text-framed message types that fall through to the dispatcher
-/// catch-all).
+/// payload pre-parsed into `fields` (the handshake, plus unhandled
+/// text-framed message types that fall through to the dispatcher catch-all).
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ResponseMessage {
     /// Cursor index for incremental decoding.
@@ -1148,7 +1147,7 @@ impl ResponseMessage {
     /// Try to extract the execution id from the message.
     ///
     /// `ExecutionData` nests `exec_id` under `execution.exec_id`;
-    /// `CommissionsReport` carries it at the top level. Both arrive
+    /// `CommissionsAndFeesReport` carries it at the top level. Both arrive
     /// proto-framed.
     pub fn execution_id(&self) -> Option<String> {
         let raw = self.raw_bytes()?;
@@ -1157,7 +1156,7 @@ impl ResponseMessage {
                 let p: ExecutionDetailsMinimal = prost::Message::decode(raw).ok()?;
                 p.execution.and_then(|e| e.exec_id)
             }
-            IncomingMessages::CommissionsReport => {
+            IncomingMessages::CommissionsAndFeesReport => {
                 let p: crate::proto::CommissionAndFeesReport = prost::Message::decode(raw).ok()?;
                 p.exec_id
             }
@@ -1166,8 +1165,7 @@ impl ResponseMessage {
     }
 
     /// Peek an integer field without advancing the cursor. Called from
-    /// [`Self::request_id`]'s text-fallback path (tests only at floor 213)
-    /// and the handshake parser (pre-proto framing).
+    /// [`Self::request_id`]'s text-fallback path (tests only at floor 213).
     ///
     /// Refuses proto-framed messages defensively (per docs/rules/wire/proto-aware-accessors.md):
     /// if `raw_bytes()` is `Some`, the caller picked the wrong accessor —

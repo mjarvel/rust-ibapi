@@ -13,9 +13,9 @@ use crate::common::timezone::{find_timezone, resolve_local};
 use crate::errors::Error;
 use crate::messages::{
     encode_length, encode_protobuf_message, split_message_id, unknown_message_type_notice, IncomingMessages, Notice, OutgoingMessages,
-    ResponseMessage, HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, PROTOBUF_MSG_ID,
+    ResponseMessage, CLIENT_ID_IN_USE_CODE, HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, PROTOBUF_MSG_ID,
 };
-use crate::orders::{CommissionReport, ExecutionData, OrderData, OrderStatus};
+use crate::orders::{CommissionAndFeesReport, ExecutionData, OrderData, OrderStatus};
 use crate::server_versions;
 use crate::transport::common::NoticeSink;
 
@@ -54,7 +54,7 @@ pub enum StartupMessage {
     Execution(ExecutionData),
     /// Commission and fees report — TWS replays the per-fill commission to
     /// the Master Client ID alongside [`Execution`](Self::Execution).
-    CommissionReport(CommissionReport),
+    CommissionAndFeesReport(CommissionAndFeesReport),
     /// Completed (terminal-state) order — TWS replays the closed-order history
     /// at handshake time when a prior session requested
     /// `reqCompletedOrders`. The contained [`OrderData::order_id`] is the
@@ -81,7 +81,7 @@ impl StartupMessage {
                 AccountUpdate::End => IncomingMessages::AccountDownloadEnd,
             },
             StartupMessage::Execution(_) => IncomingMessages::ExecutionData,
-            StartupMessage::CommissionReport(_) => IncomingMessages::CommissionsReport,
+            StartupMessage::CommissionAndFeesReport(_) => IncomingMessages::CommissionsAndFeesReport,
             StartupMessage::CompletedOrder(_) => IncomingMessages::CompletedOrder,
             StartupMessage::ExecutionDataEnd => IncomingMessages::ExecutionDataEnd,
             StartupMessage::CompletedOrdersEnd => IncomingMessages::CompletedOrdersEnd,
@@ -89,11 +89,13 @@ impl StartupMessage {
     }
 }
 
-/// Handshake-time context bundling the optional typed-message callback and the
-/// mandatory notice sink. Internal use only; the public surface is
+/// Handshake-time context bundling the client id `start_api` sent, the
+/// optional typed-message callback and the mandatory notice sink. Internal use only; the public surface is
 /// `ClientBuilder` (`crate::client::ClientBuilder` for async,
 /// `crate::client::blocking::ClientBuilder` for sync).
 pub(crate) struct StartupHandshakeContext<'a> {
+    /// The id `start_api` sent, named by [`Error::ClientIdInUse`].
+    pub client_id: i32,
     pub startup: Option<&'a (dyn Fn(StartupMessage) + Send + Sync)>,
     pub notice_sink: &'a (dyn NoticeSink + Sync),
 }
@@ -141,7 +143,7 @@ pub trait ConnectionProtocol {
     /// [`AccountInfo`]. Anything else is delegated to
     /// [`dispatch_unsolicited_message`] so the callbacks decide how to surface
     /// (or drop) it.
-    fn parse_account_info(&self, message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) -> Result<AccountInfo, Self::Error>;
+    fn parse_account_info(&self, message: &ResponseMessage, ctx: &StartupHandshakeContext<'_>) -> Result<AccountInfo, Self::Error>;
 }
 
 /// Account information received during connection establishment
@@ -191,7 +193,7 @@ impl Default for ConnectionHandler {
     fn default() -> Self {
         Self {
             min_version: server_versions::PROTOBUF_REST_MESSAGES_3,
-            max_version: server_versions::CONDITIONS_INCLUDE_OVERNIGHT,
+            max_version: server_versions::COMBO_IMPLIED_BID_ASK,
         }
     }
 }
@@ -231,7 +233,7 @@ impl ConnectionProtocol for ConnectionHandler {
         encode_protobuf_message(OutgoingMessages::StartApi as i32, &request.encode_to_vec())
     }
 
-    fn parse_account_info(&self, message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) -> Result<AccountInfo, Self::Error> {
+    fn parse_account_info(&self, message: &ResponseMessage, ctx: &StartupHandshakeContext<'_>) -> Result<AccountInfo, Self::Error> {
         let mut info = AccountInfo::default();
 
         match message.message_type() {
@@ -242,6 +244,13 @@ impl ConnectionProtocol for ConnectionHandler {
             IncomingMessages::ManagedAccounts => {
                 let proto: crate::proto::ManagedAccounts = message.proto()?;
                 info.managed_accounts = proto.accounts_list;
+            }
+            // TWS answers a held client id with this one frame, then closes the
+            // socket; reading on would end in an EOF that looks like a network
+            // failure. Still logged and delivered like any handshake notice.
+            IncomingMessages::Error if Notice::from(message).code == CLIENT_ID_IN_USE_CODE => {
+                dispatch_unsolicited_message(message, ctx);
+                return Err(Error::ClientIdInUse { client_id: ctx.client_id });
             }
             _ => dispatch_unsolicited_message(message, ctx),
         }
@@ -261,9 +270,11 @@ impl ConnectionProtocol for ConnectionHandler {
 /// ([`HANDSHAKE_DECODE_FAILURE_CODE`], [`HANDSHAKE_UNKNOWN_FRAME_CODE`] and
 /// [`UNKNOWN_MESSAGE_TYPE_CODE`](crate::UNKNOWN_MESSAGE_TYPE_CODE)) so observers via
 /// [`Client::notice_stream`](crate::Client::notice_stream) can detect them.
-pub(crate) fn dispatch_unsolicited_message(message: &mut ResponseMessage, ctx: &StartupHandshakeContext<'_>) {
+pub(crate) fn dispatch_unsolicited_message(message: &ResponseMessage, ctx: &StartupHandshakeContext<'_>) {
     use crate::accounts::common::decode_account_update_message;
-    use crate::orders::common::{decode_commission_report, decode_completed_order, decode_execution_data, decode_open_order, decode_order_status};
+    use crate::orders::common::{
+        decode_commission_and_fees_report, decode_completed_order, decode_execution_data, decode_open_order, decode_order_status,
+    };
 
     /// Run a typed decoder; fire the callback with the typed payload on
     /// success, or emit a synthesized decode-failure notice on error. The
@@ -296,7 +307,7 @@ pub(crate) fn dispatch_unsolicited_message(message: &mut ResponseMessage, ctx: &
     let kind = message.message_type();
     match kind {
         IncomingMessages::Error => {
-            let notice = Notice::from(&*message);
+            let notice = Notice::from(message);
             notice.log();
             ctx.notice_sink.deliver(notice);
         }
@@ -308,7 +319,12 @@ pub(crate) fn dispatch_unsolicited_message(message: &mut ResponseMessage, ctx: &
         | IncomingMessages::AccountUpdateTime
         | IncomingMessages::AccountDownloadEnd => dispatch_typed(ctx, kind, || decode_account_update_message(message), StartupMessage::AccountUpdate),
         IncomingMessages::ExecutionData => dispatch_typed(ctx, kind, || decode_execution_data(message), StartupMessage::Execution),
-        IncomingMessages::CommissionsReport => dispatch_typed(ctx, kind, || decode_commission_report(message), StartupMessage::CommissionReport),
+        IncomingMessages::CommissionsAndFeesReport => dispatch_typed(
+            ctx,
+            kind,
+            || decode_commission_and_fees_report(message),
+            StartupMessage::CommissionAndFeesReport,
+        ),
         IncomingMessages::CompletedOrder => dispatch_typed(ctx, kind, || decode_completed_order(message), StartupMessage::CompletedOrder),
         IncomingMessages::ExecutionDataEnd => dispatch_unit(ctx, StartupMessage::ExecutionDataEnd),
         IncomingMessages::CompletedOrdersEnd => dispatch_unit(ctx, StartupMessage::CompletedOrdersEnd),

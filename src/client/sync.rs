@@ -6,11 +6,13 @@
 
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::debug;
 use time::OffsetDateTime;
 use time_tz::Tz;
 
+use crate::accounts::common::split_account_list;
 use crate::client::builders::client_builder::sync_impl::ClientBuilder;
 use crate::client::builders::client_builder::ClientConfig;
 use crate::connection::{sync::Connection, ConnectionMetadata};
@@ -19,6 +21,7 @@ use crate::messages::OutgoingMessages;
 use crate::transport::sync::NoticeBroadcaster;
 use crate::transport::{InternalSubscription, MessageBus, TcpMessageBus};
 
+use super::handshake_state::{HandshakeState, ServerVersion};
 use super::id_generator::ClientIdManager;
 use super::ids::{OrderId, RequestId};
 
@@ -28,14 +31,17 @@ use super::ids::{OrderId, RequestId};
 /// Tracks some global information such as server version and server time.
 /// Supports generation of order ids.
 pub struct Client {
-    /// IB server version
-    pub(crate) server_version: i32,
+    /// IB server version, shared with the transport so a reconnect updates it.
+    server_version: Arc<ServerVersion>,
     pub(crate) connection_time: Option<OffsetDateTime>,
     pub(crate) time_zone: Option<&'static Tz>,
+    handshake_managed_accounts: Vec<String>,
     pub(crate) message_bus: Arc<dyn MessageBus>,
 
     client_id: i32,                   // ID of client.
     id_manager: Arc<ClientIdManager>, // Manages request and order ID generation
+    /// `ClientBuilder::one_shot_timeout`; `None` leaves request-id one-shots unbounded.
+    one_shot_timeout: Option<Duration>,
 }
 
 impl Client {
@@ -49,6 +55,11 @@ impl Client {
     /// # Arguments
     /// * `address`   - address of server. e.g. 127.0.0.1:4002
     /// * `client_id` - id of client. e.g. 100
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ClientIdInUse`] when another connection holds `client_id`;
+    /// connect with a different id. Not retried here.
     ///
     /// # Examples
     ///
@@ -95,14 +106,15 @@ impl Client {
         let connection = Connection::connect(config.connection, notice_broadcaster)?;
         let connection_metadata = connection.connection_metadata();
 
-        let message_bus = Arc::new(TcpMessageBus::new(connection)?);
+        let message_bus = Arc::new(TcpMessageBus::new(connection));
 
-        let client = Client::new(connection_metadata, message_bus.clone())?;
+        let mut client = Client::new(connection_metadata, message_bus.clone())?;
+        client.one_shot_timeout = config.one_shot_timeout;
 
-        // Share the order-ID generator with the bus so a successful reconnect
-        // re-seeds it from the handshake's NextValidId; must be installed
-        // before the dispatcher thread starts.
-        message_bus.set_order_ids(client.id_manager.clone());
+        // Share the state a reconnect's handshake refreshes (order-id floor,
+        // server version) with the bus; must be installed before the
+        // dispatcher thread starts.
+        message_bus.set_handshake_state(client.handshake_state());
         if let Some(limiter) = config.rate_limiter {
             message_bus.set_rate_limiter(limiter);
         }
@@ -115,15 +127,25 @@ impl Client {
 
     fn new(connection_metadata: ConnectionMetadata, message_bus: Arc<dyn MessageBus>) -> Result<Client, Error> {
         let client = Client {
-            server_version: connection_metadata.server_version,
+            server_version: Arc::new(ServerVersion::new(connection_metadata.server_version)),
             connection_time: connection_metadata.connection_time,
             time_zone: connection_metadata.time_zone,
+            handshake_managed_accounts: split_account_list(&connection_metadata.managed_accounts),
             message_bus,
             client_id: connection_metadata.client_id,
             id_manager: Arc::new(ClientIdManager::new(connection_metadata.next_order_id)?),
+            one_shot_timeout: None,
         };
 
         Ok(client)
+    }
+
+    /// The state the transport refreshes on reconnect, sharing this client's.
+    fn handshake_state(&self) -> HandshakeState {
+        HandshakeState {
+            order_ids: self.id_manager.clone(),
+            server_version: self.server_version.clone(),
+        }
     }
 
     /// Returns the ID assigned to the [Client].
@@ -138,6 +160,11 @@ impl Client {
         self.id_manager.next_order_id().value()
     }
 
+    /// How long a one-shot request waits for TWS's answer, if the caller bounded it.
+    pub(crate) fn one_shot_timeout(&self) -> Option<Duration> {
+        self.one_shot_timeout
+    }
+
     /// Allocates a request ID for a request this crate sends.
     pub(crate) fn mint_request_id(&self) -> RequestId {
         self.id_manager.next_request_id()
@@ -149,8 +176,9 @@ impl Client {
         self.id_manager.raise_order_id(order_id);
     }
 
-    /// Returns the version of the TWS API server to which the client is connected.
-    /// This version is determined during the initial connection handshake.
+    /// Returns the version of the TWS API server to which the client is connected,
+    /// as negotiated in the connection handshake. Updated when the client
+    /// reconnects, since the gateway may come back on a different build.
     ///
     /// # Examples
     ///
@@ -162,12 +190,14 @@ impl Client {
     /// println!("Connected to TWS server version: {server_version:?}");
     /// ```
     pub fn server_version(&self) -> i32 {
-        self.server_version
+        self.server_version.get()
     }
 
     /// Returns the gateway's clock reading when the client connected, or
     /// `None` if the zone is unrecognized (see [`time_zone`](Self::time_zone))
     /// or the reading is malformed.
+    ///
+    /// From the initial connection; a reconnect doesn't update it.
     pub fn connection_time(&self) -> Option<OffsetDateTime> {
         self.connection_time
     }
@@ -179,13 +209,35 @@ impl Client {
     /// warning at connect). Map such a name with
     /// [`register_timezone_alias`](crate::register_timezone_alias). See
     /// [Gateway Time Zone](https://github.com/wboayue/rust-ibapi/blob/main/docs/troubleshooting.md#gateway-time-zone).
+    ///
+    /// From the initial connection; a reconnect doesn't update it.
     pub fn time_zone(&self) -> Option<&'static Tz> {
         self.time_zone
     }
 
+    /// Returns the accounts TWS sent when the client connected, with no round
+    /// trip. Empty if TWS sent none.
+    ///
+    /// From the initial connection; a reconnect doesn't update it. For the
+    /// current list, call [`managed_accounts`](Self::managed_accounts).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// for account in client.handshake_managed_accounts() {
+    ///     println!("account: {account}");
+    /// }
+    /// ```
+    pub fn handshake_managed_accounts(&self) -> &[String] {
+        &self.handshake_managed_accounts
+    }
+
     /// Returns a decoder context for this client
     pub(crate) fn decoder_context(&self) -> crate::subscriptions::DecoderContext {
-        crate::subscriptions::DecoderContext::new(self.server_version)
+        crate::subscriptions::DecoderContext::new(self.server_version())
     }
 
     /// Returns true if the client is currently connected to TWS/IB Gateway.
@@ -208,6 +260,113 @@ impl Client {
     /// ```
     pub fn is_connected(&self) -> bool {
         self.message_bus.is_connected()
+    }
+
+    /// Blocks until the client is connected to TWS/IB Gateway again, so a
+    /// stream loop can resubscribe after [`Error::is_connection_lost`].
+    ///
+    /// Returns `Ok(())` at once while connected. While the client is
+    /// reconnecting it blocks until the reconnect finishes, which with
+    /// `ClientBuilder::reconnect_forever` may be never.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ConnectionFailed`] if the reconnect gave up after its last attempt.
+    /// - [`Error::Shutdown`] if the client was shut down.
+    ///
+    /// Both are terminal: every later request fails with the same error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::prelude::*;
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// let contract = Contract::stock("AAPL").build();
+    ///
+    /// loop {
+    ///     let subscription = match client.realtime_bars(&contract).subscribe() {
+    ///         Ok(subscription) => subscription,
+    ///         Err(e) if e.is_connection_lost() => {
+    ///             client.wait_connected().expect("reconnect gave up");
+    ///             continue;
+    ///         }
+    ///         Err(e) => panic!("request failed: {e}"),
+    ///     };
+    ///     // ... read until a connection-lost error, wait_connected, loop
+    /// #   break;
+    /// }
+    /// ```
+    pub fn wait_connected(&self) -> Result<(), Error> {
+        self.message_bus.wait_connected(None)
+    }
+
+    /// Streams items from the subscription `open` returns, resubscribing after
+    /// each transport reconnect: the packaged form of the
+    /// [`Error::is_connection_lost`] → [`wait_connected`](Self::wait_connected) → resubscribe loop.
+    ///
+    /// Yields the same `Result<SubscriptionItem<T>, Error>` items as the subscription. When the
+    /// connection drops, it drops the dead subscription, waits for the reconnect, calls `open`
+    /// again, and yields a [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice)
+    /// with code [`TRANSPORT_RECONNECT_CODE`](crate::TRANSPORT_RECONNECT_CODE) before
+    /// the new subscription's first item. Data from the outage is missing. A first `open` that
+    /// fails with a lost connection is retried too, without a notice.
+    ///
+    /// It ends after yielding any other error, the error `wait_connected` returns when the
+    /// reconnect gave up, or when the subscription itself ends (a snapshot that finished).
+    ///
+    /// [`filter_data`](crate::subscriptions::SubscriptionItemIterExt::filter_data) drops notices, gap included; match the
+    /// items to see it.
+    ///
+    /// `T` must be [`Resubscribable`](crate::subscriptions::Resubscribable): order streams are not,
+    /// so a resubscribe can't place or cancel again. After a resubscribe the caller sees:
+    ///
+    /// | Stream | After the gap notice |
+    /// |---|---|
+    /// | market data, realtime bars, tick-by-tick, news bulletins | new data only |
+    /// | market depth | the book rebuilt from scratch: reset yours on the notice |
+    /// | historical bars with `keep_up_to_date` | the initial bars again (duplicates) |
+    /// | account, position, PnL, account summary | the initial snapshot again |
+    /// | scanner | a fresh scan |
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::TRANSPORT_RECONNECT_CODE;
+    /// use ibapi::prelude::*;
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// let contract = Contract::stock("AAPL").build();
+    ///
+    /// for item in client.resubscribing(|| client.realtime_bars(&contract).subscribe()) {
+    ///     match item {
+    ///         Ok(SubscriptionItem::Data(bar)) => println!("{bar:?}"),
+    ///         Ok(SubscriptionItem::Notice(n)) if n.code == TRANSPORT_RECONNECT_CODE => println!("gap: {n}"),
+    ///         Ok(SubscriptionItem::Notice(n)) => println!("notice: {n}"),
+    ///         Err(e) => panic!("stream ended: {e}"),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Order streams don't compile:
+    ///
+    /// ```compile_fail,E0277
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::orders::Order;
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// let (contract, order) = (Contract::stock("AAPL").build(), Order::default());
+    /// let _ = client.resubscribing(|| client.place_order(1, &contract, &order));
+    /// ```
+    pub fn resubscribing<T, F>(&self, open: F) -> crate::subscriptions::Resubscribing<'_, T, F>
+    where
+        T: crate::subscriptions::Resubscribable,
+        F: FnMut() -> Result<crate::subscriptions::sync::Subscription<T>, Error>,
+    {
+        crate::subscriptions::Resubscribing::new(self, open)
     }
 
     /// Cleanly shuts down the message bus.
@@ -283,13 +442,22 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn stubbed(message_bus: Arc<dyn MessageBus>, server_version: i32) -> Client {
         Client {
-            server_version,
+            server_version: Arc::new(ServerVersion::new(server_version)),
             connection_time: None,
             time_zone: None,
+            handshake_managed_accounts: Vec::new(),
             message_bus,
             client_id: 100,
             id_manager: Arc::new(ClientIdManager::new(crate::common::test_utils::helpers::TEST_ORDER_ID_SEED).expect("sub-floor test seed")),
+            one_shot_timeout: None,
         }
+    }
+
+    /// [`stubbed`](Self::stubbed) with `ClientBuilder::one_shot_timeout` set.
+    #[cfg(test)]
+    pub(crate) fn with_one_shot_timeout(mut self, timeout: Duration) -> Client {
+        self.one_shot_timeout = Some(timeout);
+        self
     }
 
     pub(crate) fn send_request(&self, request_id: RequestId, message: Vec<u8>) -> Result<InternalSubscription, Error> {
@@ -328,7 +496,7 @@ impl Drop for Client {
 impl Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field("server_version", &self.server_version)
+            .field("server_version", &self.server_version())
             .field("server_time", &self.connection_time)
             .field("client_id", &self.client_id)
             .finish()

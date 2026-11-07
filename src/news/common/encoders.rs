@@ -27,7 +27,7 @@ pub(in crate::news) fn encode_request_historical_news(
     provider_codes: &[&str],
     start_time: OffsetDateTime,
     end_time: OffsetDateTime,
-    total_results: u8,
+    total_results: u16,
 ) -> Result<Vec<u8>, crate::Error> {
     use crate::messages::{encode_protobuf_message, OutgoingMessages};
     use crate::ToField;
@@ -38,7 +38,7 @@ pub(in crate::news) fn encode_request_historical_news(
         provider_codes: Some(provider_codes.join("+")),
         start_date_time: Some(start_time.to_field()),
         end_date_time: Some(end_time.to_field()),
-        total_results: Some(total_results as i32),
+        total_results: Some(i32::from(total_results)),
         historical_news_options: Default::default(),
     };
     Ok(encode_protobuf_message(
@@ -60,6 +60,26 @@ pub(in crate::news) fn encode_request_news_article(request_id: i32, provider_cod
         OutgoingMessages::RequestNewsArticle as i32,
         &request.encode_to_vec(),
     ))
+}
+
+/// Encode a contract news market data request.
+pub(in crate::news) fn encode_contract_news_request(
+    request_id: i32,
+    contract: &crate::contracts::Contract,
+    provider_codes: &[&str],
+) -> Result<Vec<u8>, crate::Error> {
+    // `mdoff` plus a `292:<provider>` tick per provider. The encoder borrows
+    // `&str`s, so the formatted ticks need an owner.
+    let provider_ticks: Vec<String> = provider_codes.iter().map(|provider| format!("292:{provider}")).collect();
+    let generic_ticks: Vec<&str> = std::iter::once("mdoff").chain(provider_ticks.iter().map(String::as_str)).collect();
+    crate::market_data::realtime::common::encode_request_market_data(request_id, contract, generic_ticks.as_slice(), false, false)
+}
+
+/// Encode a broad tape news market data request.
+pub(in crate::news) fn encode_broad_tape_news_request(request_id: i32, provider_code: &str) -> Result<Vec<u8>, crate::Error> {
+    let contract = crate::contracts::Contract::news(provider_code);
+    let generic_ticks = &["mdoff", "292"];
+    crate::market_data::realtime::common::encode_request_market_data(request_id, &contract, generic_ticks, false, false)
 }
 
 // Encoder body assertions live in the migrated sync/async tests via

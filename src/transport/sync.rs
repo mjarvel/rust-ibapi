@@ -5,15 +5,16 @@
 use std::collections::{hash_map, HashMap, HashSet};
 use std::io::prelude::*;
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, Sender};
 use log::{debug, error, info, trace, warn};
 
 use crate::accounts::types::AccountId;
-use crate::client::id_generator::ClientIdManager;
+use crate::client::handshake_state::HandshakeState;
 use crate::client::ids::{OrderId, RequestId, WireId};
 use crate::connection::sync::Connection;
 
@@ -320,11 +321,13 @@ pub struct TcpMessageBus<S: Stream> {
     shutdown_recv: Receiver<()>,
     /// Shared with the connection so a reconnect in progress sees the request.
     shutdown: Arc<ShutdownSignal>,
-    /// The client's order-ID generator, raised from the NextValidId frame the
-    /// reconnect handshake re-receives. Installed once via
-    /// [`Self::set_order_ids`] before the dispatcher thread starts; absent in
-    /// bus-only test fixtures, which never reconnect a client.
-    order_ids: OnceLock<Arc<ClientIdManager>>,
+    /// The client state a reconnect's handshake refreshes (order-id floor,
+    /// server version). Installed once via [`Self::set_handshake_state`]
+    /// before the dispatcher thread starts; absent in bus-only test fixtures,
+    /// which never reconnect a client.
+    handshake_state: OnceLock<HandshakeState>,
+    /// See [`MessageBus::session_generation`]; bumped in `reset`.
+    session_generation: AtomicU64,
     /// Outbound rate limiter, if the client was built with one. Installed
     /// once via [`Self::set_rate_limiter`] before any request is sent.
     rate_limiter: OnceLock<RateLimiter>,
@@ -332,16 +335,23 @@ pub struct TcpMessageBus<S: Stream> {
     order_taps: OrderTaps<Sender<RoutedItem>>,
     /// Session state, and what `wait_connected` blocks on.
     connection_state: ConnectionSignal,
+    /// The session gate. The dispatcher holds it for write from failing the
+    /// channels of a lost connection until the replayed handshake has the
+    /// session live again; `write_now` holds it for read across its state
+    /// check and its write. So a write either finishes before the reconnect
+    /// starts, or is refused: none reaches the socket the reconnect installs
+    /// until the handshake on it is done.
+    session: RwLock<()>,
 }
 
 impl<S: Stream> TcpMessageBus<S> {
-    pub fn new(connection: Connection<S>) -> Result<TcpMessageBus<S>, Error> {
+    pub fn new(connection: Connection<S>) -> TcpMessageBus<S> {
         let order_taps = OrderTaps::new();
         let (signals_send, signals_recv) = channel::unbounded();
         let (shutdown_send, shutdown_recv) = channel::bounded(1);
         let shutdown = connection.shutdown_signal();
 
-        Ok(TcpMessageBus {
+        TcpMessageBus {
             connection,
             handles: Mutex::new(Vec::default()),
             requests: SenderHash::new(),
@@ -353,18 +363,19 @@ impl<S: Stream> TcpMessageBus<S> {
             shutdown_send,
             shutdown_recv,
             shutdown,
-            order_ids: OnceLock::new(),
+            handshake_state: OnceLock::new(),
+            session_generation: AtomicU64::new(0),
             rate_limiter: OnceLock::new(),
             order_taps,
             connection_state: ConnectionSignal::default(),
-        })
+            session: RwLock::new(()),
+        }
     }
 
-    /// Installs the client's order-ID generator so a successful reconnect
-    /// re-seeds it from the handshake's NextValidId. Called exactly once,
-    /// before the dispatcher thread starts.
-    pub(crate) fn set_order_ids(&self, order_ids: Arc<ClientIdManager>) {
-        self.order_ids.set(order_ids).expect("order-id generator installed twice");
+    /// Installs the client state a successful reconnect refreshes from its
+    /// handshake. Called exactly once, before the dispatcher thread starts.
+    pub(crate) fn set_handshake_state(&self, state: HandshakeState) {
+        self.handshake_state.set(state).expect("handshake state installed twice");
     }
 
     /// Installs the outbound rate limiter. Called at most once, before the
@@ -406,8 +417,11 @@ impl<S: Stream> TcpMessageBus<S> {
     }
 
     /// The send gate: every bus-originated write checks here first, and is
-    /// refused with `Error::ConnectionReset` unless the session is live and
-    /// not shutting down.
+    /// refused unless the session is live and not shutting down - with
+    /// `Error::ConnectionReset` while a reconnect may still bring it back,
+    /// `Error::ConnectionFailed` once the reconnect gave up, and
+    /// `Error::Shutdown` after a shutdown, so a caller can tell "wait" from
+    /// "stop".
     ///
     /// Without it, a request sent while the connection is down would be lost
     /// on the dead socket - or, worse, interleave with the handshake the
@@ -415,16 +429,26 @@ impl<S: Stream> TcpMessageBus<S> {
     /// would never be reset again, so its caller would block forever. Callers
     /// wait the reconnect out through `wait_connected` instead.
     ///
-    /// The check-then-write window is not closed: a caller that passes here
-    /// just before the dispatcher flips the state can still write, and in
-    /// principle race the socket swap inside `reconnect`. Closing that needs a
-    /// session-level gate held across the handshake.
+    /// On its own this check is a snapshot that races the dispatcher: a caller
+    /// that passes here just before the state flips could still write, and that
+    /// write could land in the handshake the reconnect is running on the new
+    /// socket (#1171). `write_now` runs it under the `session` gate, which the
+    /// dispatcher holds across the reconnect, so there the check and the write
+    /// are one step and the race is closed.
     fn ensure_connected(&self) -> Result<(), Error> {
-        if self.is_connected() {
-            Ok(())
-        } else {
-            Err(Error::ConnectionReset)
+        self.connection_state.check()?;
+        if self.is_shutting_down() {
+            return Err(Error::Shutdown);
         }
+        Ok(())
+    }
+
+    /// A refusal from the order taps, which close on shutdown, reported as
+    /// why the session ended - `ConnectionFailed` when the client gave up on
+    /// it, as the send gate does. Asked after the refusal: `fail` latches
+    /// before the taps close, so the reason is always already set.
+    fn ended_reason(&self, refusal: Error) -> Error {
+        self.connection_state.check_ended().err().unwrap_or(refusal)
     }
 
     /// The one funnel for every bus-originated write, so no send can reach a
@@ -444,14 +468,26 @@ impl<S: Stream> TcpMessageBus<S> {
         }
     }
 
-    /// Writes without throttling; the connected check runs after any wait.
+    /// Writes without throttling; the connected check runs after any wait,
+    /// under the `session` gate. The gate held for write is a reconnect in
+    /// progress, whatever the state signal says yet, so the write is refused
+    /// as `ensure_connected` would refuse it once the signal catches up.
     fn write_now(&self, message: &[u8]) -> Result<(), Error> {
+        let _session = match self.session.try_read() {
+            Ok(guard) => guard,
+            // Poison recovery, as `common::lock`: the guard holds nothing.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(self.ended_reason(Error::ConnectionReset)),
+        };
         self.ensure_connected()?;
         self.connection.write_message(message)
     }
 
     fn reset(&self) {
         debug!("reset message bus");
+        // Before failing the routes, so a subscription that reads the reset
+        // already sees the new generation.
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
 
         self.requests.fail_all(|| Error::ConnectionReset.into());
         self.orders.fail_all(|| Error::ConnectionReset.into());
@@ -532,6 +568,16 @@ impl<S: Stream> TcpMessageBus<S> {
                 // session, and the reconnect can run for minutes.
                 self.reset();
 
+                // Fail any write still on the dead connection, so the gate
+                // below need not wait for a peer that stopped reading.
+                self.connection.socket.sever();
+
+                // Waits out writes whose state check passed before the flip
+                // (a write stuck on the dead socket must not delay the
+                // failures above); every later one is refused until the
+                // session is live again.
+                let session = write_lock(&self.session);
+
                 match self.connection.reconnect() {
                     Ok(()) => {}
                     // Shutdown was requested while reconnecting: not a failure,
@@ -542,6 +588,9 @@ impl<S: Stream> TcpMessageBus<S> {
                     }
                     Err(reconnect_err) => {
                         error!("failed to reconnect to TWS/Gateway: {reconnect_err:?}");
+                        // Latched before the shutdown, which keeps it: later
+                        // sends and waiters see `ConnectionFailed`, not `Shutdown`.
+                        self.connection_state.fail();
                         self.request_shutdown();
                         return Err(Error::ConnectionFailed);
                     }
@@ -555,17 +604,17 @@ impl<S: Stream> TcpMessageBus<S> {
                     return Err(Error::Shutdown);
                 }
 
-                // The handshake re-received NextValidId; raise the client's
-                // generator from the server's floor so allocation never
-                // resumes below it. Only the initial connection seeded the
-                // generator before this. Do it before reporting the session
-                // as live so a caller gating on `is_connected()` cannot
-                // allocate below the new floor.
-                if let Some(order_ids) = self.order_ids.get() {
-                    order_ids.raise_order_id_from_server(self.connection.connection_metadata().next_order_id);
+                // Before reporting the session as live; see
+                // `HandshakeState::refresh`.
+                if let Some(state) = self.handshake_state.get() {
+                    state.refresh(&self.connection.connection_metadata());
                 }
 
                 info!("successfully reconnected to TWS/Gateway");
+                // Released before the state flips: `set_connected` wakes
+                // `wait_connected`, and a woken caller's send must not be
+                // refused. Until the flip, `ensure_connected` still refuses.
+                drop(session);
                 self.connection_state.set_connected();
 
                 // TWS never frames the socket reconnect itself and does not replay
@@ -585,6 +634,8 @@ impl<S: Stream> TcpMessageBus<S> {
             }
             Err(err) => {
                 error!("error reading next message (shutting down): {err:?}");
+                // Nobody asked for this shutdown: report the session as failed.
+                self.connection_state.fail();
                 self.request_shutdown();
                 Err(err)
             }
@@ -761,6 +812,9 @@ impl<S: Stream> TcpMessageBus<S> {
     /// Register `request_id`'s channel, optionally with an unread-item cap,
     /// then write the request.
     fn open_request(&self, request_id: RequestId, message: &[u8], bound: Option<BufferBound>) -> Result<InternalSubscription, Error> {
+        // Read before the gate: a reset after this read leaves the
+        // subscription in the old session, which is where its request went.
+        let session = self.session_generation();
         self.ensure_connected()?;
 
         let (sender, receiver) = channel::unbounded();
@@ -787,6 +841,7 @@ impl<S: Stream> TcpMessageBus<S> {
             .signaler(self.signals_send.clone())
             .lease(lease)
             .request_id(request_id)
+            .session(session)
             .build();
 
         Ok(subscription)
@@ -883,6 +938,8 @@ impl<S: Stream> TcpMessageBus<S> {
     // Registers a subscription of `message_type` and writes its request;
     // `account` for account updates (see `SharedCounts`).
     fn send_shared(&self, message_type: OutgoingMessages, account: Option<&AccountId>, message: &[u8]) -> Result<InternalSubscription, Error> {
+        // See `open_request`.
+        let session = self.session_generation();
         self.ensure_connected()?;
 
         // A queue of its own, registered before the write so no response can
@@ -909,6 +966,7 @@ impl<S: Stream> TcpMessageBus<S> {
             .signaler(self.signals_send.clone())
             .lease(lease)
             .shared(ticket)
+            .session(session)
             .build();
 
         Ok(subscription)
@@ -921,6 +979,8 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     }
 
     fn send_order_request(&self, order_id: OrderId, message: &[u8]) -> Result<InternalSubscription, Error> {
+        // See `open_request`.
+        let session = self.session_generation();
         self.ensure_connected()?;
 
         let (sender, receiver) = channel::unbounded();
@@ -942,6 +1002,7 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             .signaler(self.signals_send.clone())
             .lease(lease)
             .order_id(order_id)
+            .session(session)
             .build();
 
         Ok(subscription)
@@ -960,13 +1021,15 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     }
 
     fn create_order_status_subscription(&self, order_id: OrderId) -> Result<InternalSubscription, Error> {
-        let NewTap { sender, receiver, lease } = self.order_taps.subscribe_status(order_id, 0)?;
+        // Allowed mid-reconnect, like the order-update stream below.
+        let NewTap { sender, receiver, lease } = self.order_taps.subscribe_status(order_id, 0).map_err(|e| self.ended_reason(e))?;
         Ok(SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender)
             .signaler(self.signals_send.clone())
             .lease(lease)
             .order_status(order_id)
+            .session(self.session_generation())
             .build())
     }
 
@@ -975,12 +1038,13 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
         // created while a reconnect is in progress. The lease gives the
         // subscription's drop signal its identity — see
         // `clear_order_update_stream`.
-        let NewTap { sender, receiver, lease } = self.order_taps.subscribe_updates(0)?;
+        let NewTap { sender, receiver, lease } = self.order_taps.subscribe_updates(0).map_err(|e| self.ended_reason(e))?;
         Ok(SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender)
             .signaler(self.signals_send.clone())
             .lease(lease)
+            .session(self.session_generation())
             .build())
     }
 
@@ -1011,12 +1075,16 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
         self.join();
     }
 
-    fn wait_connected(&self) -> Result<(), Error> {
-        self.connection_state.wait_connected()
+    fn wait_connected(&self, deadline: Option<Instant>) -> Result<(), Error> {
+        self.connection_state.wait_connected(deadline)
     }
 
     fn is_connected(&self) -> bool {
         self.connection_state.is_connected() && !self.is_shutting_down()
+    }
+
+    fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
     }
 }
 
@@ -1230,6 +1298,8 @@ struct CloseHandle {
     /// Latched by `close`; `reconnect` re-checks it under the same lock, so a
     /// stream it installs is either refused or closed after it.
     closed: bool,
+    /// Set by `sever`, cleared by the `reconnect` that replaces the stream.
+    severed: bool,
 }
 
 #[derive(Debug)]
@@ -1254,6 +1324,7 @@ impl TcpSocket {
         let close_handle = CloseHandle {
             stream: stream.try_clone()?,
             closed: false,
+            severed: false,
         };
 
         stream.set_read_timeout(Some(TWS_READ_TIMEOUT))?;
@@ -1269,10 +1340,14 @@ impl TcpSocket {
         })
     }
 
-    /// An I/O failure after `close` is the close, not the peer.
+    /// An I/O failure after `close` is the close, and after `sever` the
+    /// abandoned connection, not the peer.
     fn closed_or(&self, err: Error) -> Error {
-        if lock(&self.close_handle).closed {
+        let handle = lock(&self.close_handle);
+        if handle.closed {
             Error::Shutdown
+        } else if handle.severed {
+            Error::ConnectionReset
         } else {
             err
         }
@@ -1296,6 +1371,7 @@ impl Reconnect for TcpSocket {
         *reader = stream.try_clone()?;
         *writer = stream.try_clone()?;
         handle.stream = stream;
+        handle.severed = false;
 
         // One capture file per TCP stream: splicing two of them would
         // read back as a desync at the seam that never happened.
@@ -1306,6 +1382,19 @@ impl Reconnect for TcpSocket {
     fn sleep(&self, duration: std::time::Duration, shutdown: &ShutdownSignal) {
         shutdown.wait_timeout(duration)
     }
+
+    /// Takes only the close handle, so it gets through while a write holds
+    /// the writer; see `CloseHandle` for the order.
+    fn sever(&self) {
+        let mut handle = lock(&self.close_handle);
+        if handle.closed {
+            return;
+        }
+        handle.severed = true;
+        if let Err(e) = handle.stream.shutdown(std::net::Shutdown::Both) {
+            debug!("socket shutdown returned: {e:?}");
+        }
+    }
 }
 
 pub(crate) trait Reconnect {
@@ -1315,6 +1404,13 @@ pub(crate) trait Reconnect {
     /// Wait out the reconnect backoff, returning early once `shutdown` is
     /// requested. In-memory test streams return immediately.
     fn sleep(&self, duration: std::time::Duration, shutdown: &ShutdownSignal);
+    /// Abandon the current connection: pending and later reads and writes on
+    /// it fail with [`Error::ConnectionReset`] until `reconnect` replaces it.
+    /// Unlike [`Io::close`], not terminal. The dispatcher calls it on a lost
+    /// connection, so a write stuck on a peer that stopped reading cannot
+    /// hold up the reconnect (a TCP write has no timeout). The default does
+    /// nothing, for in-memory streams, whose writes never block.
+    fn sever(&self) {}
 }
 
 pub(crate) trait Stream: Io + Reconnect + Sync + Send + 'static + std::fmt::Debug {}

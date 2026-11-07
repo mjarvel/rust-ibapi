@@ -25,7 +25,8 @@ use time::macros::format_description;
 use time::{Date, OffsetDateTime};
 
 use crate::common::error_helpers;
-use crate::messages::{IncomingMessages, ResponseMessage};
+use crate::common::request_helpers::CancellableOneShot;
+use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -180,7 +181,8 @@ pub struct Bar {
     pub volume: f64,
     /// The bar's Weighted Average Price (only available for TRADES)
     pub wap: f64,
-    /// The number of trades during the bar's timespan (only available for TRADES)
+    /// The number of trades during the bar's timespan (only available for TRADES);
+    /// `-1` when TWS sends none
     pub count: i32,
 }
 
@@ -445,6 +447,50 @@ pub struct HistoricalData {
     pub bars: Vec<Bar>,
 }
 
+impl HistoricalData {
+    /// Keeps the bars in `[start, end)` and reports that range as the window.
+    ///
+    /// IBKR counts a request's duration in trading time, so a range request
+    /// returns bars from before `start` too. [`fetch`](HistoricalDataBuilder::fetch)
+    /// after [`between`](HistoricalDataBuilder::between) trims for you; use
+    /// this on bars read from a subscription. A daily bar's
+    /// [`Date`](BarTimestamp::Date) counts as midnight UTC.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::market_data::historical::{Bar, BarTimestamp, HistoricalData};
+    /// use time::macros::datetime;
+    ///
+    /// let bar = |at| Bar {
+    ///     date: BarTimestamp::DateTime(at),
+    ///     open: 1.0,
+    ///     high: 1.0,
+    ///     low: 1.0,
+    ///     close: 1.0,
+    ///     volume: 0.0,
+    ///     wap: 0.0,
+    ///     count: 0,
+    /// };
+    /// let data = HistoricalData {
+    ///     start: datetime!(2026-04-14 0:00 UTC),
+    ///     end: datetime!(2026-04-16 0:00 UTC),
+    ///     bars: vec![bar(datetime!(2026-04-14 19:00 UTC)), bar(datetime!(2026-04-15 13:30 UTC))],
+    /// };
+    ///
+    /// let trimmed = data.trim_to(datetime!(2026-04-15 0:00 UTC), datetime!(2026-04-16 0:00 UTC));
+    /// assert_eq!(trimmed.bars.len(), 1);
+    /// assert_eq!(trimmed.start, datetime!(2026-04-15 0:00 UTC));
+    /// ```
+    pub fn trim_to(mut self, start: OffsetDateTime, end: OffsetDateTime) -> Self {
+        let (first, last) = (BarTimestamp::from(start), BarTimestamp::from(end));
+        self.bars.retain(|bar| bar.date >= first && bar.date < last);
+        self.start = start;
+        self.end = end;
+        self
+    }
+}
+
 /// Update from historical data streaming with keepUpToDate=true.
 ///
 /// When requesting historical data with `keepUpToDate=true`, IBKR first sends
@@ -456,11 +502,9 @@ pub struct HistoricalData {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoricalBarUpdate {
-    /// Initial batch of historical bars. Always received first.
-    ///
-    /// Its `start` and `end` are `OffsetDateTime::UNIX_EPOCH`: TWS sends the
-    /// window in a separate message, delivered as [`End`](Self::End).
-    Historical(HistoricalData),
+    /// Initial batch of historical bars. Always received first. The
+    /// requested window follows as [`End`](Self::End).
+    Historical(Vec<Bar>),
     /// Real-time update of the current (incomplete) bar.
     /// Multiple updates with the same timestamp will be sent as the bar builds.
     Update(Bar),
@@ -494,7 +538,162 @@ impl StreamDecoder<HistoricalBarUpdate> for HistoricalBarUpdate {
     }
 
     fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
-        let request_id = error_helpers::require_request_id_for(request_id, "encode cancel historical data")?;
+        cancel_historical_data(request_id)
+    }
+
+    /// Live: after 200 TWS answers the cancel with 366 (no query found).
+    fn rejection_ends_request(notice: &Notice) -> bool {
+        notice.code == NO_SECURITY_DEFINITION_CODE
+    }
+}
+
+/// The cancel for a historical bar request, one-shot or streaming.
+fn cancel_historical_data(request_id: Option<i32>) -> Result<Vec<u8>, Error> {
+    let request_id = error_helpers::require_request_id_for(request_id, "encode cancel historical data")?;
+    common::encoders::encode_cancel_historical_data(request_id)
+}
+
+/// The frames of a historical bar request that doesn't stream updates: the
+/// bars, then the window.
+///
+/// Yielded by [`HistoricalDataBuilder::subscribe`], in that order. `End` ends the
+/// request at TWS: a subscription that has read it sends no cancel when
+/// dropped, and one dropped before it does. Unlike [`HistoricalBarUpdate`],
+/// nothing follows `End`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HistoricalDataFrame {
+    /// Every bar of the request, in one frame. The window comes in `End`.
+    Bars(Vec<Bar>),
+    /// The window TWS served. The request is complete.
+    End {
+        /// Start of the window.
+        start: OffsetDateTime,
+        /// End of the window.
+        end: OffsetDateTime,
+    },
+}
+
+/// A historical bar request's parameters, as its builder resolved them.
+#[derive(Clone, Copy)]
+pub(crate) struct BarRequest<'a> {
+    pub(crate) contract: &'a crate::contracts::Contract,
+    pub(crate) end_date: Option<OffsetDateTime>,
+    pub(crate) duration: Duration,
+    pub(crate) bar_size: BarSize,
+    pub(crate) what_to_show: WhatToShow,
+    pub(crate) trading_hours: crate::market_data::TradingHours,
+}
+
+impl BarRequest<'_> {
+    /// The request message. With `keep_up_to_date`, TWS streams updates after
+    /// the initial bars.
+    pub(crate) fn encode(&self, request_id: i32, keep_up_to_date: bool) -> Result<Vec<u8>, Error> {
+        common::encoders::encode_request_historical_data(
+            request_id,
+            self.contract,
+            self.end_date,
+            self.duration,
+            self.bar_size,
+            self.what_to_show,
+            self.trading_hours.use_rth(),
+            keep_up_to_date,
+        )
+    }
+}
+
+impl HistoricalDataFrame {
+    /// The bars, which TWS sends first.
+    pub(crate) fn into_bars(self) -> Result<Vec<Bar>, Error> {
+        match self {
+            Self::Bars(bars) => Ok(bars),
+            Self::End { .. } => Err(Error::UnexpectedResponse("historical data: window before bars".into())),
+        }
+    }
+
+    /// The window, which follows the bars and ends the request.
+    pub(crate) fn into_window(self) -> Result<(OffsetDateTime, OffsetDateTime), Error> {
+        match self {
+            Self::End { start, end } => Ok((start, end)),
+            Self::Bars(_) => Err(Error::UnexpectedResponse("historical data: second batch of bars before window".into())),
+        }
+    }
+}
+
+impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
+    const RESPONSE_MESSAGE_IDS: &[IncomingMessages] = &[IncomingMessages::HistoricalData, IncomingMessages::HistoricalDataEnd];
+
+    fn decode(_context: &DecoderContext, message: &ResponseMessage) -> Result<Self, Error> {
+        match message.message_type() {
+            IncomingMessages::HistoricalData => Ok(Self::Bars(common::decoders::decode_historical_data(message)?)),
+            IncomingMessages::HistoricalDataEnd => {
+                let (start, end) = common::decoders::decode_historical_data_end(message)?;
+                Ok(Self::End { start, end })
+            }
+            _ => Err(Error::unexpected_response(message)),
+        }
+    }
+
+    fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
+        cancel_historical_data(request_id)
+    }
+
+    fn is_snapshot_end(&self) -> bool {
+        matches!(self, Self::End { .. })
+    }
+
+    /// Any error, not a code list: a one-shot query has nothing to continue
+    /// after one. Verified live for 162, 200 and 10314, where TWS answers a
+    /// cancel with 366 (no query found).
+    fn rejection_ends_request(_notice: &Notice) -> bool {
+        true
+    }
+}
+
+/// The earliest data point request behind `head_timestamp`.
+pub(crate) enum HeadTimestampRequest {}
+
+impl CancellableOneShot for HeadTimestampRequest {
+    type Proto = crate::proto::HeadTimestamp;
+    type Output = OffsetDateTime;
+
+    fn decode(payload: Self::Proto) -> Result<OffsetDateTime, Error> {
+        common::decoders::decode_head_timestamp_proto(payload)
+    }
+
+    fn cancel(request_id: i32) -> Result<Vec<u8>, Error> {
+        common::encoders::encode_cancel_head_timestamp(request_id)
+    }
+}
+
+/// The request behind `histogram_data`.
+pub(crate) enum HistogramRequest {}
+
+impl CancellableOneShot for HistogramRequest {
+    type Proto = crate::proto::HistogramData;
+    type Output = Vec<HistogramEntry>;
+
+    fn decode(payload: Self::Proto) -> Result<Vec<HistogramEntry>, Error> {
+        common::decoders::decode_histogram_data_proto(payload)
+    }
+
+    fn cancel(request_id: i32) -> Result<Vec<u8>, Error> {
+        common::encoders::encode_cancel_histogram_data(request_id)
+    }
+}
+
+/// The historical data request for `WhatToShow::Schedule`, behind
+/// `historical_schedule`. Cancelled like any historical data request.
+pub(crate) enum ScheduleRequest {}
+
+impl CancellableOneShot for ScheduleRequest {
+    type Proto = crate::proto::HistoricalSchedule;
+    type Output = Schedule;
+
+    fn decode(payload: Self::Proto) -> Result<Schedule, Error> {
+        common::decoders::decode_historical_schedule_proto(payload)
+    }
+
+    fn cancel(request_id: i32) -> Result<Vec<u8>, Error> {
         common::encoders::encode_cancel_historical_data(request_id)
     }
 }
@@ -517,7 +716,8 @@ pub struct Schedule {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct Session {
-    /// Calendar date for the session.
+    /// Trade date the session belongs to. May differ from `start`'s date: an
+    /// extended futures session dated Monday opens Sunday evening.
     pub reference: Date,
     /// Session start time.
     pub start: OffsetDateTime,

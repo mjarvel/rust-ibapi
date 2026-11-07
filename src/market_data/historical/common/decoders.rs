@@ -8,7 +8,7 @@ use crate::messages::ResponseMessage;
 use crate::Error;
 
 use crate::market_data::historical::{
-    Bar, BarTimestamp, HistogramEntry, HistoricalData, Schedule, Session, TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint,
+    Bar, BarTimestamp, HistogramEntry, Schedule, Session, TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint,
 };
 
 fn parse_unix_seconds_str(s: &str) -> Result<OffsetDateTime, Error> {
@@ -17,14 +17,11 @@ fn parse_unix_seconds_str(s: &str) -> Result<OffsetDateTime, Error> {
     OffsetDateTime::from_unix_timestamp(secs).map_err(|e| mk_err(&e))
 }
 
-pub(crate) fn decode_historical_data(message: &ResponseMessage) -> Result<HistoricalData, Error> {
-    let bars = decode_historical_data_proto(message.proto()?)?;
-    // start/end always come on the separate HistoricalDataEnd message at floor 210.
-    Ok(HistoricalData {
-        start: OffsetDateTime::UNIX_EPOCH,
-        end: OffsetDateTime::UNIX_EPOCH,
-        bars,
-    })
+/// The bars of a `HistoricalData` wire message. The window's start and end
+/// come on the separate `HistoricalDataEnd` wire message
+/// ([`decode_historical_data_end`]).
+pub(crate) fn decode_historical_data(message: &ResponseMessage) -> Result<Vec<Bar>, Error> {
+    decode_historical_data_proto(message.proto()?)
 }
 
 pub(crate) fn decode_historical_data_end(message: &ResponseMessage) -> Result<(OffsetDateTime, OffsetDateTime), Error> {
@@ -100,7 +97,7 @@ fn parse_historical_data_end_timestamp(text: &str) -> Result<OffsetDateTime, Err
 // === Protobuf decoders ===
 
 use crate::proto;
-use crate::proto::decoders::{parse_decimal_or_zero, parse_optional_decimal, ts};
+use crate::proto::decoders::{parse_decimal_or_zero, parse_optional_decimal, required, ts};
 
 pub(crate) fn decode_historical_data_proto(msg: crate::proto::HistoricalData) -> Result<Vec<Bar>, Error> {
     // Sized up front rather than `.collect::<Result<Vec<_>, _>>()`: collecting into
@@ -109,17 +106,17 @@ pub(crate) fn decode_historical_data_proto(msg: crate::proto::HistoricalData) ->
     // to tens of thousands of rows.
     let mut bars = Vec::with_capacity(msg.historical_data_bars.len());
     for bar in &msg.historical_data_bars {
-        bars.push(decode_historical_data_bar(bar, -1)?);
+        bars.push(decode_historical_data_bar(bar)?);
     }
     Ok(bars)
 }
 
-fn decode_historical_data_bar(b: &proto::HistoricalDataBar, default_count: i32) -> Result<Bar, Error> {
-    let date = b
-        .date
-        .as_deref()
-        .and_then(|s| s.parse::<BarTimestamp>().ok())
-        .unwrap_or(BarTimestamp::DateTime(OffsetDateTime::UNIX_EPOCH));
+/// `Bar::count` when the frame carries no `bar_count`, the reference
+/// client's default.
+const NO_BAR_COUNT: i32 = -1;
+
+fn decode_historical_data_bar(b: &proto::HistoricalDataBar) -> Result<Bar, Error> {
+    let date = required(b.date.as_deref(), "date", "HistoricalDataBar")?.parse::<BarTimestamp>()?;
     Ok(Bar {
         date,
         open: b.open.unwrap_or_default(),
@@ -128,7 +125,7 @@ fn decode_historical_data_bar(b: &proto::HistoricalDataBar, default_count: i32) 
         close: b.close.unwrap_or_default(),
         volume: parse_decimal_or_zero(b.volume.as_deref())?,
         wap: parse_decimal_or_zero(b.wap.as_deref())?,
-        count: b.bar_count.unwrap_or(default_count),
+        count: b.bar_count.unwrap_or(NO_BAR_COUNT),
     })
 }
 
@@ -231,7 +228,7 @@ pub(crate) fn decode_historical_schedule_proto(p: crate::proto::HistoricalSchedu
 }
 
 pub(crate) fn decode_historical_data_update_proto(p: crate::proto::HistoricalDataUpdate) -> Result<Bar, Error> {
-    decode_historical_data_bar(&p.historical_data_bar.unwrap_or_default(), 0)
+    decode_historical_data_bar(required(p.historical_data_bar.as_ref(), "historical_data_bar", "HistoricalDataUpdate")?)
 }
 
 #[cfg(test)]

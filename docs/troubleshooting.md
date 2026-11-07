@@ -14,9 +14,9 @@ error: You must enable at least one of the 'sync' or 'async' features to use thi
 **Solution:**
 Default features are off and neither client is enabled. In a dependency, add one back in `Cargo.toml`:
 ```toml
-ibapi = { version = "5.2", default-features = false, features = ["async"] }
+ibapi = { version = "5.7", default-features = false, features = ["async"] }
 # OR
-ibapi = { version = "5.2", default-features = false, features = ["sync"] }
+ibapi = { version = "5.7", default-features = false, features = ["sync"] }
 ```
 When building this repository with `--no-default-features`, add `--features sync` or `--features async` to the command.
 
@@ -52,6 +52,42 @@ Configure IB Gateway/TWS:
 3. Add **127.0.0.1** to trusted IPs
 4. Disable **"Read-Only API"** if you need to place orders
 5. Set **Master API client ID** if needed
+
+### Client ID Already in Use
+
+**Error:**
+```
+Error: ClientIdInUse { client_id: 100 }
+client id 100 is already in use by another connection
+```
+
+TWS allows one connection per client id. It answers a second one with error 326 and closes the socket.
+
+**Solutions:**
+1. Connect with a different client id, or close the other connection (another process, or a client you didn't drop)
+2. Match on `Error::ClientIdInUse` to retry with another id
+
+After a dropped connection, TWS can keep the old session until it notices the socket is dead. The automatic reconnect retries 326 for that reason. If its attempts run out, the client fails with `ConnectionFailed`, and the error log names the cause.
+
+### Gateway Maintenance Windows
+
+**Symptom:** the TCP connect succeeds but `Client::connect` hangs or times out with no error.
+
+IB restarts its servers daily. During the window the gateway process still accepts TCP, but it
+doesn't answer the API handshake.
+
+| Region | Daily (Sun–Fri) |
+|---|---|
+| North America | 00:15 – 01:45 ET |
+| Europe | 06:25 – 07:45 CET |
+| Asia-Pacific | 04:45 – 06:05 HKT and 20:15 – 21:15 HKT |
+
+Weekend maintenance, all regions: Friday 23:00 ET – Saturday 03:00 ET.
+
+**Solutions:**
+1. Check the clock against the table, and wait out the window
+2. If the gateway stays silent after the window, restart it; it can stay wedged after a reset
+3. If you connect through an SSH tunnel, the local port accepts TCP even when the remote gateway is down: `lsof -nP -iTCP:4002 -sTCP:LISTEN` shows `ssh`, not `java`
 
 ### Connection Timeout
 
@@ -308,7 +344,7 @@ let client = Client::connect("127.0.0.1:4002", 100)
 // Handle specific errors
 match client.place_order(order_id, &contract, &order) {
     Ok(_) => println!("Order placed successfully"),
-    Err(Error::InvalidOrderId) => println!("Invalid order ID"),
+    Err(Error::OrderIdInRequestRange { order_id }) => println!("order id {order_id} is in the request-id range"),
     Err(e) => println!("Order failed: {}", e),
 }
 ```

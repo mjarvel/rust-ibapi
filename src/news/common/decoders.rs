@@ -1,8 +1,7 @@
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime};
-use time_tz::{timezones, PrimitiveDateTimeExt};
 
-use super::super::{ArticleType, NewsArticle, NewsArticleBody, NewsBulletin, NewsProvider};
+use super::super::{ArticleType, BulletinType, NewsArticle, NewsArticleBody, NewsBulletin, NewsProvider};
 use crate::messages::ResponseMessage;
 use crate::Error;
 
@@ -31,12 +30,30 @@ pub(in crate::news) fn decode_historical_news(message: &ResponseMessage) -> Resu
     decode_historical_news_proto(message.proto()?)
 }
 
+/// Parses a `HistoricalNews` `time`: zone-less UTC `YYYY-MM-DD HH:MM:SS.f`
+/// (docs/wire-facts/news.md). Any other shape is `None` with a warning, not an
+/// error: the reference client delivers the article regardless, and an error
+/// would end the subscription. The warning makes a format change visible.
 fn try_parse_time_as_utc(time: &str) -> Option<OffsetDateTime> {
     let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]");
-    let dt = PrimitiveDateTime::parse(time, format).ok()?;
-    match dt.assume_timezone(timezones::db::UTC) {
-        time_tz::OffsetResult::Some(v) => Some(v),
-        _ => None,
+    match PrimitiveDateTime::parse(time, format) {
+        Ok(dt) => Some(dt.assume_utc()),
+        Err(e) => {
+            log::warn!("news article time {time:?} not parsed, leaving it unset: {e}");
+            None
+        }
+    }
+}
+
+/// Converts a `TickNews` `timestamp` (epoch milliseconds). Out of range is
+/// `None` with a warning, for the same reason as [`try_parse_time_as_utc`].
+fn try_time_from_millis(millis: i64) -> Option<OffsetDateTime> {
+    match OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000) {
+        Ok(time) => Some(time),
+        Err(e) => {
+            log::warn!("news article timestamp {millis} out of range, leaving it unset: {e}");
+            None
+        }
     }
 }
 
@@ -45,12 +62,8 @@ pub(in crate::news) fn decode_tick_news(message: &ResponseMessage) -> Result<New
 }
 
 pub(crate) fn decode_tick_news_proto(p: crate::proto::TickNews) -> Result<NewsArticle, Error> {
-    let millis = p.timestamp.unwrap_or_default();
-    let time =
-        OffsetDateTime::from_unix_timestamp_nanos((millis as i128) * 1_000_000).map_err(|e| Error::parse_field(millis.to_string(), e.to_string()))?;
-
     Ok(NewsArticle {
-        time,
+        time: p.timestamp.and_then(try_time_from_millis),
         provider_code: p.provider_code.unwrap_or_default(),
         article_id: p.article_id.unwrap_or_default(),
         headline: p.headline.unwrap_or_default(),
@@ -61,7 +74,7 @@ pub(crate) fn decode_tick_news_proto(p: crate::proto::TickNews) -> Result<NewsAr
 pub(crate) fn decode_news_bulletin_proto(p: crate::proto::NewsBulletin) -> Result<NewsBulletin, Error> {
     Ok(NewsBulletin {
         message_id: p.news_msg_id.unwrap_or_default(),
-        message_type: p.news_msg_type.unwrap_or_default(),
+        message_type: BulletinType::from(p.news_msg_type.unwrap_or_default()),
         message: p.news_message.unwrap_or_default(),
         exchange: p.originating_exch.unwrap_or_default(),
     })
@@ -69,16 +82,26 @@ pub(crate) fn decode_news_bulletin_proto(p: crate::proto::NewsBulletin) -> Resul
 
 pub(crate) fn decode_news_article_proto(p: crate::proto::NewsArticle) -> Result<NewsArticleBody, Error> {
     Ok(NewsArticleBody {
-        article_type: ArticleType::from(p.article_type.unwrap_or_default()),
+        article_type: decode_article_type(p.article_type.unwrap_or_default())?,
         article_text: p.article_text.unwrap_or_default(),
     })
 }
 
-pub(crate) fn decode_historical_news_proto(p: crate::proto::HistoricalNews) -> Result<NewsArticle, Error> {
-    let time = p.time.as_deref().and_then(try_parse_time_as_utc).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+// One-shot path, so closed: an unknown code fails the call rather than reading as `Text`.
+// Absent is `Text` (code 0), as in the reference client. Same table as `From<i32> for
+// ArticleType`, minus its coercion.
+fn decode_article_type(code: i32) -> Result<ArticleType, Error> {
+    match code {
+        0 => Ok(ArticleType::Text),
+        1 => Ok(ArticleType::Binary),
+        _ => Err(Error::parse_proto("article_type", format!("unknown article type code {code}"))),
+    }
+}
 
+pub(crate) fn decode_historical_news_proto(p: crate::proto::HistoricalNews) -> Result<NewsArticle, Error> {
     Ok(NewsArticle {
-        time,
+        // Absent or empty (the reference client's default) is unset without a warning.
+        time: p.time.as_deref().filter(|t| !t.is_empty()).and_then(try_parse_time_as_utc),
         provider_code: p.provider_code.unwrap_or_default(),
         article_id: p.article_id.unwrap_or_default(),
         headline: p.headline.unwrap_or_default(),

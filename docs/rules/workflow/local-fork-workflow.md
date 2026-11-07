@@ -10,7 +10,6 @@ triggers:
 symbols: [main, main-upstream, origin, upstream]
 related: [pre-pr-checks, pinned-toolchain]
 precedents: []
-memory: []
 ---
 
 Read `G:\repos\info\README.md` before work and follow its branch/worktree rules.
